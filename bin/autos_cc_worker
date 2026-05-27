@@ -1,0 +1,228 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "net/http"
+require "securerandom"
+require "socket"
+require "time"
+require "uri"
+
+class AutosCcWorker
+  def initialize
+    @base_url = env("AUTOS_WORKER_BASE_URL", "http://sun-dev:3333").sub(%r{/+\z}, "")
+    @token = ENV.fetch("AUTOS_WORKER_TOKEN")
+    @worker_id = env("AUTOS_WORKER_ID", "alice-cc-01")
+    @poll_seconds = env("AUTOS_WORKER_POLL_SECONDS", "5").to_f.clamp(1.0, 60.0)
+    @ollama_url = env("OLLAMA_URL", "http://127.0.0.1:11434").sub(%r{/+\z}, "")
+    @local_model = env("AUTOS_LOCAL_MODEL", "llama3.2:3b")
+    @openai_fallback = truthy?(ENV["AUTOS_WORKER_OPENAI_FALLBACK"])
+  end
+
+  def run
+    log "Alice node starting as #{@worker_id} against #{@base_url} using #{@local_model}"
+    log_status
+
+    loop do
+      job = next_job
+      if job
+        answer_job(job)
+      else
+        sleep @poll_seconds
+      end
+    rescue Interrupt
+      log "stopping"
+      break
+    rescue StandardError => e
+      log "loop error #{e.class}: #{e.message}"
+      sleep @poll_seconds
+    end
+  end
+
+  private
+
+  def log_status
+    response = request(:get, "/autos_worker/status", nil)
+    if response.is_a?(Net::HTTPSuccess)
+      status = JSON.parse(response.body)
+      log "status node=#{status["node"]} enabled=#{status["enabled"]} queued=#{status["queued"]} paid=#{status.dig("paid_lane", "model")}"
+    else
+      log "status failed HTTP #{response.code}: #{response.body}"
+    end
+  rescue StandardError => e
+    log "status failed #{e.class}: #{e.message}"
+  end
+
+  def next_job
+    response = request(:get, "/autos_worker/next", nil)
+    return nil if response.code.to_i == 204
+    raise "next failed HTTP #{response.code}: #{response.body}" unless response.is_a?(Net::HTTPSuccess)
+
+    JSON.parse(response.body)
+  end
+
+  def answer_job(job)
+    log "claim ##{job.fetch("id")} #{job["source"]} #{job["lane"]}"
+    payload = local_answer(job)
+    complete(job, payload)
+    log "answered ##{job.fetch("id")} via #{payload[:provider]} #{payload[:model]}"
+  rescue StandardError => e
+    fail_job(job, e)
+  end
+
+  def local_answer(job)
+    prompt = <<~PROMPT
+      #{job["system_prompt"]}
+
+      CC CONTEXT CACHE RULES:
+      - Prefer the supplied local context.
+      - If context is enough, answer directly in MONSTER ME TALK.
+      - If context is missing and you are unsure, say what you know and what you do not know.
+      - You are read-only. Do not claim you sent coin, changed records, or ran commands.
+
+      LOCAL CONTEXT:
+      #{job["context"]}
+
+      USER QUESTION:
+      #{job["prompt"]}
+    PROMPT
+
+    response = ollama_generate(prompt)
+    answer = response.fetch("response", "").to_s.strip
+    raise "empty local answer" if answer.empty?
+
+    {
+      answer: answer,
+      provider: "local_cc",
+      model: response["model"] || @local_model,
+      context_used: job["context"],
+      usage: approximate_usage(prompt, answer)
+    }
+  rescue StandardError => e
+    raise e unless @openai_fallback && ENV["OPENAI_API_KEY"].to_s.strip != ""
+
+    openai_answer(job, fallback_reason: e.message)
+  end
+
+  def ollama_generate(prompt)
+    uri = URI("#{@ollama_url}/api/generate")
+    req = Net::HTTP::Post.new(uri)
+    req["Content-Type"] = "application/json"
+    req.body = {
+      model: @local_model,
+      prompt: prompt,
+      stream: false,
+      options: {
+        temperature: env("AUTOS_LOCAL_TEMPERATURE", "0.4").to_f,
+        num_predict: env("AUTOS_LOCAL_MAX_TOKENS", "900").to_i
+      }
+    }.to_json
+
+    res = http(uri).request(req)
+    raise "ollama HTTP #{res.code}: #{res.body}" unless res.is_a?(Net::HTTPSuccess)
+
+    JSON.parse(res.body)
+  end
+
+  def openai_answer(job, fallback_reason:)
+    config = job.fetch("openai", {})
+    model = env("AUTOS_WORKER_OPENAI_MODEL", config["model"] || "gpt-5.4")
+    effort = env("AUTOS_WORKER_OPENAI_REASONING", config["reasoning_effort"] || "xhigh")
+    uri = URI("https://api.openai.com/v1/responses")
+    req = Net::HTTP::Post.new(uri)
+    req["Authorization"] = "Bearer #{ENV.fetch("OPENAI_API_KEY")}"
+    req["Content-Type"] = "application/json"
+    input = <<~TEXT
+      CC fallback reason: #{fallback_reason}
+
+      Context:
+      #{job["context"]}
+
+      User question:
+      #{job["prompt"]}
+    TEXT
+    req.body = {
+      model: model,
+      instructions: job["system_prompt"],
+      input: input,
+      reasoning: { effort: effort },
+      text: { verbosity: "low" },
+      max_output_tokens: 2_000
+    }.to_json
+
+    res = http(uri, read_timeout: 120).request(req)
+    parsed = JSON.parse(res.body)
+    raise "openai HTTP #{res.code}: #{parsed["error"] || res.body}" unless res.is_a?(Net::HTTPSuccess)
+
+    answer = parsed["output_text"].to_s
+    if answer.empty?
+      answer = Array(parsed["output"]).flat_map { |item| Array(item["content"]).map { |c| c["text"] || c.dig("text", "value") } }.compact.join("\n")
+    end
+    raise "empty OpenAI fallback answer" if answer.strip.empty?
+
+    {
+      answer: answer.strip,
+      provider: "openai",
+      model: parsed["model"] || model,
+      context_used: job["context"],
+      usage: parsed["usage"] || {}
+    }
+  end
+
+  def complete(job, payload)
+    response = request(:post, job.fetch("complete_path"), payload)
+    raise "complete failed HTTP #{response.code}: #{response.body}" unless response.is_a?(Net::HTTPSuccess)
+  end
+
+  def fail_job(job, error)
+    log "failed ##{job && job["id"]}: #{error.class}: #{error.message}"
+    return unless job
+
+    request(:post, job.fetch("fail_path"), { error: "#{error.class}: #{error.message}" })
+  rescue StandardError => e
+    log "failed to report failure: #{e.class}: #{e.message}"
+  end
+
+  def request(method, path, body)
+    uri = URI("#{@base_url}#{path}")
+    klass = method == :get ? Net::HTTP::Get : Net::HTTP::Post
+    req = klass.new(uri)
+    req["Authorization"] = "Bearer #{@token}"
+    req["X-Autos-Worker-Id"] = @worker_id
+    req["X-Forwarded-Proto"] = "https"
+    req["Content-Type"] = "application/json"
+    req.body = JSON.generate(body) if body
+    http(uri).request(req)
+  end
+
+  def http(uri, read_timeout: 30)
+    Net::HTTP.new(uri.host, uri.port).tap do |client|
+      client.use_ssl = uri.scheme == "https"
+      client.open_timeout = 5
+      client.read_timeout = read_timeout
+    end
+  end
+
+  def approximate_usage(prompt, answer)
+    {
+      input_tokens: (prompt.length / 4.0).ceil,
+      output_tokens: (answer.length / 4.0).ceil,
+      total_tokens: ((prompt.length + answer.length) / 4.0).ceil
+    }
+  end
+
+  def env(name, fallback)
+    value = ENV[name].to_s.strip
+    value.empty? ? fallback : value
+  end
+
+  def truthy?(value)
+    %w[1 true yes on].include?(value.to_s.downcase)
+  end
+
+  def log(message)
+    warn "[autos_cc_worker] #{Time.now.iso8601} #{message}"
+  end
+end
+
+AutosCcWorker.new.run
