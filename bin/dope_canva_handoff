@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""Open the latest DOPE Canva handoff packet on Alice."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import html
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import zipfile
+from pathlib import Path
+
+
+REPORT_DIR = Path.home() / ".config" / "autos" / "reports" / "dope"
+REPORT_INDEX_PATH = REPORT_DIR / "index.jsonl"
+CANVA_APP_PATHS = [Path("/Applications/Canva.app"), Path.home() / "Applications" / "Canva.app"]
+
+
+def load_index(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    records = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records
+
+
+def canva_app_path() -> Path | None:
+    for path in CANVA_APP_PATHS:
+        if path.exists():
+            return path
+    return None
+
+
+def clip(value, max_chars: int = 360) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def clean_text(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_docx_text(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        with zipfile.ZipFile(path) as docx:
+            xml = docx.read("word/document.xml").decode("utf-8", errors="ignore")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return ""
+    xml = re.sub(r"</w:p>", "\n\n", xml)
+    xml = re.sub(r"</w:tr>", "\n", xml)
+    xml = re.sub(r"</w:tc>", " | ", xml)
+    return clean_text(xml)
+
+
+def canva_rows_from_record(record: dict, report_text: str) -> list[dict]:
+    title = str(record.get("title") or "DOPE Market Report").strip()
+    headline = title.replace("90-Day AM Market Report:", "").strip() or title
+    insight = clip(report_text, 420)
+    deal_id = record.get("deal_id") or "Deal"
+    artifact_id = record.get("artifact_id") or "Report"
+    return [
+        {
+            "page": "Strategy Snapshot",
+            "headline": headline,
+            "subhead": insight,
+            "stat_1_label": "Deal",
+            "stat_1_value": str(deal_id),
+            "stat_2_label": "Report",
+            "stat_2_value": str(artifact_id),
+            "stat_3_label": "Format",
+            "stat_3_value": "8.5x11",
+            "body": "Use this page as the client-facing summary: the opportunity, the recommendation, and the next approval decision.",
+            "cta": "Approve creative direction and confirm the campaign CTA.",
+            "source_note": "Generated from the latest Alice DOCX report because this report predates automatic Canva packet logging.",
+        },
+        {
+            "page": "90-Day Campaign Map",
+            "headline": "Three Drops, One Follow-Up System",
+            "subhead": "Turn the report into a visual calendar the customer can approve at a glance.",
+            "stat_1_label": "Drop 1",
+            "stat_1_value": "Awareness",
+            "stat_2_label": "Drop 2",
+            "stat_2_value": "Offer",
+            "stat_3_label": "Drop 3",
+            "stat_3_value": "Follow-up",
+            "body": "Show postcard waves, email/EDM support, CRM follow-up, landing/QR destination, and approval checkpoints.",
+            "cta": "Confirm list, offer, QR destination, print quantity, and mail dates.",
+            "source_note": "Human review required before proofs or production files are sent.",
+        },
+        {
+            "page": "Creative Proof Card",
+            "headline": "What The Postcard Needs To Make Clear",
+            "subhead": "One customer problem, one offer, one action.",
+            "stat_1_label": "Front",
+            "stat_1_value": "Hook + visual proof",
+            "stat_2_label": "Back",
+            "stat_2_value": "Offer + trust + QR",
+            "stat_3_label": "Approval",
+            "stat_3_value": "AM + customer",
+            "body": "Build the 8.5x11 stylized page in Canva first, then adapt the approved direction into postcard sizes.",
+            "cta": "Export proof images for approval and print PDF with bleed after final signoff.",
+            "source_note": "Use DOPE brand assets from Canva and client media from the report folder when available.",
+        },
+    ]
+
+
+def canva_csv_text(rows: list[dict]) -> str:
+    columns = [
+        "page",
+        "headline",
+        "subhead",
+        "stat_1_label",
+        "stat_1_value",
+        "stat_2_label",
+        "stat_2_value",
+        "stat_3_label",
+        "stat_3_value",
+        "body",
+        "cta",
+        "source_note",
+    ]
+    handle = io.StringIO()
+    writer = csv.DictWriter(handle, fieldnames=columns)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({column: row.get(column, "") for column in columns})
+    return handle.getvalue()
+
+
+def canva_brief_text(record: dict, rows: list[dict], report_text: str) -> str:
+    lines = [
+        "# DOPE Canva Handoff",
+        "",
+        "Purpose: turn the latest Alice market report into a stylized 8.5x11 data postcard/report page.",
+        "",
+        "## Source",
+        f"- Title: {record.get('title') or 'Latest report'}",
+        f"- Artifact: {record.get('artifact_id') or 'Unknown'}",
+        f"- Deal: {record.get('deal_id') or 'Unknown'}",
+        f"- DOCX: {record.get('local_path') or 'Unknown'}",
+        "",
+        "## Pages",
+        "| Page | Headline | CTA |",
+        "| --- | --- | --- |",
+    ]
+    for row in rows:
+        lines.append(f"| {row['page']} | {row['headline']} | {row['cta']} |")
+    lines.extend(
+        [
+            "",
+            "## Visual Direction",
+            "- Use a DOPE brand Canva template.",
+            "- Keep one strong headline, three stats, one campaign map, one CTA, and one source note.",
+            "- Preserve human approval before proofs, client delivery, or print production.",
+            "",
+            "## Extracted Report Teaser",
+            clip(report_text, 900),
+        ]
+    )
+    return "\n".join(lines).strip() + "\n"
+
+
+def packet_from_legacy_record(record: dict) -> dict | None:
+    docx_value = record.get("local_path")
+    if not docx_value:
+        return None
+    docx_path = Path(docx_value)
+    if not docx_path.exists():
+        return None
+    csv_path = docx_path.with_suffix(".canva-copy.csv")
+    brief_path = docx_path.with_suffix(".canva-brief.md")
+    report_text = record.get("summary") or extract_docx_text(docx_path)
+    rows = canva_rows_from_record(record, report_text)
+    csv_path.write_text(canva_csv_text(rows), encoding="utf-8")
+    brief_path.write_text(canva_brief_text(record, rows, report_text), encoding="utf-8")
+    return {
+        "source": "legacy_docx",
+        "artifact_id": record.get("artifact_id"),
+        "deal_id": record.get("deal_id"),
+        "title": record.get("title"),
+        "docx_path": docx_path,
+        "csv_path": csv_path,
+        "brief_path": brief_path,
+        "generated_at": record.get("generated_at") or record.get("completed_at"),
+        "format": "8.5x11 data postcard",
+    }
+
+
+def packet_from_record(record: dict) -> dict | None:
+    canva = record.get("canva") or {}
+    csv_value = canva.get("csv_path")
+    if not csv_value:
+        return None
+    csv_path = Path(csv_value)
+    brief_path = Path(canva.get("brief_path") or "")
+    if csv_path.exists():
+        if not brief_path.exists():
+            brief_path = csv_path.with_suffix(".md")
+        return {
+            "source": "index",
+            "artifact_id": record.get("artifact_id"),
+            "deal_id": record.get("deal_id"),
+            "title": record.get("title"),
+            "docx_path": Path(record.get("local_path") or ""),
+            "csv_path": csv_path,
+            "brief_path": brief_path if brief_path.exists() else None,
+            "generated_at": record.get("generated_at") or record.get("completed_at"),
+            "format": canva.get("format") or "8.5x11 data postcard",
+        }
+    return None
+
+
+def latest_packet(report_dir: Path, index_path: Path) -> dict | None:
+    records = load_index(index_path)
+    for record in reversed(records):
+        packet = packet_from_record(record)
+        if packet:
+            return packet
+
+    csv_files = sorted(report_dir.glob("*.canva-copy.csv"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if not csv_files:
+        for record in reversed(records):
+            packet = packet_from_legacy_record(record)
+            if packet:
+                return packet
+        return None
+    csv_path = csv_files[0]
+    brief_path = csv_path.with_name(csv_path.name.replace(".canva-copy.csv", ".canva-brief.md"))
+    docx_path = csv_path.with_name(csv_path.name.replace(".canva-copy.csv", ".docx"))
+    return {
+        "source": "file_scan",
+        "artifact_id": None,
+        "deal_id": None,
+        "title": csv_path.name,
+        "docx_path": docx_path if docx_path.exists() else None,
+        "csv_path": csv_path,
+        "brief_path": brief_path if brief_path.exists() else None,
+        "generated_at": None,
+        "format": "8.5x11 data postcard",
+    }
+
+
+def run_open(target: str | Path) -> None:
+    subprocess.run(["open", str(target)], check=False)
+
+
+def copy_to_clipboard(text: str) -> bool:
+    try:
+        subprocess.run(["pbcopy"], input=text, text=True, check=True)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def print_packet(packet: dict, copied: bool, app_path: Path | None) -> None:
+    print("DOPE Canva handoff")
+    print(f"Format: {packet['format']}")
+    print(f"Title: {packet.get('title') or 'Latest report'}")
+    if packet.get("artifact_id"):
+        print(f"Artifact: {packet['artifact_id']}")
+    if packet.get("deal_id"):
+        print(f"Deal: {packet['deal_id']}")
+    if packet.get("generated_at"):
+        print(f"Generated: {packet['generated_at']}")
+    if packet.get("docx_path"):
+        print(f"DOCX: {packet['docx_path']}")
+    if packet.get("brief_path"):
+        print(f"Brief: {packet['brief_path']}")
+    print(f"CSV: {packet['csv_path']}")
+    print(f"Canva app: {app_path if app_path else 'not found'}")
+    print(f"CSV path copied: {'yes' if copied else 'no'}")
+    print()
+    print("Canva step: open an 8.5x11 DOPE brand template, use Bulk Create or manual paste with the CSV fields, then export only after human approval.")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Open the latest DOPE Canva handoff packet.")
+    parser.add_argument("--report-dir", default=str(REPORT_DIR))
+    parser.add_argument("--index", default=str(REPORT_INDEX_PATH))
+    parser.add_argument("--template-url", default=os.environ.get("DOPE_CANVA_TEMPLATE_URL", ""))
+    parser.add_argument("--no-open", action="store_true", help="Print paths without opening Finder/Canva.")
+    parser.add_argument("--no-copy", action="store_true", help="Do not copy the CSV path to the clipboard.")
+    args = parser.parse_args()
+
+    report_dir = Path(args.report_dir).expanduser()
+    index_path = Path(args.index).expanduser()
+    packet = latest_packet(report_dir, index_path)
+    if not packet:
+        print(f"No Canva handoff packet found in {report_dir}", file=sys.stderr)
+        return 1
+
+    copied = False if args.no_copy else copy_to_clipboard(str(packet["csv_path"]))
+    app_path = canva_app_path()
+    if not args.no_open:
+        run_open(packet["csv_path"].parent)
+        if packet.get("brief_path"):
+            run_open(packet["brief_path"])
+        if args.template_url:
+            run_open(args.template_url)
+        elif app_path:
+            run_open(app_path)
+
+    print_packet(packet, copied, app_path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
