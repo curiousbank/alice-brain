@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import datetime as dt
 import html
+import io
 import json
 import os
 import re
@@ -30,6 +32,7 @@ DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessin
 LOG_PATH = Path.home() / ".config" / "autos" / "log" / "dope_market_report_worker.jsonl"
 REPORT_DIR = Path.home() / ".config" / "autos" / "reports" / "dope"
 REPORT_INDEX_PATH = REPORT_DIR / "index.jsonl"
+CANVA_APP_PATHS = [Path("/Applications/Canva.app"), Path.home() / "Applications" / "Canva.app"]
 MAX_LOGO_BYTES = 5 * 1024 * 1024
 DEFAULT_MINIMUM_WORDS = 1400
 DEFAULT_MINIMUM_DOCX_BYTES = 12_000
@@ -430,6 +433,7 @@ Do not invent private facts. If a field is missing, call out what the AM must co
 No caveman voice. No generic marketing filler. No JSON.
 Return a polished Markdown report of at least {minimum} words with clear headings, useful tables, bullets, AM-facing actions, designer notes, print production notes, and measurement/KPI details.
 Include every required section from report_contract.required_sections. Keep recommendations tied to DOPE services: direct mail, postcards, print, EDM/email, landing pages, QR/payment links, CRM follow-up, and human approval.
+Include a Canva Data Postcard Handoff section for an 8.5x11 stylized report page: headline, core insight, key stats, 90-day visual map, proof points, CTA, source notes, asset list, and human approval gates. Do not claim Canva work was created automatically.
 The output will be rendered into a real DOCX by Alice, so write complete report content only."""
 
     job_id = job.get("id")
@@ -1025,9 +1029,182 @@ def context_appendix_text(job: dict) -> str:
     return "\n".join(lines).strip()
 
 
+def canva_app_path() -> str | None:
+    for path in CANVA_APP_PATHS:
+        if path.exists():
+            return str(path)
+    return None
+
+
+def plain_text(markdown: str) -> str:
+    text = re.sub(r"`([^`]*)`", r"\1", markdown or "")
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"[*_>#|]", " ", text)
+    text = re.sub(r"^\s*[-+]\s+", "", text, flags=re.MULTILINE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def report_teaser(report_text: str, max_chars: int = 360) -> str:
+    for block in re.split(r"\n\s*\n", report_text or ""):
+        cleaned = plain_text(block)
+        if len(cleaned) > 90 and not cleaned.lower().startswith("source data appendix"):
+            return clip(cleaned, max_chars)
+    return clip(plain_text(report_text), max_chars)
+
+
+def canva_rows(job: dict, report_text: str) -> list[dict]:
+    deal = job.get("deal", {}) or {}
+    company = job.get("company", {}) or {}
+    commerce = job.get("commerce", {}) or {}
+    hubspot = job.get("hubspot_context", {}) or {}
+    media = job.get("assets", {}).get("uploaded_media", []) or []
+    missing = hubspot.get("missing_core_fields", []) or []
+    company_name = compact(company.get("name") or deal.get("company_name"), "Client")
+    industry = compact(company.get("industry") or deal.get("industry"), "Industry to confirm")
+    amount = compact(deal.get("amount"), "Amount TBD")
+    stage = compact(deal.get("stage"), "Stage TBD")
+    quote_link = compact(commerce.get("quote_purchase_link"), "Confirm QR/payment link")
+    insight = report_teaser(report_text)
+    missing_note = ", ".join(map(str, missing[:8])) if missing else "No core missing fields flagged."
+    return [
+        {
+            "page": "Strategy Snapshot",
+            "headline": f"{company_name}: 90-Day Growth Snapshot",
+            "subhead": insight,
+            "stat_1_label": "Deal stage",
+            "stat_1_value": stage,
+            "stat_2_label": "Deal value",
+            "stat_2_value": amount,
+            "stat_3_label": "Industry",
+            "stat_3_value": industry,
+            "body": "Use this page as the client-facing summary: what we know, where the opportunity is, and what DOPE recommends first.",
+            "cta": f"Approve creative direction and confirm CTA: {quote_link}",
+            "source_note": f"Missing fields to collect: {missing_note}",
+        },
+        {
+            "page": "90-Day Campaign Map",
+            "headline": "Three Drops, One Follow-Up System",
+            "subhead": "Turn the long-form strategy into a visual calendar the customer can approve at a glance.",
+            "stat_1_label": "Drop 1",
+            "stat_1_value": "Awareness / reactivation",
+            "stat_2_label": "Drop 2",
+            "stat_2_value": "Offer / proof",
+            "stat_3_label": "Drop 3",
+            "stat_3_value": "Urgency / follow-up",
+            "body": "Show postcard waves, email/EDM support, CRM follow-up, landing/QR destination, and approval checkpoints.",
+            "cta": "Confirm list, offer, QR destination, print quantity, and mail dates.",
+            "source_note": f"Uploaded media available: {len(media)}",
+        },
+        {
+            "page": "Creative Proof Card",
+            "headline": "What The Postcard Needs To Make Clear",
+            "subhead": "A print-ready creative brief for Canva: one customer problem, one offer, one action.",
+            "stat_1_label": "Front",
+            "stat_1_value": "Hook + visual proof",
+            "stat_2_label": "Back",
+            "stat_2_value": "Offer + trust + QR",
+            "stat_3_label": "Approval",
+            "stat_3_value": "AM + customer + production",
+            "body": "Build an 8.5x11 stylized report/postcard page in Canva first, then adapt the approved direction into postcard sizes.",
+            "cta": "Export PNG/JPG proof for approval and print PDF with bleed after final signoff.",
+            "source_note": "Human review required before sending proofs or production files.",
+        },
+    ]
+
+
+def canva_csv_text(rows: list[dict]) -> str:
+    columns = [
+        "page",
+        "headline",
+        "subhead",
+        "stat_1_label",
+        "stat_1_value",
+        "stat_2_label",
+        "stat_2_value",
+        "stat_3_label",
+        "stat_3_value",
+        "body",
+        "cta",
+        "source_note",
+    ]
+    handle = io.StringIO()
+    writer = csv.DictWriter(handle, fieldnames=columns)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({column: row.get(column, "") for column in columns})
+    return handle.getvalue()
+
+
+def canva_design_handoff_text(job: dict, report_text: str) -> str:
+    media = job.get("assets", {}).get("uploaded_media", []) or []
+    app_path = canva_app_path()
+    rows = canva_rows(job, report_text)
+    lines = [
+        "## Canva Data Postcard Handoff",
+        "",
+        "Purpose: turn this strategy into a stylized 8.5x11 data postcard/report page that informs and engages the client. Alice creates the copy/data packet; a human designer finishes the Canva design and approves exports.",
+        "",
+        "### Canva Workflow",
+        f"- Canva Desktop status: {'available at ' + app_path if app_path else 'not detected on this machine'}",
+        "- Start with an 8.5x11 US Letter design in Canva, portrait or landscape depending on the story.",
+        "- Treat each row of the CSV packet as one Canva page/card: Strategy Snapshot, 90-Day Campaign Map, and Creative Proof Card.",
+        "- Use Canva Bulk Create or manual paste into a locked DOPE template with fields for headline, stats, body, CTA, and source note.",
+        "- Keep it human-reviewed: AM approval, customer approval, designer preflight, and production approval before print/mail.",
+        "",
+        "### Canva Page Data",
+        "| Page | Headline | Main CTA |",
+        "| --- | --- | --- |",
+    ]
+    for row in rows:
+        lines.append(f"| {row['page']} | {row['headline']} | {row['cta']} |")
+
+    lines.extend(
+        [
+            "",
+            "### Visual Direction",
+            "- Format: 8.5x11 data postcard/report page, designed for PDF proofing and client-facing review.",
+            "- Hierarchy: one strong headline, three stat blocks, one campaign map, one CTA, and one source note.",
+            "- Style: confident printshop/marketing operations, practical and polished. Avoid generic AI graphics.",
+            "- Use client logo/media when supplied. If media is missing, leave a clean logo slot and label it for collection.",
+            "- Preserve human approval checkpoints before any proof is sent or any production file is exported.",
+            "",
+            "### Asset Notes",
+        ]
+    )
+    if media:
+        for item in media:
+            lines.append(f"- {item.get('filename')} ({item.get('content_type')}, role={item.get('role')}) endpoint: {item.get('endpoint')}")
+    else:
+        lines.append("- No uploaded media was included in the worker package.")
+    return "\n".join(lines).strip()
+
+
 def full_document_text(job: dict, report_text: str) -> str:
+    canva = canva_design_handoff_text(job, report_text)
     appendix = context_appendix_text(job)
-    return "\n\n".join(part for part in [report_text.strip(), appendix] if part)
+    return "\n\n".join(part for part in [report_text.strip(), canva, appendix] if part)
+
+
+def write_canva_packet(job: dict, report_text: str, docx_path: Path) -> dict:
+    rows = canva_rows(job, report_text)
+    brief_path = docx_path.with_suffix(".canva-brief.md")
+    csv_path = docx_path.with_suffix(".canva-copy.csv")
+    brief_path.write_text(canva_design_handoff_text(job, report_text) + "\n", encoding="utf-8")
+    csv_path.write_text(canva_csv_text(rows), encoding="utf-8")
+    app_path = canva_app_path()
+    return {
+        "enabled": True,
+        "mode": "human_reviewed_canva_handoff",
+        "app_detected": bool(app_path),
+        "app_path": app_path,
+        "brief_path": str(brief_path),
+        "csv_path": str(csv_path),
+        "format": "8.5x11 data postcard",
+        "page_count": len(rows),
+        "automation_boundary": "Alice writes copy/data. Canva design/export stays human-reviewed unless an explicit Canva API integration is approved.",
+        "approval_gates": ["account_manager", "customer", "designer_preflight", "production"],
+    }
 
 
 def markdown_table(lines: list[str]) -> list[list[str]]:
@@ -1180,6 +1357,7 @@ def write_local_report_record(job: dict, docx_path: Path, manifest: dict, comple
         "completed_at": now_iso(),
         "logo_embedded": manifest.get("logo_embedded"),
         "logo_reason": manifest.get("logo_reason"),
+        "canva": manifest.get("canva"),
         "quality": {
             "errors": manifest.get("quality_errors", []),
             "warnings": manifest.get("quality_warnings", []),
@@ -1270,6 +1448,8 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
         REPORT_DIR.mkdir(parents=True, exist_ok=True)
         docx_path = REPORT_DIR / filename
         create_report_docx(job, document_text, logo, docx_path)
+        canva_packet = write_canva_packet(job, report_text, docx_path)
+        log("canva_packet", id=job_id, status=f"{canva_packet['format']} csv={canva_packet['csv_path']}")
         sections = extract_sections(document_text)
         words = word_count(document_text)
         quality_errors = validate_report_file(job, docx_path, document_text)
@@ -1298,6 +1478,7 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
                 "embedded_image_count": 1 if logo else 0,
                 "fetch_errors": [] if logo else [logo_reason],
             },
+            "canva": canva_packet,
             "local_path": str(docx_path),
             "source_artifact_id": job_id,
             "source_deal_id": job.get("deal", {}).get("id"),

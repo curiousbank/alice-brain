@@ -97,6 +97,7 @@ def event_order(event)
     "frontier_fallback_unavailable" => 3,
     "openai_empty_response" => 4,
     "openai_response" => 5,
+    "canva_packet" => 5,
     "answer" => 5,
     "completed" => 6,
     "complete" => 6,
@@ -307,6 +308,9 @@ def render(event, stream_name:, raw:)
     puts "[#{time}] REPORT OPENAI RETRY #{stream_name} ##{event["id"]} model=#{event["model"]} #{event["status"]}"
   when "openai_response"
     puts "[#{time}] REPORT OPENAI DONE #{stream_name} ##{event["id"]} model=#{event["model"]} #{event["status"]}"
+  when "canva_packet"
+    puts "[#{time}] REPORT CANVA PACKET #{stream_name} ##{event["id"]}"
+    print_block("FILE", event["status"])
   when "completed"
     puts "[#{time}] REPORT COMPLETE #{stream_name} ##{event["id"]} provider=#{event["provider"]} model=#{event["model"]} result=#{event["status"]}"
   when "dry_run_ready"
