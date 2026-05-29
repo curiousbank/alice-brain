@@ -30,11 +30,15 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8182"
 DEFAULT_WORKER_ID = "alice-dope-reports-01"
 DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 LOG_PATH = Path.home() / ".config" / "autos" / "log" / "dope_market_report_worker.jsonl"
+CONTEXT_DIR = Path.home() / ".config" / "autos" / "context"
 REPORT_DIR = Path.home() / ".config" / "autos" / "reports" / "dope"
 REPORT_INDEX_PATH = REPORT_DIR / "index.jsonl"
+EXAMPLES_DIR = REPORT_DIR / "examples"
+STRATEGY_PROPOSAL_STYLE_PATH = EXAMPLES_DIR / "DOPE_STRATEGY_PROPOSAL_STYLE.md"
+STRATEGY_PROPOSAL_CONTEXT_PATH = CONTEXT_DIR / "dope_strategy_proposal_style.md"
 CANVA_APP_PATHS = [Path("/Applications/Canva.app"), Path.home() / "Applications" / "Canva.app"]
 MAX_LOGO_BYTES = 5 * 1024 * 1024
-DEFAULT_MINIMUM_WORDS = 1400
+DEFAULT_MINIMUM_WORDS = 900
 DEFAULT_MINIMUM_DOCX_BYTES = 12_000
 BRAND_RED = "D71920"
 INK = "111111"
@@ -377,6 +381,20 @@ def reasoning_effort_candidates() -> list[str]:
     return [item for index, item in enumerate(candidates) if item and item not in candidates[:index]]
 
 
+def strategy_proposal_style_summary() -> str | None:
+    configured = env("DOPE_STRATEGY_PROPOSAL_STYLE_PATH")
+    candidate_paths = [Path(configured).expanduser()] if configured else [STRATEGY_PROPOSAL_STYLE_PATH, STRATEGY_PROPOSAL_CONTEXT_PATH]
+    path = next((candidate for candidate in candidate_paths if candidate.exists()), candidate_paths[0])
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError as error:
+        log("style_reference_error", status=f"{path}: {error}")
+        return None
+    return text[:12_000] if text else None
+
+
 def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
     contract = job.get("report_contract", {}) or {}
     primary_prompt = job.get("generation_prompt") or contract.get("llm_prompt") or contract.get("requested_output")
@@ -384,6 +402,7 @@ def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
     prompt_package = {
         "primary_generation_prompt": primary_prompt,
         "retry_note": retry_note,
+        "reference_style_summary": strategy_proposal_style_summary(),
         "report_contract": contract,
         "required_sections": contract.get("required_sections", []),
         "writing_rules": contract.get("writing_rules", []),
@@ -428,10 +447,11 @@ def call_openai(job: dict) -> tuple[str, dict]:
     instructions = f"""You are Alice, the private AI report desk for DOPE Marketing.
 Write professional-grade 90-day postcard/direct-mail market reports for DOPE account managers.
 Use payload["generation_prompt"] or payload["report_contract"]["llm_prompt"] as the controlling brief.
+Use payload["reference_style_summary"] as the house style guide when present. Prefer a concise 5-page DOPE Strategy Proposal over a long AI research report unless the job contract explicitly asks for a deeper report.
 Use HubSpot labeled properties, raw properties, missing core fields, deal/company/commerce data, and uploaded media filenames/endpoints.
 Do not invent private facts. If a field is missing, call out what the AM must collect.
 No caveman voice. No generic marketing filler. No JSON.
-Return a polished Markdown report of at least {minimum} words with clear headings, useful tables, bullets, AM-facing actions, designer notes, print production notes, and measurement/KPI details.
+Return a polished Markdown proposal of at least {minimum} words with clear headings, useful tables, bullets, AM-facing actions, designer notes, print production notes, and measurement/KPI details.
 Include every required section from report_contract.required_sections. Keep recommendations tied to DOPE services: direct mail, postcards, print, EDM/email, landing pages, QR/payment links, CRM follow-up, and human approval.
 Include a Canva Data Postcard Handoff section for an 8.5x11 stylized report page: headline, core insight, key stats, 90-day visual map, proof points, CTA, source notes, asset list, and human approval gates. Do not claim Canva work was created automatically.
 The output will be rendered into a real DOCX by Alice, so write complete report content only."""
