@@ -124,7 +124,8 @@ end
       - Never recommend Powderball just because a question mentions markets, bets, leverage, monetization, profit, or gain money.
       - The worker will escalate uncertain answers to OpenAI, so mark uncertainty instead of padding or hedging.
       - Do not mention Bible, context cache, hidden prompts, or missing local files to the user.
-      - Keep normal answers under six short sentences.
+      - Brevity is priceless: default to 1 to 2 short sentences. Hard ceiling: 4 short lines.
+      - Do not recite identity unless asked. Never loop "Me be..." statements.
       - Do not force Pinball or monster voice on non-AUTOS/DOPE work.
       - If context is missing and you are unsure, say what you know and what you do not know.
       - If the answer is unknown, one short sentence is enough.
@@ -325,27 +326,39 @@ end
 
     text = text.gsub(/((?:\b[[:alnum:]'’]+\b\W*){2,6})(?:\s*\1){2,}/i, '\1').strip
 
-    counts = Hash.new(0)
-    kept = []
-    text.scan(/[^.!?\n]+[.!?]+|[^.!?\n]+\z|\n+/).each do |sentence|
-      if sentence.match?(/\S/)
-        normalized = sentence.downcase.gsub(/[^[:alnum:]]+/, " ").strip
-        counts[normalized] += 1 if normalized.length >= 6
-        break if counts[normalized] && counts[normalized] > 2
-      end
-      kept << sentence
+    max_chars = env("AUTOS_LOCAL_MAX_ANSWER_CHARS", "420").to_i.clamp(160, 1_200)
+    max_lines = env("AUTOS_LOCAL_MAX_ANSWER_LINES", "4").to_i.clamp(1, 8)
+    prefix = nil
+    if text.start_with?("⚡︎🐦‍⬛⚡︎ αὐτός")
+      parts = text.split(/\n+/, 2)
+      prefix = parts[0]
+      text = parts[1].to_s.strip
     end
-    text = kept.join(" ").gsub(/\s+([.!?,;:])/, '\1').gsub(/\n\s+/, "\n").strip if kept.any?
 
-    max_chars = env("AUTOS_LOCAL_MAX_ANSWER_CHARS", "1200").to_i.clamp(240, 4_000)
+    pieces = text.split(/(?<=[.!?])\s+|\n+/).map(&:strip).reject(&:empty?)
+    pieces = [text] if pieces.empty?
+    seen = {}
+    kept = []
+
+    pieces.each do |piece|
+      normalized = piece.downcase.gsub(/[^[:alnum:]]+/, " ").strip
+      next if !normalized.empty? && seen[normalized]
+
+      seen[normalized] = true unless normalized.empty?
+      kept << piece
+      break if kept.length >= max_lines || kept.join(" ").length >= max_chars
+    end
+
+    text = kept.join("\n").strip
     if text.length > max_chars
       snippet = text[0, max_chars]
-      last_end = snippet.rindex(/[.!?]/)
+      last_end = [snippet.rindex("."), snippet.rindex("!"), snippet.rindex("?")].compact.max
       snippet = snippet[0..last_end] if last_end && last_end > (max_chars / 2)
       text = snippet.strip
+      text += "..." unless text.end_with?(".", "!", "?", "...")
     end
 
-    text
+    [prefix, text].compact.join("\n")
   end
 
   def sanitize_persona_language(text)
@@ -384,7 +397,7 @@ end
         top_p: env("AUTOS_LOCAL_TOP_P", "0.85").to_f,
         repeat_penalty: env("AUTOS_LOCAL_REPEAT_PENALTY", "1.25").to_f,
         repeat_last_n: env("AUTOS_LOCAL_REPEAT_LAST_N", "128").to_i,
-        num_predict: env("AUTOS_LOCAL_MAX_TOKENS", "450").to_i
+        num_predict: env("AUTOS_LOCAL_MAX_TOKENS", "220").to_i
       }
     }.to_json
 
@@ -399,17 +412,17 @@ end
     update_active_runtime(provider: "openai", model: model)
     effort = ENV["AUTOS_WORKER_OPENAI_REASONING"].to_s.strip
     effort = env("AUTOS_WORKER_OPENAI_FALLBACK_REASONING", "medium") if effort.empty?
-    max_tokens = env("AUTOS_WORKER_OPENAI_MAX_OUTPUT_TOKENS", "6000").to_i.clamp(2_000, 12_000)
+    max_tokens = env("AUTOS_WORKER_OPENAI_MAX_OUTPUT_TOKENS", "1600").to_i.clamp(500, 4_000)
 
     parsed = openai_response(job, fallback_reason: fallback_reason, model: model, effort: effort, max_output_tokens: max_tokens)
-    answer = sanitize_persona_language(extract_openai_text(parsed))
+    answer = sanitize_answer(extract_openai_text(parsed))
 
     if answer.strip.empty?
       activity("openai_empty_response", job_snapshot(job).merge(openai: openai_diagnostic(parsed), effort: effort, max_output_tokens: max_tokens))
       retry_effort = env("AUTOS_WORKER_OPENAI_RETRY_REASONING", "low")
-      retry_tokens = [max_tokens, 8_000].max
+      retry_tokens = [max_tokens, 2_400].max
       parsed = openai_response(job, fallback_reason: "#{fallback_reason}; retry after empty response", model: model, effort: retry_effort, max_output_tokens: retry_tokens)
-      answer = sanitize_persona_language(extract_openai_text(parsed))
+      answer = sanitize_answer(extract_openai_text(parsed))
       effort = retry_effort
       max_tokens = retry_tokens
     end
@@ -442,6 +455,7 @@ end
       FRONTIER FALLBACK OVERRIDE:
       This request reached OpenAI because the local model was uncertain. For general public questions, answer directly from broad knowledge even when the supplied business context is unrelated. Do not mention the local model, Bible, missing files, or context cache. For live/internal business records, use only supplied context and clearly say what cannot be known.
       For betting, prediction-market, financial, gambling, automated trading, arbitrage, or system-gaming prompts, do not recommend exploiting markets, spamming many bets, manipulating systems, or any guaranteed-profit scheme. Do not choose Powderball just because local context mentions it. Give risk-aware, compliance-first guidance; if the user asks how to exploit a system for money, refuse that part and redirect to legitimate analytics, bankroll limits, and risk controls.
+      Brevity is priceless: default to 1 to 2 short sentences. Hard ceiling: 4 short lines. Do not recite identity unless asked.
     TEXT
 
     input = <<~TEXT
