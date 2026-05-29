@@ -7,6 +7,10 @@ The purpose of Alice is to keep simple, repetitive, local-first AI work close to
 ## What lives here
 
 - `bin/autos_cc_worker` runs the local worker loop.
+- `bin/dope_market_report_worker` polls DOPE report jobs, builds DOCX reports locally, and posts completed files back to SUN/DOPE.
+- `bin/autos_cc_watch` tails Pinball AUTOS, DOPE AUTOS, and DOPE report worker activity in one readable terminal window.
+- `bin/alice_context_cache.rb` builds/searches the local context cache.
+- `context/` contains local read-only context packs for Pinball/AUTOS and DOPE.
 - `docs/cc_context_cache.md` documents the context-cache architecture.
 - `.env.example` shows required local settings without secrets.
 
@@ -16,9 +20,9 @@ The purpose of Alice is to keep simple, repetitive, local-first AI work close to
 - Alice only talks to Pinball through authenticated worker routes.
 - Paid/frontier model selection remains controlled by Pinball server policy.
 - Local free answers are allowed only when Pinball explicitly queues them.
+- Generated logs, report DOCX files, manifests, local indexes, and `.env` files stay out of git.
 
 ## Planned private remote
 
 Target GitHub repo: `TIM3H3AD/alice-brain`
 Visibility: private
-

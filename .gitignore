@@ -2,6 +2,11 @@
 .env.*
 !.env.example
 *.log
+*.jsonl
+log/
+reports/
+__pycache__/
+*.pyc
 tmp/
 .DS_Store
 node_modules/

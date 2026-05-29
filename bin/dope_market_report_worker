@@ -1,0 +1,1369 @@
+#!/usr/bin/env python3
+"""Alice-side DOPE market report worker.
+
+Polls SUN/DOPE for queued market-report artifacts, generates a DOCX locally,
+and posts the finished file back to SUN for storage/publishing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import html
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+from pathlib import Path
+
+
+DEFAULT_BASE_URL = "http://127.0.0.1:8182"
+DEFAULT_WORKER_ID = "alice-dope-reports-01"
+DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+LOG_PATH = Path.home() / ".config" / "autos" / "log" / "dope_market_report_worker.jsonl"
+REPORT_DIR = Path.home() / ".config" / "autos" / "reports" / "dope"
+REPORT_INDEX_PATH = REPORT_DIR / "index.jsonl"
+MAX_LOGO_BYTES = 5 * 1024 * 1024
+DEFAULT_MINIMUM_WORDS = 1400
+DEFAULT_MINIMUM_DOCX_BYTES = 12_000
+BRAND_RED = "D71920"
+INK = "111111"
+MUTED = "555555"
+SOFT_RED = "FCE8EA"
+SOFT_GRAY = "F4F4F5"
+
+
+def load_env_files() -> None:
+    for path in [
+        Path.home() / ".config" / "autos" / "alice.env",
+        Path.home() / "Desktop" / "PB" / ".env.alice",
+    ]:
+        if not path.exists():
+            continue
+        try:
+            lines = path.read_text(errors="ignore").splitlines()
+        except OSError:
+            continue
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+def env(name: str, default: str | None = None) -> str | None:
+    value = os.environ.get(name)
+    return value if value not in (None, "") else default
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def log(event: str, **data) -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    record = {"time": now_iso(), "event": event, **data}
+    with LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+    printable = " ".join(f"{key}={value}" for key, value in data.items() if key in {"id", "status", "queued", "provider", "model"})
+    print(f"[dope_report_worker] {record['time']} {event} {printable}".rstrip(), flush=True)
+
+
+def require_token() -> str:
+    token = env("DOPE_REPORT_WORKER_TOKEN") or env("AUTOS_WORKER_TOKEN")
+    if not token:
+        raise RuntimeError("DOPE_REPORT_WORKER_TOKEN or AUTOS_WORKER_TOKEN is required")
+    return token
+
+
+class DopeClient:
+    def __init__(self) -> None:
+        self.base_url = (env("DOPE_REPORT_WORKER_BASE_URL") or env("DOPE_WORKER_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
+        self.worker_id = env("DOPE_REPORT_WORKER_ID", DEFAULT_WORKER_ID)
+        self.token = require_token()
+
+    def request(self, method: str, path: str, body: bytes | None = None, headers: dict[str, str] | None = None):
+        url = f"{self.base_url}{path}"
+        request_headers = {
+            "Authorization": f"Bearer {self.token}",
+            "X-Dope-Worker-Id": self.worker_id,
+            "User-Agent": "alice-dope-market-report-worker/1.0",
+        }
+        request_headers.update(headers or {})
+        req = urllib.request.Request(url, data=body, headers=request_headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.headers, error.read()
+
+    def status(self) -> dict:
+        code, _headers, body = self.request("GET", "/dope_worker/report_status")
+        if code != 200:
+            raise RuntimeError(f"status failed HTTP {code}: {body.decode(errors='replace')[:300]}")
+        return json.loads(body.decode("utf-8"))
+
+    def next_report(self) -> dict | None:
+        code, _headers, body = self.request("POST", "/dope_worker/reports/next", body=b"")
+        if code == 204:
+            return None
+        if code != 200:
+            raise RuntimeError(f"next report failed HTTP {code}: {body.decode(errors='replace')[:300]}")
+        return json.loads(body.decode("utf-8"))
+
+    def recent_reports(self, limit: int = 25) -> list[dict]:
+        code, _headers, body = self.request("GET", f"/dope_worker/reports/recent?limit={int(limit)}")
+        if code != 200:
+            raise RuntimeError(f"recent reports failed HTTP {code}: {body.decode(errors='replace')[:300]}")
+        parsed = json.loads(body.decode("utf-8"))
+        return parsed.get("reports", []) or []
+
+    def fetch_logo(self, job: dict) -> tuple[bytes, str, str] | None:
+        for source, endpoint in logo_candidates(job):
+            code, headers, body = self.fetch_asset(endpoint)
+            if code == 204 or not body:
+                continue
+            if code not in (200, 302):
+                log("logo_skipped", id=job.get("id"), status=f"{source}_http_{code}")
+                continue
+            if len(body) > MAX_LOGO_BYTES:
+                log("logo_skipped", id=job.get("id"), status=f"{source}_too_large")
+                continue
+            content_type = headers.get("Content-Type", "").split(";")[0].strip().lower()
+            ext = image_extension(body, content_type)
+            if ext not in {"png", "jpg", "jpeg", "gif"}:
+                log("logo_skipped", id=job.get("id"), status=f"{source}_unsupported_{content_type or 'unknown'}")
+                continue
+            return body, "jpg" if ext == "jpeg" else ext, source
+        return None
+
+    def fetch_asset(self, endpoint: str):
+        if not endpoint:
+            return 204, {}, b""
+        if endpoint.startswith("http://") or endpoint.startswith("https://"):
+            req = urllib.request.Request(endpoint, headers={"User-Agent": "alice-dope-market-report-worker/1.0"})
+            try:
+                with urllib.request.urlopen(req, timeout=120) as response:
+                    return response.status, response.headers, response.read()
+            except urllib.error.HTTPError as error:
+                return error.code, error.headers, error.read()
+            except urllib.error.URLError:
+                return 599, {}, b""
+
+        code, headers, body = self.request("GET", endpoint)
+        if code == 204 or not body:
+            return code, headers, body
+        if code not in (200, 302):
+            return code, headers, body
+        return code, headers, body
+
+    def complete(self, job: dict, docx_path: Path, manifest: dict) -> dict:
+        encoded = base64.b64encode(docx_path.read_bytes()).decode("ascii")
+        form = urllib.parse.urlencode(
+            {
+                "file_base64": encoded,
+                "filename": docx_path.name,
+                "content_type": DOCX_CONTENT_TYPE,
+                "manifest": json.dumps(manifest, ensure_ascii=True),
+                "worker_id": self.worker_id,
+                "provider": manifest.get("provider", "template"),
+                "model": manifest.get("model", "none"),
+                "summary": manifest.get("summary", ""),
+            }
+        ).encode("utf-8")
+        endpoint = job.get("output", {}).get("complete_endpoint") or f"/dope_worker/reports/{job['id']}/complete"
+        code, _headers, body = self.request(
+            "POST",
+            endpoint,
+            body=form,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if code != 200:
+            raise RuntimeError(f"complete failed HTTP {code}: {body.decode(errors='replace')[:500]}")
+        return json.loads(body.decode("utf-8"))
+
+    def fail(self, job: dict, message: str) -> None:
+        endpoint = job.get("output", {}).get("fail_endpoint") or f"/dope_worker/reports/{job['id']}/fail"
+        form = urllib.parse.urlencode({"error": message[:1800], "worker_id": self.worker_id}).encode("utf-8")
+        self.request("POST", endpoint, body=form, headers={"Content-Type": "application/x-www-form-urlencoded"})
+
+
+def image_extension(data: bytes, content_type: str) -> str | None:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8"):
+        return "jpg"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return "gif"
+    if content_type == "image/png":
+        return "png"
+    if content_type in {"image/jpeg", "image/jpg"}:
+        return "jpg"
+    if content_type == "image/gif":
+        return "gif"
+    return None
+
+
+def image_size(data: bytes) -> tuple[int, int]:
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if data.startswith(b"\xff\xd8"):
+        index = 2
+        while index + 9 < len(data):
+            if data[index] != 0xFF:
+                index += 1
+                continue
+            marker = data[index + 1]
+            index += 2
+            if marker in {0xD8, 0xD9}:
+                continue
+            if index + 2 > len(data):
+                break
+            length = int.from_bytes(data[index:index + 2], "big")
+            if marker in {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF} and index + 7 < len(data):
+                return int.from_bytes(data[index + 5:index + 7], "big"), int.from_bytes(data[index + 3:index + 5], "big")
+            index += max(length, 2)
+    return 900, 320
+
+
+def logo_candidates(job: dict) -> list[tuple[str, str]]:
+    assets = job.get("assets", {}) or {}
+    candidates: list[tuple[str, str]] = []
+
+    if assets.get("logo_endpoint"):
+        candidates.append(("logo_endpoint", assets["logo_endpoint"]))
+    if assets.get("logo_url"):
+        candidates.append(("logo_url", assets["logo_url"]))
+
+    for item in assets.get("uploaded_media", []) or []:
+        content_type = str(item.get("content_type") or "").lower()
+        role = str(item.get("role") or "").lower()
+        endpoint = item.get("endpoint")
+        if endpoint and content_type.startswith("image/") and ("logo" in role or "logo" in str(item.get("filename") or "").lower()):
+            candidates.append(("uploaded_logo_media", endpoint))
+
+    for item in assets.get("uploaded_media", []) or []:
+        content_type = str(item.get("content_type") or "").lower()
+        endpoint = item.get("endpoint")
+        if endpoint and content_type.startswith("image/"):
+            candidates.append(("uploaded_image_media", endpoint))
+
+    seen = set()
+    unique = []
+    for source, endpoint in candidates:
+        if endpoint in seen:
+            continue
+        seen.add(endpoint)
+        unique.append((source, endpoint))
+    return unique
+
+
+def logo_missing_reason(job: dict, logo: tuple | None) -> str:
+    if logo:
+        return f"embedded from {logo[2] if len(logo) > 2 else 'worker asset'}"
+    if logo_candidates(job):
+        return "logo candidates were unavailable, empty, unsupported, or too large"
+    return "no logo_url, logo_endpoint, or uploaded image media was provided"
+
+
+def safe_text(value) -> str:
+    return html.escape(str(value or "").strip(), quote=False)
+
+
+def compact(value, default="Not provided") -> str:
+    text = str(value or "").strip()
+    return text if text else default
+
+
+def clip(value, max_chars: int = 220) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def slug(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", value.lower()).strip("-")
+    return cleaned[:70] or "dope-market-report"
+
+
+def minimum_docx_bytes(job: dict) -> int:
+    value = job.get("output", {}).get("minimum_docx_bytes")
+    try:
+        return max(int(value), DEFAULT_MINIMUM_DOCX_BYTES)
+    except (TypeError, ValueError):
+        return DEFAULT_MINIMUM_DOCX_BYTES
+
+
+def minimum_words(job: dict) -> int:
+    value = job.get("report_contract", {}).get("length", {}).get("minimum_words")
+    try:
+        return max(int(value), DEFAULT_MINIMUM_WORDS)
+    except (TypeError, ValueError):
+        return DEFAULT_MINIMUM_WORDS
+
+
+def word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w'$%-]+\b", text or ""))
+
+
+def extract_sections(text: str) -> list[str]:
+    sections = []
+    for line in text.splitlines():
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        if cleaned.startswith("#"):
+            title = cleaned.lstrip("#").strip()
+            if title:
+                sections.append(title)
+        elif re.match(r"^[A-Z][A-Za-z0-9 &/().,'-]{8,80}:$", cleaned):
+            sections.append(cleaned.rstrip(":"))
+    seen = set()
+    unique = []
+    for section in sections:
+        key = section.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(section)
+    return unique
+
+
+def compact_for_prompt(value, limit: int = 4000):
+    if isinstance(value, dict):
+        return {str(k): compact_for_prompt(v, limit) for k, v in value.items() if v not in (None, "", [], {})}
+    if isinstance(value, list):
+        return [compact_for_prompt(item, limit) for item in value if item not in (None, "", [], {})]
+    text = str(value or "")
+    return text if len(text) <= limit else f"{text[:limit].rstrip()}..."
+
+
+def openai_model_candidates() -> list[str]:
+    candidates = [
+        env("DOPE_REPORT_OPENAI_MODEL"),
+        "gpt-5.5",
+        env("OPENAI_MODEL"),
+        "gpt-5.4",
+        "gpt-5.2",
+        "gpt-5.1",
+        "gpt-5",
+    ]
+    return [item for index, item in enumerate(candidates) if item and item not in candidates[:index]]
+
+
+def reasoning_effort_candidates() -> list[str]:
+    candidates = [
+        env("DOPE_REPORT_OPENAI_REASONING"),
+        env("DOPE_REPORT_REASONING_EFFORT"),
+        "xhigh",
+        "high",
+        "medium",
+    ]
+    return [item for index, item in enumerate(candidates) if item and item not in candidates[:index]]
+
+
+def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
+    contract = job.get("report_contract", {}) or {}
+    primary_prompt = job.get("generation_prompt") or contract.get("llm_prompt") or contract.get("requested_output")
+    uploaded_media = job.get("assets", {}).get("uploaded_media", []) or []
+    prompt_package = {
+        "primary_generation_prompt": primary_prompt,
+        "retry_note": retry_note,
+        "report_contract": contract,
+        "required_sections": contract.get("required_sections", []),
+        "writing_rules": contract.get("writing_rules", []),
+        "deal": job.get("deal", {}),
+        "company": job.get("company", {}),
+        "commerce": job.get("commerce", {}),
+        "campaign_context": job.get("campaign_context", {}),
+        "hubspot_context": {
+            "labeled_properties": job.get("hubspot_context", {}).get("labeled_properties", {}),
+            "raw_properties": job.get("hubspot_context", {}).get("raw_properties", {}),
+            "missing_core_fields": job.get("hubspot_context", {}).get("missing_core_fields", []),
+            "property_count": job.get("hubspot_context", {}).get("property_count"),
+        },
+        "uploaded_media": [
+            {
+                "filename": item.get("filename"),
+                "content_type": item.get("content_type"),
+                "byte_size": item.get("byte_size"),
+                "role": item.get("role"),
+                "endpoint": item.get("endpoint"),
+            }
+            for item in uploaded_media
+        ],
+        "quality_gate": {
+            "minimum_words": minimum_words(job),
+            "minimum_docx_bytes": minimum_docx_bytes(job),
+            "docx_signature": "PK",
+        },
+    }
+    return json.dumps(compact_for_prompt(prompt_package), indent=2, ensure_ascii=True)
+
+
+def call_openai(job: dict) -> tuple[str, dict]:
+    api_key = env("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for DOPE market reports")
+
+    minimum = minimum_words(job)
+    max_tokens = int(env("DOPE_REPORT_OPENAI_MAX_OUTPUT_TOKENS", "16000"))
+    max_tokens = max(8000, min(max_tokens, 30000))
+
+    instructions = f"""You are Alice, the private AI report desk for DOPE Marketing.
+Write professional-grade 90-day postcard/direct-mail market reports for DOPE account managers.
+Use payload["generation_prompt"] or payload["report_contract"]["llm_prompt"] as the controlling brief.
+Use HubSpot labeled properties, raw properties, missing core fields, deal/company/commerce data, and uploaded media filenames/endpoints.
+Do not invent private facts. If a field is missing, call out what the AM must collect.
+No caveman voice. No generic marketing filler. No JSON.
+Return a polished Markdown report of at least {minimum} words with clear headings, useful tables, bullets, AM-facing actions, designer notes, print production notes, and measurement/KPI details.
+Include every required section from report_contract.required_sections. Keep recommendations tied to DOPE services: direct mail, postcards, print, EDM/email, landing pages, QR/payment links, CRM follow-up, and human approval.
+The output will be rendered into a real DOCX by Alice, so write complete report content only."""
+
+    job_id = job.get("id")
+    contract = job.get("report_contract", {}) or {}
+    primary_prompt = job.get("generation_prompt") or contract.get("llm_prompt") or contract.get("requested_output") or job.get("title") or ""
+    input_text = report_prompt_input(job)
+    log(
+        "generation_prompt",
+        id=job_id,
+        provider="openai",
+        status=f"context_chars={len(input_text)} prompt={clip(primary_prompt, 260)}",
+    )
+
+    last_error = None
+    for model in openai_model_candidates():
+        for effort in reasoning_effort_candidates():
+            try:
+                log("openai_request", id=job_id, provider="openai", model=model, status=f"effort={effort} max_tokens={max_tokens}")
+                parsed = openai_response(
+                    api_key=api_key,
+                    model=model,
+                    effort=effort,
+                    instructions=instructions,
+                    input_text=input_text,
+                    max_tokens=max_tokens,
+                )
+                report_text = extract_openai_text(parsed).strip()
+                if word_count(report_text) < minimum:
+                    log(
+                        "openai_retry",
+                        id=job_id,
+                        provider="openai",
+                        model=parsed.get("model") or model,
+                        status=f"words={word_count(report_text)} minimum={minimum}",
+                    )
+                    parsed = openai_response(
+                        api_key=api_key,
+                        model=model,
+                        effort=effort,
+                        instructions=instructions,
+                        input_text=report_prompt_input(
+                            job,
+                            retry_note=f"The previous draft was only {word_count(report_text)} words. Rewrite and expand to at least {minimum} words while preserving all required sections.",
+                        ),
+                        max_tokens=max(max_tokens, 20000),
+                    )
+                    report_text = extract_openai_text(parsed).strip()
+
+                if not report_text:
+                    raise RuntimeError("OpenAI returned empty report text")
+
+                log(
+                    "openai_response",
+                    id=job_id,
+                    provider="openai",
+                    model=parsed.get("model") or model,
+                    status=f"words={word_count(report_text)} effort={effort}",
+                )
+                return report_text, {
+                    "provider": "openai",
+                    "model": parsed.get("model") or model,
+                    "usage": parsed.get("usage", {}),
+                    "reasoning_effort": effort,
+                }
+            except OpenAIRequestError as error:
+                last_error = error
+                log("openai_candidate_failed", model=model, status=f"{error.http_code}: {error.message[:140]}")
+                if error.http_code in {401, 403, 429}:
+                    raise
+                continue
+
+    raise RuntimeError(f"all OpenAI model/effort candidates failed: {last_error}")
+
+
+class OpenAIRequestError(RuntimeError):
+    def __init__(self, http_code: int, message: str) -> None:
+        super().__init__(f"OpenAI HTTP {http_code}: {message}")
+        self.http_code = http_code
+        self.message = message
+
+
+def openai_response(api_key: str, model: str, effort: str, instructions: str, input_text: str, max_tokens: int) -> dict:
+    body = {
+        "model": model,
+        "instructions": instructions,
+        "input": input_text,
+        "reasoning": {"effort": effort},
+        "text": {"verbosity": "high"},
+        "max_output_tokens": max_tokens,
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "alice-dope-market-report-worker/2.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=360) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raw = error.read().decode(errors="replace")
+        try:
+            parsed = json.loads(raw)
+            message = parsed.get("error", {}).get("message") or raw
+        except json.JSONDecodeError:
+            message = raw
+        raise OpenAIRequestError(error.code, message[:1200]) from error
+
+
+def extract_openai_text(parsed: dict) -> str:
+    texts = []
+    if isinstance(parsed.get("output_text"), str):
+        texts.append(parsed["output_text"])
+    for item in parsed.get("output", []) or []:
+        for content in item.get("content", []) or []:
+            if isinstance(content, str):
+                texts.append(content)
+            elif isinstance(content, dict):
+                if isinstance(content.get("text"), str):
+                    texts.append(content["text"])
+                elif isinstance(content.get("text"), dict) and isinstance(content["text"].get("value"), str):
+                    texts.append(content["text"]["value"])
+    return "\n".join(text.strip() for text in texts if text and text.strip())
+
+
+def parse_report_json(text: str) -> dict:
+    cleaned = text.strip()
+    match = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.S | re.I)
+    if match:
+        cleaned = match.group(1).strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return {"executive_summary": cleaned}
+
+
+def template_report(job: dict) -> dict:
+    company = job.get("company", {})
+    deal = job.get("deal", {})
+    campaign = job.get("campaign_context", {})
+    company_name = compact(company.get("name") or deal.get("company_name") or deal.get("name"), "This company")
+    crm = compact(company.get("crm_used"), "the current CRM")
+    description = compact(campaign.get("deal_description"), "No deal description was provided.")
+    return {
+        "title": f"{company_name} 90-Day Postcard Campaign Report",
+        "subtitle": "Prepared by DOPE Marketing with Alice-assisted strategy",
+        "executive_summary": (
+            f"{company_name} is a fit for a disciplined 90-day postcard campaign that connects CRM data, "
+            f"print production, and account-manager follow-up. The current brief says: {description} "
+            "The recommended approach is to start with narrow, measurable audience segments, ship in waves, "
+            "and review response signals before scaling spend."
+        ),
+        "objectives": [
+            "Turn existing CRM and opportunity data into mailed offers that account managers can follow up.",
+            "Use postcard waves to revive stale leads, support current promotions, and reach high-fit neighborhoods.",
+            "Track every campaign with a simple source code, landing page, phone path, or CRM field.",
+        ],
+        "campaigns": [
+            {
+                "name": "Reactivation Wave",
+                "audience": "Open, stalled, or previously quoted contacts in the CRM.",
+                "goal": "Create a reason for the account manager to re-open the conversation.",
+                "filters": f"Use {crm} status, last-contact date, deal stage, geography, and order history.",
+                "cadence": "Three postcard touches across 90 days with a call or email follow-up after each drop.",
+                "tracking": "Unique QR/URL, campaign code, and CRM note on every response.",
+            },
+            {
+                "name": "Neighborhood Expansion",
+                "audience": "Addresses around recent wins, service areas, or high-value target neighborhoods.",
+                "goal": "Build local awareness where delivery, service, or sales coverage is already strong.",
+                "filters": "Radius targeting, home value or business category filters where available, and suppression of poor-fit records.",
+                "cadence": "Two postcard waves, then a final reminder to the strongest segment.",
+                "tracking": "Dedicated landing page or phone extension plus source field in CRM.",
+            },
+            {
+                "name": "New Prospect Offer",
+                "audience": "Cold but qualified prospects matched to the company profile and offer.",
+                "goal": "Test a clear offer before committing to a larger list.",
+                "filters": "Industry, location, estimated value, prior engagement, and deliverability quality.",
+                "cadence": "Small first drop, evaluate response quality, then expand the best-performing list.",
+                "tracking": "Campaign ID printed on each card and matched against CRM-created opportunities.",
+            },
+        ],
+        "budget": {
+            "postcard_cost": "$0.89",
+            "assumptions": "Budget uses a planning estimate when no live quote is attached.",
+            "rows": [
+                {"campaign": "Reactivation Wave", "quantity": "1,000", "estimated_cost": "$890", "notes": "Best first test if CRM data is usable."},
+                {"campaign": "Neighborhood Expansion", "quantity": "2,500", "estimated_cost": "$2,225", "notes": "Scale after creative and list approval."},
+                {"campaign": "New Prospect Offer", "quantity": "5,000", "estimated_cost": "$4,450", "notes": "Use after the first response readout."},
+            ],
+        },
+        "measurement": [
+            "Response rate by campaign code, call path, landing page, and CRM source.",
+            "Qualified replies, booked conversations, quotes, won revenue, and cost per opportunity.",
+            "Account-manager notes after each wave so the campaign improves instead of running blind.",
+        ],
+        "data_setup": [
+            f"Confirm list exports from {crm}, including contact status, owner, geography, and suppression fields.",
+            "Approve creative, offer, compliance language, and mail quantity before production.",
+            "Keep human review in the workflow; Alice drafts and organizes, the team approves.",
+        ],
+        "next_steps": [
+            "Confirm the campaign objective and primary audience.",
+            "Upload or approve the company logo and brand colors.",
+            "Export the first list and remove bad-fit records.",
+            "Approve postcard creative and schedule the first drop.",
+        ],
+        "assumptions": [
+            "No live postage or print quote was supplied unless shown in the deal package.",
+            "Recommendations should be reviewed by the DOPE account manager before being sent to the customer.",
+        ],
+    }
+
+
+def normalize_report(report: dict, job: dict) -> dict:
+    base = template_report(job)
+    merged = {**base, **{key: value for key, value in report.items() if value not in (None, "", [])}}
+    merged["objectives"] = ensure_list(merged.get("objectives"), base["objectives"])
+    merged["campaigns"] = ensure_campaigns(merged.get("campaigns"), base["campaigns"])
+    merged["measurement"] = ensure_list(merged.get("measurement"), base["measurement"])
+    merged["data_setup"] = ensure_list(merged.get("data_setup"), base["data_setup"])
+    merged["next_steps"] = ensure_list(merged.get("next_steps"), base["next_steps"])
+    merged["assumptions"] = ensure_list(merged.get("assumptions"), base["assumptions"])
+    if not isinstance(merged.get("budget"), dict):
+        merged["budget"] = base["budget"]
+    merged["budget"]["rows"] = ensure_list(merged["budget"].get("rows"), base["budget"]["rows"])
+    return merged
+
+
+def ensure_list(value, fallback):
+    if isinstance(value, list) and value:
+        return value
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return fallback
+
+
+def ensure_campaigns(value, fallback):
+    if isinstance(value, list) and value:
+        campaigns = []
+        for item in value[:5]:
+            if isinstance(item, dict):
+                campaigns.append({**fallback[min(len(campaigns), len(fallback) - 1)], **item})
+            else:
+                campaigns.append({**fallback[min(len(campaigns), len(fallback) - 1)], "name": str(item)})
+        return campaigns
+    return fallback
+
+
+def paragraph(
+    text: str,
+    style: str | None = None,
+    bold: bool = False,
+    italic: bool = False,
+    color: str | None = None,
+    size: int | None = None,
+    shading: str | None = None,
+    keep_next: bool = False,
+) -> str:
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    ppr_bits = []
+    if style:
+        ppr_bits.append(f"<w:pStyle w:val=\"{style}\"/>")
+    if keep_next:
+        ppr_bits.append("<w:keepNext/>")
+    if shading:
+        ppr_bits.append(f"<w:shd w:fill=\"{shading}\"/>")
+    ppr_bits.append("<w:spacing w:before=\"80\" w:after=\"120\" w:line=\"276\" w:lineRule=\"auto\"/>")
+    ppr = f"<w:pPr>{''.join(ppr_bits)}</w:pPr>"
+    rpr_bits = []
+    if bold:
+        rpr_bits.append("<w:b/>")
+    if italic:
+        rpr_bits.append("<w:i/>")
+    if color:
+        rpr_bits.append(f"<w:color w:val=\"{color}\"/>")
+    if size:
+        rpr_bits.append(f"<w:sz w:val=\"{size}\"/>")
+    rpr = f"<w:rPr>{''.join(rpr_bits)}</w:rPr>" if rpr_bits else ""
+    return f"<w:p>{ppr}<w:r>{rpr}<w:t xml:space=\"preserve\">{safe_text(text)}</w:t></w:r></w:p>"
+
+
+def bullet(text: str) -> str:
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    return (
+        "<w:p><w:pPr><w:pStyle w:val=\"ListParagraph\"/>"
+        "<w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr>"
+        "<w:spacing w:before=\"40\" w:after=\"80\" w:line=\"276\" w:lineRule=\"auto\"/>"
+        "</w:pPr><w:r><w:t xml:space=\"preserve\">"
+        f"{safe_text(text)}</w:t></w:r></w:p>"
+    )
+
+
+def callout(text: str) -> str:
+    return paragraph(text, style="Callout", color=INK, shading=SOFT_RED)
+
+
+def page_break() -> str:
+    return "<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>"
+
+
+def cell_paragraph(text: str, header: bool = False) -> str:
+    text = str(text or "").strip() or " "
+    rpr = "<w:rPr><w:b/><w:color w:val=\"FFFFFF\"/></w:rPr>" if header else ""
+    return (
+        "<w:p><w:pPr><w:spacing w:before=\"20\" w:after=\"60\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>"
+        f"<w:r>{rpr}<w:t xml:space=\"preserve\">{safe_text(text)}</w:t></w:r></w:p>"
+    )
+
+
+def table(rows: list[list[str]]) -> str:
+    clean_rows = []
+    for row in rows:
+        clean = [str(cell or "").strip() for cell in row]
+        if any(clean):
+            clean_rows.append(clean)
+    if len(clean_rows) < 2:
+        return ""
+
+    column_count = max(len(row) for row in clean_rows)
+    table_width = 9360
+    widths = [table_width // column_count] * column_count
+    widths[-1] += table_width - sum(widths)
+    grid = "".join(f"<w:gridCol w:w=\"{width}\"/>" for width in widths)
+
+    rendered_rows = []
+    for row_index, row in enumerate(clean_rows):
+        cells = []
+        for index in range(column_count):
+            value = row[index] if index < len(row) else ""
+            header = row_index == 0
+            shade = f"<w:shd w:fill=\"{BRAND_RED}\"/>" if header else ""
+            cells.append(
+                "<w:tc><w:tcPr>"
+                f"<w:tcW w:w=\"{widths[index]}\" w:type=\"dxa\"/>"
+                "<w:tcMar><w:top w:w=\"120\" w:type=\"dxa\"/><w:left w:w=\"120\" w:type=\"dxa\"/><w:bottom w:w=\"120\" w:type=\"dxa\"/><w:right w:w=\"120\" w:type=\"dxa\"/></w:tcMar>"
+                f"{shade}</w:tcPr>{cell_paragraph(value, header=header)}</w:tc>"
+            )
+        rendered_rows.append("<w:tr>" + "".join(cells) + "</w:tr>")
+    return (
+        "<w:tbl><w:tblPr><w:tblStyle w:val=\"TableGrid\"/>"
+        f"<w:tblW w:w=\"{table_width}\" w:type=\"dxa\"/><w:tblInd w:w=\"0\" w:type=\"dxa\"/>"
+        "<w:tblCellMar><w:top w:w=\"120\" w:type=\"dxa\"/><w:left w:w=\"120\" w:type=\"dxa\"/><w:bottom w:w=\"120\" w:type=\"dxa\"/><w:right w:w=\"120\" w:type=\"dxa\"/></w:tblCellMar></w:tblPr>"
+        f"<w:tblGrid>{grid}</w:tblGrid>"
+        + "".join(rendered_rows)
+        + "</w:tbl>"
+    )
+
+
+def image_run(width_px: int, height_px: int) -> str:
+    max_width = 3_900_000
+    emu_per_px = 9525
+    cx = min(width_px * emu_per_px, max_width)
+    ratio = height_px / max(width_px, 1)
+    cy = int(cx * ratio)
+    return f"""
+<w:p><w:r><w:drawing>
+<wp:inline distT="0" distB="0" distL="0" distR="0">
+<wp:extent cx="{cx}" cy="{cy}"/>
+<wp:docPr id="1" name="Company logo"/>
+<a:graphic>
+<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+<pic:pic>
+<pic:nvPicPr><pic:cNvPr id="0" name="Company logo"/><pic:cNvPicPr/></pic:nvPicPr>
+<pic:blipFill><a:blip r:embed="rIdLogo"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
+<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
+</pic:pic>
+</a:graphicData>
+</a:graphic>
+</wp:inline>
+</w:drawing></w:r></w:p>
+"""
+
+
+def build_document_xml(job: dict, report: dict, logo: tuple[bytes, str] | None) -> str:
+    deal = job.get("deal", {})
+    company = job.get("company", {})
+    commerce = job.get("commerce", {})
+    campaign_context = job.get("campaign_context", {})
+    body = []
+
+    body.append(paragraph("DOPE MARKETING", bold=True, color="D71920", size=24))
+    if logo:
+        width, height = image_size(logo[0])
+        body.append(image_run(width, height))
+    body.append(paragraph(report["title"], style="Title"))
+    body.append(paragraph(report.get("subtitle", "90-Day Postcard Campaign Strategy"), color="555555", size=24))
+    body.append(paragraph(f"Prepared: {dt.date.today().strftime('%B %-d, %Y')}", color="555555"))
+    body.append(paragraph(f"Deal stage: {compact(deal.get('stage'))} | Amount: {compact(deal.get('amount'))} | Close date: {compact(deal.get('close_date'))}", color="555555"))
+    body.append(page_break())
+
+    body.append(paragraph("Executive Summary", style="Heading1"))
+    body.append(paragraph(report["executive_summary"]))
+    body.append(paragraph("Primary Objectives", style="Heading2"))
+    for item in report["objectives"]:
+        body.append(bullet(item))
+
+    body.append(paragraph("Deal Context", style="Heading2"))
+    body.append(table([
+        ["Company", compact(company.get("name") or deal.get("company_name"))],
+        ["Website", compact(company.get("website_url"))],
+        ["Industry", compact(company.get("industry"))],
+        ["CRM", compact(company.get("crm_used"))],
+        ["Deal description", compact(campaign_context.get("deal_description"))],
+        ["Quote link", compact(commerce.get("quote_purchase_link"))],
+    ]))
+    body.append(page_break())
+
+    body.append(paragraph("90-Day Campaign Plan", style="Heading1"))
+    for campaign in report["campaigns"]:
+        body.append(paragraph(compact(campaign.get("name")), style="Heading2", color="D71920"))
+        body.append(table([
+            ["Audience", compact(campaign.get("audience"))],
+            ["Goal", compact(campaign.get("goal"))],
+            ["Filters", compact(campaign.get("filters"))],
+            ["Cadence", compact(campaign.get("cadence"))],
+            ["Tracking", compact(campaign.get("tracking"))],
+        ]))
+        body.append(paragraph(""))
+    body.append(page_break())
+
+    budget = report.get("budget", {})
+    body.append(paragraph("Budget Planning", style="Heading1"))
+    body.append(paragraph(f"Planning postcard cost: {compact(budget.get('postcard_cost'), '$0.89')}"))
+    body.append(paragraph(compact(budget.get("assumptions"), "Final pricing should be confirmed before production.")))
+    rows = [["Campaign", "Quantity", "Estimated cost", "Notes"]]
+    for row in budget.get("rows", []):
+        if isinstance(row, dict):
+            rows.append([
+                compact(row.get("campaign")),
+                compact(row.get("quantity")),
+                compact(row.get("estimated_cost")),
+                compact(row.get("notes")),
+            ])
+        else:
+            rows.append([str(row), "", "", ""])
+    body.append(table(rows))
+
+    body.append(paragraph("Measurement & Reporting", style="Heading1"))
+    for item in report["measurement"]:
+        body.append(bullet(item))
+    body.append(paragraph("Data & Setup", style="Heading1"))
+    for item in report["data_setup"]:
+        body.append(bullet(item))
+    body.append(paragraph("Next Steps", style="Heading1"))
+    for item in report["next_steps"]:
+        body.append(bullet(item))
+    body.append(paragraph("Assumptions", style="Heading2"))
+    for item in report["assumptions"]:
+        body.append(bullet(item))
+
+    section = """
+<w:sectPr>
+<w:pgSz w:w="12240" w:h="15840"/>
+<w:pgMar w:top="900" w:right="900" w:bottom="900" w:left="900" w:header="450" w:footer="450" w:gutter="0"/>
+</w:sectPr>
+"""
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document
+xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"
+xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+xmlns:o="urn:schemas-microsoft-com:office:office"
+xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"
+xmlns:v="urn:schemas-microsoft-com:vml"
+xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing"
+xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+xmlns:w10="urn:schemas-microsoft-com:office:word"
+xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"
+xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"
+xmlns:wpi="http://schemas.microsoft.com/office/word/2010/wordprocessingInk"
+xmlns:wne="http://schemas.microsoft.com/office/word/2006/wordml"
+xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"
+mc:Ignorable="w14 wp14">
+<w:body>{''.join(body)}{section}</w:body>
+</w:document>"""
+
+
+def styles_xml() -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:pPr><w:spacing w:after="120" w:line="276" w:lineRule="auto"/></w:pPr><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:color w:val="{INK}"/><w:sz w:val="21"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="120" w:after="260"/></w:pPr><w:rPr><w:b/><w:color w:val="{INK}"/><w:sz w:val="42"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:pPr><w:keepNext/><w:spacing w:before="360" w:after="140"/></w:pPr><w:rPr><w:b/><w:color w:val="{BRAND_RED}"/><w:sz w:val="30"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:pPr><w:keepNext/><w:spacing w:before="220" w:after="100"/></w:pPr><w:rPr><w:b/><w:color w:val="{INK}"/><w:sz w:val="24"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Callout"><w:name w:val="Callout"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="160" w:after="160"/><w:ind w:left="180" w:right="180"/></w:pPr><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="21"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:pPr><w:ind w:left="540" w:hanging="260"/><w:spacing w:after="80"/></w:pPr><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="21"/></w:rPr></w:style>
+</w:styles>"""
+
+
+def numbering_xml() -> str:
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:abstractNum w:abstractNumId="1">
+<w:multiLevelType w:val="hybridMultilevel"/>
+<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="540" w:hanging="260"/></w:pPr></w:lvl>
+</w:abstractNum>
+<w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num>
+</w:numbering>"""
+
+
+def header_xml(job: dict) -> str:
+    company = compact(job.get("company", {}).get("name") or job.get("deal", {}).get("company_name"), "DOPE client")
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:p><w:pPr><w:pStyle w:val="Normal"/><w:jc w:val="right"/><w:spacing w:after="60"/></w:pPr><w:r><w:rPr><w:b/><w:color w:val="{BRAND_RED}"/><w:sz w:val="16"/></w:rPr><w:t>DOPE Marketing</w:t></w:r><w:r><w:rPr><w:color w:val="{MUTED}"/><w:sz w:val="16"/></w:rPr><w:t xml:space="preserve"> | {safe_text(company)}</w:t></w:r></w:p>
+</w:hdr>"""
+
+
+def footer_xml() -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:p><w:pPr><w:pStyle w:val="Normal"/><w:jc w:val="center"/><w:spacing w:before="60"/></w:pPr><w:r><w:rPr><w:color w:val="{MUTED}"/><w:sz w:val="16"/></w:rPr><w:t>Human-reviewed campaign strategy draft | Generated by Alice for DOPE</w:t></w:r></w:p>
+</w:ftr>"""
+
+
+def create_docx(job: dict, report: dict, logo: tuple[bytes, str] | None, path: Path) -> None:
+    rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"""
+    document_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rIdHeader" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+<Relationship Id="rIdFooter" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>
+<Relationship Id="rIdNumbering" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>
+{image_rel}
+</Relationships>""".format(
+        image_rel='<Relationship Id="rIdLogo" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/logo.{ext}"/>'.format(ext=logo[1]) if logo else ""
+    )
+    content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Default Extension="png" ContentType="image/png"/>
+<Default Extension="jpg" ContentType="image/jpeg"/>
+<Default Extension="jpeg" ContentType="image/jpeg"/>
+<Default Extension="gif" ContentType="image/gif"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>
+<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>
+<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>
+</Types>"""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as docx:
+        docx.writestr("[Content_Types].xml", content_types)
+        docx.writestr("_rels/.rels", rels)
+        docx.writestr("word/document.xml", build_document_xml(job, report, logo))
+        docx.writestr("word/styles.xml", styles_xml())
+        docx.writestr("word/_rels/document.xml.rels", document_rels)
+        if logo:
+            docx.writestr(f"word/media/logo.{logo[1]}", logo[0])
+
+
+def context_appendix_text(job: dict) -> str:
+    hubspot = job.get("hubspot_context", {}) or {}
+    media = job.get("assets", {}).get("uploaded_media", []) or []
+    labeled = hubspot.get("labeled_properties", {}) or {}
+    raw = hubspot.get("raw_properties", {}) or {}
+    missing = hubspot.get("missing_core_fields", []) or []
+    lines = [
+        "## Source Data Appendix",
+        "",
+        "This appendix is included so the account manager can see the facts Alice used while preparing the report.",
+        "",
+        "### Missing Core Fields",
+    ]
+    lines.append(", ".join(str(item) for item in missing) if missing else "No core fields were flagged as missing by SUN.")
+    lines.extend(["", "### Uploaded Media References"])
+    if media:
+        for item in media:
+            lines.append(f"- {item.get('filename')} ({item.get('content_type')}, {item.get('role')}) endpoint: {item.get('endpoint')}")
+    else:
+        lines.append("- No uploaded media was included in the worker package.")
+    lines.extend(["", "### HubSpot Labeled Properties"])
+    for key, value in labeled.items():
+        lines.append(f"- {key}: {value}")
+    lines.extend(["", "### Raw HubSpot Properties"])
+    for key, value in list(raw.items())[:120]:
+        lines.append(f"- {key}: {value}")
+    return "\n".join(lines).strip()
+
+
+def full_document_text(job: dict, report_text: str) -> str:
+    appendix = context_appendix_text(job)
+    return "\n\n".join(part for part in [report_text.strip(), appendix] if part)
+
+
+def markdown_table(lines: list[str]) -> list[list[str]]:
+    rows = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$", stripped):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if len(cells) > 1:
+            rows.append(cells)
+    return rows
+
+
+def markdown_to_word_body(text: str, logo: tuple[bytes, str] | None) -> str:
+    body = [paragraph("DOPE MARKETING", bold=True, color=BRAND_RED, size=24, keep_next=True)]
+    if logo:
+        width, height = image_size(logo[0])
+        body.append(image_run(width, height))
+
+    lines = text.splitlines()
+    table_lines = []
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        if "|" in line and line.strip().startswith("|"):
+            table_lines.append(line)
+            continue
+        if table_lines:
+            rows = markdown_table(table_lines)
+            if rows:
+                body.append(table(rows))
+            table_lines = []
+
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("### "):
+            body.append(paragraph(stripped[4:].strip(), style="Heading2", keep_next=True))
+        elif stripped.startswith("## "):
+            body.append(paragraph(stripped[3:].strip(), style="Heading1", keep_next=True))
+        elif stripped.startswith("# "):
+            body.append(paragraph(stripped[2:].strip(), style="Title", keep_next=True))
+        elif stripped.startswith(">"):
+            body.append(callout(stripped.lstrip(">").strip()))
+        elif stripped.startswith(("- ", "* ")):
+            body.append(bullet(stripped[2:].strip()))
+        elif re.match(r"^\d+\.\s+", stripped):
+            body.append(bullet(re.sub(r"^\d+\.\s+", "", stripped).strip()))
+        elif re.match(r"^[A-Z][A-Za-z0-9 &/().,'-]{8,80}:$", stripped):
+            body.append(paragraph(stripped.rstrip(":"), style="Heading2", keep_next=True))
+        else:
+            body.append(paragraph(stripped))
+
+    if table_lines:
+        rows = markdown_table(table_lines)
+        if rows:
+            body.append(table(rows))
+
+    section = """
+<w:sectPr>
+<w:headerReference w:type="default" r:id="rIdHeader"/>
+<w:footerReference w:type="default" r:id="rIdFooter"/>
+<w:pgSz w:w="12240" w:h="15840"/>
+<w:pgMar w:top="840" w:right="840" w:bottom="840" w:left="840" w:header="420" w:footer="420" w:gutter="0"/>
+</w:sectPr>
+"""
+    return "".join(part for part in body if part) + section
+
+
+def create_report_docx(job: dict, document_text: str, logo: tuple[bytes, str] | None, path: Path) -> None:
+    rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"""
+    document_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rIdHeader" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+<Relationship Id="rIdFooter" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>
+<Relationship Id="rIdNumbering" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>
+{image_rel}
+</Relationships>""".format(
+        image_rel='<Relationship Id="rIdLogo" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/logo.{ext}"/>'.format(ext=logo[1]) if logo else ""
+    )
+    content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Default Extension="png" ContentType="image/png"/>
+<Default Extension="jpg" ContentType="image/jpeg"/>
+<Default Extension="jpeg" ContentType="image/jpeg"/>
+<Default Extension="gif" ContentType="image/gif"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>
+<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>
+<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>
+</Types>"""
+    document_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document
+xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+<w:body>{markdown_to_word_body(document_text, logo)}</w:body>
+</w:document>"""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as docx:
+        docx.writestr("[Content_Types].xml", content_types)
+        docx.writestr("_rels/.rels", rels)
+        docx.writestr("word/document.xml", document_xml)
+        docx.writestr("word/styles.xml", styles_xml())
+        docx.writestr("word/numbering.xml", numbering_xml())
+        docx.writestr("word/header1.xml", header_xml(job))
+        docx.writestr("word/footer1.xml", footer_xml())
+        docx.writestr("word/_rels/document.xml.rels", document_rels)
+        if logo:
+            docx.writestr(f"word/media/logo.{logo[1]}", logo[0])
+
+
+def validate_report_file(job: dict, docx_path: Path, document_text: str) -> list[str]:
+    errors = []
+    payload = docx_path.read_bytes() if docx_path.exists() else b""
+    if payload[:2] != b"PK":
+        errors.append("generated file does not start with PK DOCX zip signature")
+    byte_size = len(payload)
+    min_bytes = minimum_docx_bytes(job)
+    if byte_size < min_bytes:
+        errors.append(f"generated DOCX is too small ({byte_size} bytes; minimum {min_bytes})")
+    words = word_count(document_text)
+    min_words = minimum_words(job)
+    if words < min_words:
+        errors.append(f"generated report is too short ({words} words; minimum {min_words})")
+    return errors
+
+
+def write_local_report_record(job: dict, docx_path: Path, manifest: dict, complete_result: dict | None = None) -> None:
+    complete_result = complete_result or {}
+    record = {
+        "artifact_id": manifest.get("source_artifact_id") or job.get("id"),
+        "deal_id": manifest.get("source_deal_id") or job.get("deal", {}).get("id"),
+        "title": manifest.get("report_title") or job.get("title"),
+        "status": complete_result.get("status") or "local",
+        "local_path": str(docx_path),
+        "file_url": complete_result.get("file_url"),
+        "storage_key": complete_result.get("storage_key"),
+        "byte_size": manifest.get("byte_size"),
+        "model": manifest.get("model"),
+        "provider": manifest.get("provider"),
+        "generated_at": manifest.get("generated_at"),
+        "completed_at": now_iso(),
+        "logo_embedded": manifest.get("logo_embedded"),
+        "logo_reason": manifest.get("logo_reason"),
+        "quality": {
+            "errors": manifest.get("quality_errors", []),
+            "warnings": manifest.get("quality_warnings", []),
+            "docx_signature": manifest.get("docx_signature"),
+            "minimum_docx_bytes": manifest.get("minimum_docx_bytes"),
+            "word_count": manifest.get("word_count"),
+        },
+    }
+    manifest_path = docx_path.with_suffix(".manifest.json")
+    manifest_payload = {**manifest, "complete_result": complete_result, "viewer_record": record}
+    manifest_path.write_text(json.dumps(manifest_payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    REPORT_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with REPORT_INDEX_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+
+def local_report_records(limit: int = 25) -> list[dict]:
+    records = []
+    if REPORT_INDEX_PATH.exists():
+        for line in REPORT_INDEX_PATH.read_text(errors="ignore").splitlines():
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    seen = {str(record.get("local_path")) for record in records if record.get("local_path")}
+    for manifest_path in REPORT_DIR.glob("*.manifest.json"):
+        try:
+            payload = json.loads(manifest_path.read_text(errors="ignore"))
+        except json.JSONDecodeError:
+            continue
+        record = payload.get("viewer_record") or payload
+        if record.get("local_path") and str(record["local_path"]) in seen:
+            continue
+        records.append(record)
+
+    records.sort(key=lambda item: str(item.get("completed_at") or item.get("generated_at") or ""), reverse=True)
+    return records[:limit]
+
+
+def report_record_key(record: dict) -> str:
+    for key in ["artifact_id", "local_path", "storage_key", "file_url", "title"]:
+        value = record.get(key)
+        if value not in (None, ""):
+            return f"{key}:{value}"
+    return json.dumps(record, sort_keys=True, ensure_ascii=True)
+
+
+def sync_local_report_records(records: list[dict]) -> None:
+    if not records:
+        return
+
+    merged = {}
+    for record in local_report_records(limit=5000):
+        if isinstance(record, dict):
+            merged[report_record_key(record)] = record
+    for record in records:
+        if isinstance(record, dict):
+            key = report_record_key(record)
+            merged[key] = {**merged.get(key, {}), **record}
+
+    sorted_records = sorted(
+        merged.values(),
+        key=lambda item: str(item.get("completed_at") or item.get("generated_at") or item.get("source", {}).get("created_at") or ""),
+        reverse=True,
+    )
+    REPORT_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with REPORT_INDEX_PATH.open("w", encoding="utf-8") as handle:
+        for record in sorted_records:
+            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+
+def process_one(client: DopeClient, dry_run: bool = False) -> bool:
+    job = client.next_report()
+    if not job:
+        log("idle")
+        return False
+
+    job_id = job.get("id")
+    company_name = compact(job.get("company", {}).get("name") or job.get("deal", {}).get("company_name"), "unknown")
+    log("claimed", id=job_id, status=company_name)
+    try:
+        logo = client.fetch_logo(job)
+        report_text, ai_meta = call_openai(job)
+        document_text = full_document_text(job, report_text)
+        timestamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = f"{timestamp}-{slug(company_name)}-market-report.docx"
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        docx_path = REPORT_DIR / filename
+        create_report_docx(job, document_text, logo, docx_path)
+        sections = extract_sections(document_text)
+        words = word_count(document_text)
+        quality_errors = validate_report_file(job, docx_path, document_text)
+        logo_reason = logo_missing_reason(job, logo)
+        manifest = {
+            "worker_id": client.worker_id,
+            "generated_at": now_iso(),
+            "provider": ai_meta["provider"],
+            "model": ai_meta["model"],
+            "usage": ai_meta.get("usage", {}),
+            "reasoning_effort": ai_meta.get("reasoning_effort"),
+            "word_count": words,
+            "minimum_words": minimum_words(job),
+            "minimum_docx_bytes": minimum_docx_bytes(job),
+            "byte_size": docx_path.stat().st_size,
+            "docx_signature": docx_path.read_bytes()[:2].decode("ascii", errors="replace"),
+            "report_title": sections[0] if sections else company_name,
+            "summary": report_text[:500],
+            "logo_embedded": bool(logo),
+            "logo_reason": logo_reason,
+            "media": {
+                "logo_embedded": bool(logo),
+                "logo_source": logo[2] if logo and len(logo) > 2 else None,
+                "logo_reason": logo_reason,
+                "uploaded_media_count": len(job.get("assets", {}).get("uploaded_media", []) or []),
+                "embedded_image_count": 1 if logo else 0,
+                "fetch_errors": [] if logo else [logo_reason],
+            },
+            "local_path": str(docx_path),
+            "source_artifact_id": job_id,
+            "source_deal_id": job.get("deal", {}).get("id"),
+            "sections": sections,
+            "required_sections": job.get("report_contract", {}).get("required_sections", []),
+            "quality_errors": quality_errors,
+            "quality_warnings": [],
+        }
+        if quality_errors:
+            raise RuntimeError("quality failed before complete: " + "; ".join(quality_errors))
+        if dry_run:
+            write_local_report_record(job, docx_path, manifest, {"status": "dry_run"})
+            log("dry_run_ready", id=job_id, provider=ai_meta["provider"], model=ai_meta["model"], status=str(docx_path))
+            return True
+        result = client.complete(job, docx_path, manifest)
+        write_local_report_record(job, docx_path, manifest, result)
+        log("completed", id=job_id, provider=ai_meta["provider"], model=ai_meta["model"], status=result.get("status"))
+        return True
+    except Exception as error:
+        message = f"{type(error).__name__}: {error}"
+        log("failed", id=job_id, status=message[:160])
+        try:
+            client.fail(job, message)
+        except Exception as fail_error:
+            log("fail_endpoint_error", id=job_id, status=f"{type(fail_error).__name__}: {fail_error}")
+        return False
+
+
+def main() -> int:
+    load_env_files()
+    parser = argparse.ArgumentParser(description="Alice-side worker for DOPE market-report DOCX generation.")
+    parser.add_argument("--status", action="store_true", help="Check worker API status and exit.")
+    parser.add_argument("--recent", action="store_true", help="Print the local completed-report index and exit.")
+    parser.add_argument("--once", action="store_true", help="Process one queued report and exit.")
+    parser.add_argument("--dry-run", action="store_true", help="Generate locally after claiming, but do not complete the job.")
+    parser.add_argument("--poll-seconds", type=float, default=float(env("DOPE_REPORT_WORKER_POLL_SECONDS", "10")), help="Polling delay for daemon mode.")
+    args = parser.parse_args()
+
+    client = DopeClient()
+    if args.recent:
+        try:
+            records = client.recent_reports()
+            sync_local_report_records(records)
+            print(json.dumps(records, indent=2, ensure_ascii=True))
+        except Exception as error:
+            log("recent_reports_fallback", status=f"{type(error).__name__}: {error}")
+            print(json.dumps(local_report_records(), indent=2, ensure_ascii=True))
+        return 0
+
+    status = client.status()
+    log("status", status=f"enabled={status.get('enabled')}", queued=status.get("queued"))
+    if args.status:
+        print(json.dumps({k: status.get(k) for k in ["ok", "worker_id", "enabled", "queued", "generating", "ready", "failed", "archived", "completed"]}, indent=2))
+        return 0
+
+    if args.once:
+        return 0 if process_one(client, dry_run=args.dry_run) else 1
+
+    while True:
+        process_one(client)
+        time.sleep(max(args.poll_seconds, 2.0))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nstopping", file=sys.stderr)
+        raise SystemExit(130)

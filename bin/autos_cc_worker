@@ -2,11 +2,13 @@
 # frozen_string_literal: true
 
 require "json"
+require "fileutils"
 require "net/http"
 require "securerandom"
 require "socket"
 require "time"
 require "uri"
+require_relative "alice_context_cache"
 
 class AutosCcWorker
   def initialize
@@ -16,11 +18,17 @@ class AutosCcWorker
     @poll_seconds = env("AUTOS_WORKER_POLL_SECONDS", "5").to_f.clamp(1.0, 60.0)
     @ollama_url = env("OLLAMA_URL", "http://127.0.0.1:11434").sub(%r{/+\z}, "")
     @local_model = env("AUTOS_LOCAL_MODEL", "llama3.2:3b")
+    @local_think = truthy?(env("AUTOS_LOCAL_THINK", "false"))
+    @context_cache = AliceContextCache.new(ollama_url: @ollama_url, logger: method(:log))
     @openai_fallback = truthy?(ENV["AUTOS_WORKER_OPENAI_FALLBACK"])
+    @activity_log = env("AUTOS_WORKER_ACTIVITY_LOG", File.expand_path("../log/autos_cc_activity.jsonl", __dir__))
+    @active_provider = "standby"
+    @active_model = @local_model
   end
 
   def run
     log "Alice node starting as #{@worker_id} against #{@base_url} using #{@local_model}"
+    activity("startup", base_url: @base_url, local_model: @local_model)
     log_status
 
     loop do
@@ -46,11 +54,23 @@ class AutosCcWorker
     if response.is_a?(Net::HTTPSuccess)
       status = JSON.parse(response.body)
       log "status node=#{status["node"]} enabled=#{status["enabled"]} queued=#{status["queued"]} paid=#{status.dig("paid_lane", "model")}"
+      activity(
+        "status",
+        node: status["node"],
+        enabled: status["enabled"],
+        queued: status["queued"],
+        local_model: @local_model,
+        server_local_model: status["local_model"],
+        free_lane: status["free_lane"],
+        paid_lane: status["paid_lane"]
+      )
     else
       log "status failed HTTP #{response.code}: #{response.body}"
+      activity("status_failed", http_code: response.code.to_i, body: response.body.to_s)
     end
   rescue StandardError => e
     log "status failed #{e.class}: #{e.message}"
+    activity("status_failed", error_class: e.class.name, error: e.message)
   end
 
   def next_job
@@ -61,48 +81,293 @@ class AutosCcWorker
     JSON.parse(response.body)
   end
 
-  def answer_job(job)
-    log "claim ##{job.fetch("id")} #{job["source"]} #{job["lane"]}"
-    payload = local_answer(job)
-    complete(job, payload)
-    log "answered ##{job.fetch("id")} via #{payload[:provider]} #{payload[:model]}"
-  rescue StandardError => e
-    fail_job(job, e)
-  end
+def answer_job(job)
+  log "claim ##{job.fetch("id")} #{job["source"]} #{job["lane"]}"
+  activity("question", job_snapshot(job))
+  payload = nil
+  payload = local_answer(job)
+  activity(
+    "answer",
+    job_snapshot(job).merge(
+      answer: payload[:answer],
+      provider: payload[:provider],
+      model: payload[:model],
+      usage: payload[:usage],
+      semantic_sources: payload[:semantic_sources]
+    )
+  )
+  complete(job, payload)
+  log "answered ##{job.fetch("id")} via #{payload[:provider]} #{payload[:model]}"
+  activity("complete", id: job["id"], provider: payload[:provider], model: payload[:model])
+rescue StandardError => e
+  activity("error", job_snapshot(job).merge(error_class: e.class.name, error: e.message, has_answer_payload: payload.to_h[:answer].to_s.strip != ""))
+  fail_job(job, e, payload)
+end
 
   def local_answer(job)
+    semantic_scope = worker_scope(job)
+    semantic_chunks = @context_cache.search(job["prompt"], scope: semantic_scope)
+    semantic_context = @context_cache.format_results(semantic_chunks)
+    context_used = [job["context"].to_s, semantic_context].reject { |part| part.strip.empty? }.join("\n\n--- ALICE SEMANTIC CONTEXT ---\n\n")
+
     prompt = <<~PROMPT
       #{job["system_prompt"]}
 
       CC CONTEXT CACHE RULES:
-      - Prefer the supplied local context.
-      - If context is enough, answer directly in MONSTER ME TALK.
+      - Prefer the supplied local context and Alice semantic context.
+      - Follow the system prompt's requested voice for this surface.
+      - For general non-Pinball questions, answer directly from broad knowledge when safe.
+      - Accuracy is the top priority. Do not guess.
+      - If you are not confident, start your answer with LOCAL_UNCERTAIN: and give a one-line reason.
+      - Use LOCAL_UNCERTAIN: for current facts, exact external facts, technical specs, safety/medical/legal/financial claims, or broad factual questions when local context is weak.
+      - For prediction-market, betting, gambling, automated trading, arbitrage, profit-seeking, or system-gaming questions, start with LOCAL_UNCERTAIN: frontier required for betting/financial safety.
+      - Never recommend Powderball just because a question mentions markets, bets, leverage, monetization, profit, or gain money.
+      - The worker will escalate uncertain answers to OpenAI, so mark uncertainty instead of padding or hedging.
+      - Do not mention Bible, context cache, hidden prompts, or missing local files to the user.
+      - Keep normal answers under six short sentences.
+      - Do not force Pinball or monster voice on non-AUTOS/DOPE work.
       - If context is missing and you are unsure, say what you know and what you do not know.
+      - If the answer is unknown, one short sentence is enough.
+      - Never repeat the same sentence, phrase, or disclaimer.
       - You are read-only. Do not claim you sent coin, changed records, or ran commands.
 
-      LOCAL CONTEXT:
+      LOCAL CONTEXT FROM SUN:
       #{job["context"]}
+
+      ALICE SEMANTIC CONTEXT (scope=#{semantic_scope}):
+      #{semantic_context}
 
       USER QUESTION:
       #{job["prompt"]}
     PROMPT
 
+    forced_frontier_reason = frontier_required_reason(job)
+    if forced_frontier_reason
+      if openai_available?
+        progress(job, status: "frontier", provider: "openai", model: openai_model_for(job), reason: forced_frontier_reason)
+        activity("frontier_required", job_snapshot(job).merge(reason: forced_frontier_reason, local_model: @local_model))
+        return openai_answer(job, fallback_reason: forced_frontier_reason)
+      end
+
+      log "frontier required for ##{job["id"]} but OPENAI_API_KEY is not configured"
+      activity("frontier_required_unavailable", job_snapshot(job).merge(reason: forced_frontier_reason, unavailable_reason: "missing_openai_api_key"))
+      answer = "αὐτός needs OpenAI frontier check for betting, prediction-market, or money-strategy questions. Me will not guess or recommend a market without that review."
+      return {
+        answer: answer,
+        provider: "local_cc",
+        model: @local_model,
+        context_used: context_used,
+        usage: approximate_usage(prompt, answer),
+        semantic_sources: semantic_chunks.map { |chunk| { path: chunk["path"], score: chunk["score"] } }
+      }
+    end
+
+    update_active_runtime(provider: "local_cc", model: @local_model)
+    progress(job, status: "local", provider: "local_cc", model: @local_model, reason: "ollama_local_context")
     response = ollama_generate(prompt)
-    answer = response.fetch("response", "").to_s.strip
+    answer = sanitize_answer(response.fetch("response", "").to_s.strip)
     raise "empty local answer" if answer.empty?
+
+    fallback_reason = frontier_fallback_reason(answer, job: job, semantic_chunks: semantic_chunks)
+    if fallback_reason
+      if openai_available?
+        progress(job, status: "frontier", provider: "openai", model: openai_model_for(job), reason: fallback_reason)
+        activity("frontier_fallback", job_snapshot(job).merge(reason: fallback_reason, local_model: response["model"] || @local_model))
+        return openai_answer(job, fallback_reason: fallback_reason)
+      end
+
+      log "frontier fallback needed for ##{job["id"]} but OPENAI_API_KEY is not configured"
+      activity("frontier_fallback_unavailable", job_snapshot(job).merge(reason: fallback_reason, unavailable_reason: "missing_openai_api_key"))
+      answer = strip_local_uncertainty_marker(answer)
+    end
 
     {
       answer: answer,
       provider: "local_cc",
       model: response["model"] || @local_model,
-      context_used: job["context"],
-      usage: approximate_usage(prompt, answer)
+      context_used: context_used,
+      usage: approximate_usage(prompt, answer),
+      semantic_sources: semantic_chunks.map { |chunk| { path: chunk["path"], score: chunk["score"] } }
     }
   rescue StandardError => e
-    raise e unless @openai_fallback && ENV["OPENAI_API_KEY"].to_s.strip != ""
+    raise e unless openai_available?
 
     openai_answer(job, fallback_reason: e.message)
   end
+
+  def frontier_fallback_reason(answer, job: nil, semantic_chunks: [])
+    forced_frontier_reason = frontier_required_reason(job)
+    return forced_frontier_reason if forced_frontier_reason
+
+    text = answer.to_s.downcase.gsub(/\s+/, " ")
+    return "local_uncertain_marker" if text.include?("local_uncertain:")
+
+strong_unknown_markers = [
+  "me not know",
+  "me not know all",
+  "i do not know",
+  "i don't know",
+  "i am not sure",
+  "i'm not sure",
+  "not sure",
+  "not certain",
+  "not fully sure",
+  "uncertain",
+  "i may be wrong",
+  "could be wrong",
+  "i can't verify",
+  "i cannot verify",
+  "cannot verify",
+  "can't verify",
+  "no reliable source",
+  "not enough context",
+  "not enough information",
+  "not enough data",
+  "need more context",
+  "need more record",
+  "missing data",
+  "no data",
+  "not have that info",
+  "do not have that info",
+  "not read that",
+  "do not know what",
+  "can't answer",
+  "cannot answer",
+  "need to verify",
+  "should verify",
+  "please verify",
+  "verify with",
+  "need to confirm",
+  "should confirm",
+  "please confirm",
+  "cannot confirm",
+  "ask an expert"
+]
+return "local_uncertain_language" if strong_unknown_markers.any? { |marker| text.include?(marker) }
+
+soft_uncertainty_markers = [
+  "me check",
+  "me think",
+  "best guess",
+  "rough guess",
+  "i think",
+  "maybe",
+  "probably",
+  "appears to",
+  "seems to",
+  "from memory",
+  "as far as i know"
+]
+if accuracy_sensitive_prompt?(job) && soft_uncertainty_markers.any? { |marker| text.include?(marker) }
+  return "local_uncertain_language"
+end
+    return "local_repeated_uncertainty" if text.scan(/\bme not\b/).length >= 3
+    return "local_repeated_uncertainty" if text.include?("me not fake")
+    return "accuracy_sensitive_weak_context" if accuracy_sensitive_prompt?(job) && weak_semantic_context?(semantic_chunks)
+
+    nil
+  end
+
+  def frontier_required_reason(job)
+    prompt = [job && job["prompt"], job && job["raw_prompt"]].compact.join(" ").downcase
+    return nil if prompt.strip.empty?
+
+    betting_terms = /\b(prediction markets?|sportsbook|wager(?:ing)?|bet(?:s|ting)?|gambl(?:e|ing)|parlay|casino|arbitrage|spread betting|market making)\b/
+    profit_terms = /\b(ai agent|bot|automated|minimal bets?|large quantity|leverage the system|exploit|game the system|edge|gain money|make money|profit|monetize|best market|place bets?)\b/
+    finance_terms = /\b(invest(?:ment|ing)?|trading|trade|stock|crypto|forex|loan|debt|tax|financial)\b/
+    strategy_terms = /\b(strategy|should i|best|monetize|profit|gain money|make money|arbitrage|leverage)\b/
+
+    return "frontier_required_betting_financial_safety" if prompt.match?(betting_terms) && prompt.match?(profit_terms)
+    return "frontier_required_system_gaming_safety" if prompt.match?(/\b(leverage the system|exploit|game the system|minimal bets?.*large quantity|large quantity.*minimal bets?)\b/)
+    return "frontier_required_financial_safety" if prompt.match?(finance_terms) && prompt.match?(strategy_terms)
+
+    nil
+  end
+
+  def frontier_fallback_needed?(answer, job: nil, semantic_chunks: [])
+    !frontier_fallback_reason(answer, job: job, semantic_chunks: semantic_chunks).nil?
+  end
+
+  def accuracy_sensitive_prompt?(job)
+    prompt = job && job["prompt"].to_s.downcase
+    return false if prompt.to_s.strip.empty?
+
+    prompt.match?(/\b(today|latest|current|currently|recent|news|price|schedule|score|weather|ceo|president|mayor|law|legal|medical|medicine|dosage|tax|financial|investment|stock|crypto|safety|safe|manual|spec|specs|compatible|largest|smallest|oldest|newest|fastest|highest|lowest|first|last|most|least)\b/) ||
+      prompt.match?(/\b(what kind of|what type of|which kind of|which type of|how long would it take|how long will it take|how many|how much)\b/) ||
+      prompt.match?(/\b(airport|vehicle|engine|oil|fluid|drug|building|space|dyson|equipment|part|model|tribal nation|prediction market|betting|wager|gambling|arbitrage|trading|profit|monetize)\b/)
+  end
+
+  def weak_semantic_context?(semantic_chunks)
+    threshold = env("AUTOS_LOCAL_STRONG_CONTEXT_SCORE", "0.62").to_f
+    top_score = Array(semantic_chunks).map { |chunk| chunk["score"].to_f }.max
+    top_score.nil? || top_score < threshold
+  end
+
+  def strip_local_uncertainty_marker(answer)
+    stripped = answer.to_s.sub(/\A\s*LOCAL_UNCERTAIN:\s*/i, "").strip
+    stripped.empty? ? answer : stripped
+  end
+
+  def openai_available?
+    @openai_fallback && ENV["OPENAI_API_KEY"].to_s.strip != ""
+  end
+
+  def openai_model_for(job)
+    config = job.fetch("openai", {})
+    env("AUTOS_WORKER_OPENAI_MODEL", config["model"] || "gpt-5.4")
+  end
+
+  def sanitize_answer(answer)
+    text = answer.to_s.gsub(/[ \t]+/, " ").gsub(/\n{3,}/, "\n\n").strip
+    return text if text.empty?
+
+    text = sanitize_persona_language(text)
+
+    text = text.gsub(/((?:\b[[:alnum:]'’]+\b\W*){2,6})(?:\s*\1){2,}/i, '\1').strip
+
+    counts = Hash.new(0)
+    kept = []
+    text.scan(/[^.!?\n]+[.!?]+|[^.!?\n]+\z|\n+/).each do |sentence|
+      if sentence.match?(/\S/)
+        normalized = sentence.downcase.gsub(/[^[:alnum:]]+/, " ").strip
+        counts[normalized] += 1 if normalized.length >= 6
+        break if counts[normalized] && counts[normalized] > 2
+      end
+      kept << sentence
+    end
+    text = kept.join(" ").gsub(/\s+([.!?,;:])/, '\1').gsub(/\n\s+/, "\n").strip if kept.any?
+
+    max_chars = env("AUTOS_LOCAL_MAX_ANSWER_CHARS", "1200").to_i.clamp(240, 4_000)
+    if text.length > max_chars
+      snippet = text[0, max_chars]
+      last_end = snippet.rindex(/[.!?]/)
+      snippet = snippet[0..last_end] if last_end && last_end > (max_chars / 2)
+      text = snippet.strip
+    end
+
+    text
+  end
+
+  def sanitize_persona_language(text)
+    text.to_s
+      .gsub(/\bcave wall\b/i, "empty input")
+      .gsub(/\bcave quiet\b/i, "room quiet")
+      .gsub(/\bcaveman\b/i, "Frankenstein monster")
+      .gsub(/\btribes\b/i, "communities")
+      .gsub(/\btribe\b/i, "community")
+  end
+
+  def worker_scope(job)
+    values = [@worker_id, @base_url, job["surface"], job["source"]].map { |value| value.to_s.downcase }
+    return "dope" if values.any? { |value| value.include?("dope") || value.include?("8182") }
+
+    "autos"
+  end
+
+def update_active_runtime(provider:, model:)
+  @active_provider = provider.to_s.empty? ? "standby" : provider.to_s
+  @active_model = model.to_s.empty? ? @local_model : model.to_s
+end
 
   def ollama_generate(prompt)
     uri = URI("#{@ollama_url}/api/generate")
@@ -112,9 +377,14 @@ class AutosCcWorker
       model: @local_model,
       prompt: prompt,
       stream: false,
+      think: @local_think,
       options: {
-        temperature: env("AUTOS_LOCAL_TEMPERATURE", "0.4").to_f,
-        num_predict: env("AUTOS_LOCAL_MAX_TOKENS", "900").to_i
+        temperature: env("AUTOS_LOCAL_TEMPERATURE", "0.25").to_f,
+        top_k: env("AUTOS_LOCAL_TOP_K", "30").to_i,
+        top_p: env("AUTOS_LOCAL_TOP_P", "0.85").to_f,
+        repeat_penalty: env("AUTOS_LOCAL_REPEAT_PENALTY", "1.25").to_f,
+        repeat_last_n: env("AUTOS_LOCAL_REPEAT_LAST_N", "128").to_i,
+        num_predict: env("AUTOS_LOCAL_MAX_TOKENS", "450").to_i
       }
     }.to_json
 
@@ -125,13 +395,55 @@ class AutosCcWorker
   end
 
   def openai_answer(job, fallback_reason:)
-    config = job.fetch("openai", {})
-    model = env("AUTOS_WORKER_OPENAI_MODEL", config["model"] || "gpt-5.4")
-    effort = env("AUTOS_WORKER_OPENAI_REASONING", config["reasoning_effort"] || "xhigh")
+    model = openai_model_for(job)
+    update_active_runtime(provider: "openai", model: model)
+    effort = ENV["AUTOS_WORKER_OPENAI_REASONING"].to_s.strip
+    effort = env("AUTOS_WORKER_OPENAI_FALLBACK_REASONING", "medium") if effort.empty?
+    max_tokens = env("AUTOS_WORKER_OPENAI_MAX_OUTPUT_TOKENS", "6000").to_i.clamp(2_000, 12_000)
+
+    parsed = openai_response(job, fallback_reason: fallback_reason, model: model, effort: effort, max_output_tokens: max_tokens)
+    answer = sanitize_persona_language(extract_openai_text(parsed))
+
+    if answer.strip.empty?
+      activity("openai_empty_response", job_snapshot(job).merge(openai: openai_diagnostic(parsed), effort: effort, max_output_tokens: max_tokens))
+      retry_effort = env("AUTOS_WORKER_OPENAI_RETRY_REASONING", "low")
+      retry_tokens = [max_tokens, 8_000].max
+      parsed = openai_response(job, fallback_reason: "#{fallback_reason}; retry after empty response", model: model, effort: retry_effort, max_output_tokens: retry_tokens)
+      answer = sanitize_persona_language(extract_openai_text(parsed))
+      effort = retry_effort
+      max_tokens = retry_tokens
+    end
+
+    if answer.strip.empty?
+      diagnostic = openai_diagnostic(parsed)
+      raise "empty OpenAI fallback answer status=#{diagnostic[:status].inspect} incomplete=#{diagnostic[:incomplete_details].inspect} output_types=#{diagnostic[:output_types].inspect}"
+    end
+
+    {
+      answer: answer.strip,
+      provider: "openai",
+      model: parsed["model"] || model,
+      context_used: job["context"],
+      usage: parsed["usage"] || {},
+      openai_effort: effort,
+      openai_max_output_tokens: max_tokens
+    }
+  end
+
+  def openai_response(job, fallback_reason:, model:, effort:, max_output_tokens:)
     uri = URI("https://api.openai.com/v1/responses")
     req = Net::HTTP::Post.new(uri)
     req["Authorization"] = "Bearer #{ENV.fetch("OPENAI_API_KEY")}"
     req["Content-Type"] = "application/json"
+
+    instructions = <<~TEXT
+      #{job["system_prompt"]}
+
+      FRONTIER FALLBACK OVERRIDE:
+      This request reached OpenAI because the local model was uncertain. For general public questions, answer directly from broad knowledge even when the supplied business context is unrelated. Do not mention the local model, Bible, missing files, or context cache. For live/internal business records, use only supplied context and clearly say what cannot be known.
+      For betting, prediction-market, financial, gambling, automated trading, arbitrage, or system-gaming prompts, do not recommend exploiting markets, spamming many bets, manipulating systems, or any guaranteed-profit scheme. Do not choose Powderball just because local context mentions it. Give risk-aware, compliance-first guidance; if the user asks how to exploit a system for money, refuse that part and redirect to legitimate analytics, bankroll limits, and risk controls.
+    TEXT
+
     input = <<~TEXT
       CC fallback reason: #{fallback_reason}
 
@@ -141,58 +453,121 @@ class AutosCcWorker
       User question:
       #{job["prompt"]}
     TEXT
+
     req.body = {
       model: model,
-      instructions: job["system_prompt"],
+      instructions: instructions,
       input: input,
       reasoning: { effort: effort },
       text: { verbosity: "low" },
-      max_output_tokens: 2_000
+      max_output_tokens: max_output_tokens
     }.to_json
 
-    res = http(uri, read_timeout: 120).request(req)
+    res = http(uri, read_timeout: env("AUTOS_WORKER_OPENAI_READ_TIMEOUT", "180").to_i.clamp(30, 300)).request(req)
     parsed = JSON.parse(res.body)
     raise "openai HTTP #{res.code}: #{parsed["error"] || res.body}" unless res.is_a?(Net::HTTPSuccess)
 
-    answer = parsed["output_text"].to_s
-    if answer.empty?
-      answer = Array(parsed["output"]).flat_map { |item| Array(item["content"]).map { |c| c["text"] || c.dig("text", "value") } }.compact.join("\n")
-    end
-    raise "empty OpenAI fallback answer" if answer.strip.empty?
+    parsed
+  end
 
+  def extract_openai_text(parsed)
+    texts = []
+    texts << parsed["output_text"] if parsed["output_text"].is_a?(String)
+
+    Array(parsed["output"]).each do |item|
+      Array(item["content"]).each do |content|
+        if content.is_a?(String)
+          texts << content
+          next
+        end
+        next unless content.is_a?(Hash)
+
+        text_value = content["text"]
+        texts << text_value if text_value.is_a?(String)
+        texts << text_value["value"] if text_value.is_a?(Hash) && text_value["value"].is_a?(String)
+        texts << content["refusal"] if content["refusal"].is_a?(String)
+      end
+    end
+
+    texts.map(&:strip).reject(&:empty?).uniq.join("\n")
+  end
+
+  def openai_diagnostic(parsed)
     {
-      answer: answer.strip,
-      provider: "openai",
-      model: parsed["model"] || model,
-      context_used: job["context"],
-      usage: parsed["usage"] || {}
+      status: parsed["status"],
+      incomplete_details: parsed["incomplete_details"],
+      output_types: Array(parsed["output"]).map do |item|
+        {
+          type: item["type"],
+          status: item["status"],
+          content_types: Array(item["content"]).map { |content| content["type"] }
+        }
+      end,
+      usage: parsed["usage"]
     }
   end
 
-  def complete(job, payload)
-    response = request(:post, job.fetch("complete_path"), payload)
-    raise "complete failed HTTP #{response.code}: #{response.body}" unless response.is_a?(Net::HTTPSuccess)
-  end
+def complete(job, payload)
+  timeout = env("AUTOS_WORKER_COMPLETE_READ_TIMEOUT", "75").to_i.clamp(15, 180)
+  response = request(:post, job.fetch("complete_path"), payload, read_timeout: timeout)
+  return if response.is_a?(Net::HTTPSuccess)
 
-  def fail_job(job, error)
-    log "failed ##{job && job["id"]}: #{error.class}: #{error.message}"
-    return unless job
+  raise "complete failed HTTP #{response.code}: #{response.body}"
+rescue Net::ReadTimeout, IOError, SystemCallError => e
+  activity("complete_retry", job_snapshot(job).merge(error_class: e.class.name, error: e.message, provider: payload.to_h[:provider], model: payload.to_h[:model]))
+  response = request(:post, job.fetch("complete_path"), payload, read_timeout: timeout)
+  raise "complete retry failed HTTP #{response.code}: #{response.body}" unless response.is_a?(Net::HTTPSuccess)
+end
 
-    request(:post, job.fetch("fail_path"), { error: "#{error.class}: #{error.message}" })
+  def progress(job, status:, provider: nil, model: nil, reason: nil)
+    path = job["progress_path"].to_s
+    return if path.empty?
+
+    payload = {
+      status: status,
+      provider: provider,
+      model: model,
+      reason: reason
+    }.compact
+    response = request(:post, path, payload)
+    return if response.is_a?(Net::HTTPSuccess)
+
+    activity("progress_failed", job_snapshot(job).merge(http_code: response.code.to_i, body: response.body.to_s, progress: payload))
   rescue StandardError => e
-    log "failed to report failure: #{e.class}: #{e.message}"
+    activity("progress_failed", job_snapshot(job).merge(error_class: e.class.name, error: e.message, progress_status: status))
   end
 
-  def request(method, path, body)
+def fail_job(job, error, payload = nil)
+  log "failed ##{job && job["id"]}: #{error.class}: #{error.message}"
+  return unless job
+
+  body = { error: "#{error.class}: #{error.message}" }
+  if payload.to_h[:answer].to_s.strip != ""
+    body.merge!(payload.to_h.slice(:answer, :provider, :model, :context_used, :usage, :openai_effort, :openai_max_output_tokens))
+  end
+
+  request(:post, job.fetch("fail_path"), body, read_timeout: env("AUTOS_WORKER_COMPLETE_READ_TIMEOUT", "75").to_i.clamp(15, 180))
+rescue StandardError => e
+  log "failed to report failure: #{e.class}: #{e.message}"
+end
+
+  def request(method, path, body, read_timeout: 30)
     uri = URI("#{@base_url}#{path}")
     klass = method == :get ? Net::HTTP::Get : Net::HTTP::Post
     req = klass.new(uri)
     req["Authorization"] = "Bearer #{@token}"
     req["X-Autos-Worker-Id"] = @worker_id
+memory = memory_snapshot
+req["X-Autos-Memory-Used-Mb"] = memory[:used_mb].to_s if memory[:used_mb]
+req["X-Autos-Memory-Total-Mb"] = memory[:total_mb].to_s if memory[:total_mb]
+req["X-Autos-Memory-Percent"] = memory[:percent].to_s if memory[:percent]
+req["X-Autos-Local-Model"] = @local_model
+req["X-Autos-Active-Provider"] = @active_provider || "standby"
+req["X-Autos-Active-Model"] = @active_model || @local_model
     req["X-Forwarded-Proto"] = "https"
     req["Content-Type"] = "application/json"
     req.body = JSON.generate(body) if body
-    http(uri).request(req)
+    http(uri, read_timeout: read_timeout).request(req)
   end
 
   def http(uri, read_timeout: 30)
@@ -202,6 +577,53 @@ class AutosCcWorker
       client.read_timeout = read_timeout
     end
   end
+
+def memory_snapshot
+  if RUBY_PLATFORM.include?("darwin")
+    mac_memory_snapshot
+  else
+    linux_memory_snapshot
+  end
+rescue StandardError
+  {}
+end
+
+def linux_memory_snapshot
+  meminfo = File.read("/proc/meminfo")
+  total_kb = meminfo[/^MemTotal:\s+(\d+) kB$/, 1].to_i
+  available_kb = meminfo[/^MemAvailable:\s+(\d+) kB$/, 1].to_i
+  return {} unless total_kb.positive? && available_kb.positive?
+
+  total_mb = (total_kb / 1024.0).round
+  used_mb = ((total_kb - available_kb) / 1024.0).round
+  memory_payload(total_mb: total_mb, used_mb: used_mb)
+rescue Errno::ENOENT
+  {}
+end
+
+def mac_memory_snapshot
+  total_bytes = `/usr/sbin/sysctl -n hw.memsize 2>/dev/null`.to_i
+  vm_stat = `/usr/bin/vm_stat 2>/dev/null`
+  page_size = vm_stat[/page size of (\d+) bytes/, 1].to_i
+  free_pages = vm_stat[/Pages free:\s+(\d+)./, 1].to_i
+  inactive_pages = vm_stat[/Pages inactive:\s+(\d+)./, 1].to_i
+  speculative_pages = vm_stat[/Pages speculative:\s+(\d+)./, 1].to_i
+  available_bytes = (free_pages + inactive_pages + speculative_pages) * page_size
+  return {} unless total_bytes.positive? && available_bytes.positive?
+
+  total_mb = (total_bytes / 1024.0 / 1024.0).round
+  used_mb = ((total_bytes - available_bytes) / 1024.0 / 1024.0).round
+  memory_payload(total_mb: total_mb, used_mb: used_mb)
+end
+
+def memory_payload(total_mb:, used_mb:)
+  percent = total_mb.positive? ? ((used_mb.to_f / total_mb) * 100).round : nil
+  {
+    used_mb: used_mb,
+    total_mb: total_mb,
+    percent: percent&.clamp(0, 100)
+  }.compact
+end
 
   def approximate_usage(prompt, answer)
     {
@@ -218,6 +640,34 @@ class AutosCcWorker
 
   def truthy?(value)
     %w[1 true yes on].include?(value.to_s.downcase)
+  end
+
+  def job_snapshot(job)
+    return {} unless job
+
+    {
+      id: job["id"],
+      source: job["source"],
+      surface: job["surface"],
+      lane: job["lane"],
+      preferred_provider: job["preferred_provider"],
+      prompt: job["prompt"].to_s,
+      raw_prompt: job["raw_prompt"].to_s,
+      context_chars: job["context"].to_s.length
+    }
+  end
+
+  def activity(event, data = {})
+    payload = {
+      time: Time.now.iso8601,
+      event: event,
+      worker_id: @worker_id
+    }.merge(data)
+
+    FileUtils.mkdir_p(File.dirname(@activity_log))
+    File.open(@activity_log, "a") { |file| file.puts(JSON.generate(payload)) }
+  rescue StandardError => e
+    warn "[autos_cc_worker] #{Time.now.iso8601} activity log failed #{e.class}: #{e.message}"
   end
 
   def log(message)

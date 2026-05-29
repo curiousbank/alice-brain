@@ -1,0 +1,419 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "fileutils"
+require "json"
+require "time"
+
+class String
+  def presence
+    strip.empty? ? nil : self
+  end
+end
+
+DEFAULT_AUTOS_LOG = File.expand_path("~/.config/autos/log/autos_cc_activity.jsonl")
+DEFAULT_DOPE_LOG = File.expand_path("~/.config/autos/log/dope_cc_activity.jsonl")
+DEFAULT_DOPE_REPORT_LOG = File.expand_path("~/.config/autos/log/dope_market_report_worker.jsonl")
+LEGACY_LOG = File.expand_path("../log/autos_cc_activity.jsonl", __dir__)
+
+raw = ARGV.delete("--raw")
+all = ARGV.delete("--all")
+follow = !ARGV.delete("--no-follow")
+autos_only = ARGV.delete("--autos") || ARGV.delete("--pinball") || ARGV.delete("--pinball-autos")
+dope_only = ARGV.delete("--dope")
+reports_only = ARGV.delete("--reports") || ARGV.delete("--dope-reports") || ARGV.delete("--market-reports")
+both = ARGV.delete("--both") || ARGV.delete("--combined")
+
+custom_log = nil
+if (idx = ARGV.index("--log"))
+  ARGV.delete_at(idx)
+  custom_log = ARGV.delete_at(idx)
+end
+
+LINE_COUNT = Integer(ENV.fetch("AUTOS_CC_WATCH_LINES", "120"))
+IDLE_HEARTBEAT_SECONDS = Integer(ENV.fetch("AUTOS_CC_WATCH_IDLE_HEARTBEAT_SECONDS", "60"))
+
+if ARGV.delete("--help") || ARGV.delete("-h")
+  puts "Usage: bin/autos_cc_watch [--both] [--autos|--pinball] [--dope] [--reports] [--log PATH] [--all] [--no-follow] [--raw]"
+  puts
+  puts "Default mode:            combined AUTOS + DOPE + DOPE reports"
+  puts "Default AUTOS log:       #{DEFAULT_AUTOS_LOG}"
+  puts "Default DOPE log:        #{DEFAULT_DOPE_LOG}"
+  puts "Default DOPE report log: #{DEFAULT_DOPE_REPORT_LOG}"
+  puts "Legacy log:              #{LEGACY_LOG}"
+  puts "Idle heartbeat seconds:  #{IDLE_HEARTBEAT_SECONDS} (set AUTOS_CC_WATCH_IDLE_HEARTBEAT_SECONDS=0 to hide)"
+  exit 0
+end
+
+streams = if custom_log
+  [{ name: "CUSTOM", path: File.expand_path(custom_log) }]
+elsif reports_only && !dope_only && !autos_only && !both
+  [{ name: "DOPE.REPORTS", path: DEFAULT_DOPE_REPORT_LOG }]
+elsif dope_only && !autos_only && !both
+  [
+    { name: "DOPE.AUTOS", path: DEFAULT_DOPE_LOG },
+    { name: "DOPE.REPORTS", path: DEFAULT_DOPE_REPORT_LOG }
+  ]
+elsif autos_only && !dope_only && !both
+  [{ name: "PINBALL.AUTOS", path: DEFAULT_AUTOS_LOG }]
+else
+  [
+    { name: "PINBALL.AUTOS", path: ENV["AUTOS_WORKER_ACTIVITY_LOG"].to_s.presence || DEFAULT_AUTOS_LOG },
+    { name: "DOPE.AUTOS", path: DEFAULT_DOPE_LOG },
+    { name: "DOPE.REPORTS", path: DEFAULT_DOPE_REPORT_LOG }
+  ]
+end
+
+STATE = {
+  workers: {},
+  questions: {},
+  fallback: {},
+  reports: {},
+  last_idle: {},
+  last_idle_printed: {}
+}
+
+def parse_time(value)
+  Time.iso8601(value.to_s)
+rescue ArgumentError
+  Time.at(0)
+end
+
+def key_for(event, stream_name)
+  [stream_name, event["worker_id"].to_s, event["id"].to_s]
+end
+
+def event_order(event)
+  {
+    "startup" => 0,
+    "status" => 1,
+    "claimed" => 2,
+    "generation_prompt" => 3,
+    "question" => 2,
+    "frontier_fallback" => 3,
+    "frontier_required" => 3,
+    "openai_request" => 4,
+    "openai_retry" => 4,
+    "frontier_fallback_unavailable" => 3,
+    "openai_empty_response" => 4,
+    "openai_response" => 5,
+    "answer" => 5,
+    "completed" => 6,
+    "complete" => 6,
+    "failed" => 7,
+    "fail_endpoint_error" => 7,
+    "error" => 7,
+    "idle" => 99
+  }.fetch(event["event"].to_s, 9)
+end
+
+def compact_text(text, max = nil)
+  value = text.to_s.strip
+  return "" if value.empty?
+  return value unless max && value.length > max
+
+  clipped = value[0, max]
+  last_space = clipped.rindex(/\s/)
+  clipped = clipped[0...last_space] if last_space && last_space > (max * 0.65)
+  "#{clipped.strip}..."
+end
+
+def print_block(label, text)
+  value = text.to_s.strip
+  return if value.empty?
+
+  puts "#{label}:"
+  value.split("\n").each { |line| puts "  #{line}" }
+end
+
+def origin_label(event, stream_name)
+  source = event["source"].to_s
+  surface = event["surface"].to_s
+
+  return "telegram" if source == "telegram"
+  return "power prompt/thumper" if source == "thumper"
+  return "web guest/private" if source == "web" && surface == "chicle_private"
+  return "web guest" if source == "web"
+  return "dope ask" if source == "dope" || stream_name.include?("DOPE")
+  return "autos system" if source == "system"
+
+  [source, surface].reject(&:empty?).join("/").presence || "unknown"
+end
+
+def destination_label(event, stream_name)
+  provider = event["provider"].to_s
+  model = event["model"].to_s
+  preferred = event["preferred_provider"].to_s
+  worker = STATE[:workers][event["worker_id"].to_s] || {}
+
+  if provider == "openai"
+    return ["openai", model].reject(&:empty?).join(" ")
+  end
+
+  if provider == "local_cc" || preferred == "local_cc"
+    local_model = model.presence || event["local_model"].to_s.presence || worker[:local_model]
+    return ["qwen/local", local_model].compact.join(" ")
+  end
+
+  return [provider, model].reject(&:empty?).join(" ") if provider.present? || model.present?
+
+  "pending"
+end
+
+def headline(event, stream_name)
+  id = event["id"] ? "##{event["id"]}" : nil
+  origin = origin_label(event, stream_name)
+  route = destination_label(event, stream_name)
+  bits = [stream_name, id, "origin=#{origin}", "to=#{route}"].compact
+  bits.join(" ")
+end
+
+def elapsed_for(event, stream_name)
+  key = key_for(event, stream_name)
+  question_time = STATE[:questions][key]
+  return nil unless question_time
+
+  elapsed = parse_time(event["time"]) - question_time
+  return nil if elapsed.negative?
+
+  format("%.1fs", elapsed)
+end
+
+def print_sources(event)
+  sources = event["semantic_sources"]
+  return unless sources.is_a?(Array) && sources.any?
+
+  formatted = sources.first(5).map do |source|
+    score = source["score"] ? format("%.3f", source["score"].to_f) : "?"
+    "#{source["path"]} (#{score})"
+  end
+  puts "sources=#{formatted.join("; ")}"
+end
+
+def record_state(event, stream_name)
+  worker_id = event["worker_id"].to_s
+  STATE[:workers][worker_id] ||= {}
+  if event["local_model"].to_s.presence
+    STATE[:workers][worker_id][:local_model] = event["local_model"].to_s
+  end
+
+  case event["event"].to_s
+  when "question"
+    STATE[:questions][key_for(event, stream_name)] = parse_time(event["time"])
+  when "frontier_fallback"
+    STATE[:fallback][key_for(event, stream_name)] = {
+      at: parse_time(event["time"]),
+      reason: event["reason"],
+      local_model: event["local_model"]
+    }
+  when "frontier_required"
+    STATE[:fallback][key_for(event, stream_name)] = {
+      at: parse_time(event["time"]),
+      reason: event["reason"],
+      local_model: event["local_model"]
+    }
+  when "claimed"
+    STATE[:reports][[stream_name, event["id"].to_s]] = {
+      id: event["id"],
+      title: event["status"].to_s,
+      started_at: parse_time(event["time"])
+    }
+  when "completed", "failed", "fail_endpoint_error", "dry_run_ready"
+    STATE[:reports].delete([stream_name, event["id"].to_s])
+  when "idle"
+    STATE[:last_idle][stream_name] = parse_time(event["time"])
+  end
+end
+
+def visible_history_event?(event, raw:)
+  return true if raw
+
+  event["event"].to_s != "idle"
+end
+
+def should_print_idle?(event, stream_name)
+  return false unless stream_name == "DOPE.REPORTS"
+  return false if IDLE_HEARTBEAT_SECONDS <= 0
+
+  at = parse_time(event["time"])
+  last = STATE[:last_idle_printed][stream_name]
+  return false if last && (at - last) < IDLE_HEARTBEAT_SECONDS
+
+  STATE[:last_idle_printed][stream_name] = at
+  true
+end
+
+def print_active_reports
+  active = STATE[:reports].values
+  return if active.empty?
+
+  puts
+  puts "Active DOPE report process:"
+  active.each do |report|
+    started_at = report[:started_at].is_a?(Time) ? report[:started_at].iso8601 : report[:started_at]
+    title = compact_text(report[:title], 100)
+    puts "  ##{report[:id]} #{title} started=#{started_at}"
+  end
+end
+
+def print_idle_summaries
+  STATE[:last_idle].each do |stream_name, at|
+    next unless stream_name == "DOPE.REPORTS"
+    next if IDLE_HEARTBEAT_SECONDS <= 0
+
+    STATE[:last_idle_printed][stream_name] = at
+    puts "[#{at.iso8601}] #{stream_name} polling no queued report jobs"
+  end
+end
+
+def render(event, stream_name:, raw:)
+  record_state(event, stream_name)
+
+  if raw
+    puts JSON.pretty_generate(event.merge("stream" => stream_name))
+    return
+  end
+
+  time = event["time"].to_s
+  kind = event["event"].to_s
+  if kind == "idle"
+    puts "[#{time}] #{stream_name} polling no queued report jobs" if should_print_idle?(event, stream_name)
+    return
+  end
+
+  case kind
+  when "startup"
+    puts "[#{time}] #{stream_name} worker started #{event["worker_id"]} model=#{event["local_model"]}"
+  when "status"
+    if stream_name == "DOPE.REPORTS"
+      puts "[#{time}] #{stream_name} worker #{event["status"]} queued=#{event["queued"]}"
+    else
+      server_model = event["server_local_model"]
+      suffix = server_model && server_model != event["local_model"] ? " server_model=#{server_model}" : ""
+      puts "[#{time}] #{stream_name} status enabled=#{event["enabled"]} queued=#{event["queued"]} model=#{event["local_model"]}#{suffix}"
+    end
+  when "status_failed"
+    puts "[#{time}] #{stream_name} status failed #{event["http_code"] || event["error_class"]}: #{event["body"] || event["error"]}"
+  when "claimed"
+    puts
+    puts "[#{time}] REPORT CLAIMED #{stream_name} ##{event["id"]}"
+    print_block("DEAL", event["status"])
+  when "generation_prompt"
+    puts "[#{time}] REPORT PROMPT #{stream_name} ##{event["id"]} provider=#{event["provider"]}"
+    print_block("BRIEF", compact_text(event["status"], 320))
+  when "openai_request"
+    puts "[#{time}] REPORT OPENAI START #{stream_name} ##{event["id"]} model=#{event["model"]} #{event["status"]}"
+  when "openai_retry"
+    puts "[#{time}] REPORT OPENAI RETRY #{stream_name} ##{event["id"]} model=#{event["model"]} #{event["status"]}"
+  when "openai_response"
+    puts "[#{time}] REPORT OPENAI DONE #{stream_name} ##{event["id"]} model=#{event["model"]} #{event["status"]}"
+  when "completed"
+    puts "[#{time}] REPORT COMPLETE #{stream_name} ##{event["id"]} provider=#{event["provider"]} model=#{event["model"]} result=#{event["status"]}"
+  when "dry_run_ready"
+    puts "[#{time}] REPORT READY DRY-RUN #{stream_name} ##{event["id"]} provider=#{event["provider"]} model=#{event["model"]}"
+    print_block("FILE", event["status"])
+  when "failed"
+    puts "[#{time}] REPORT FAILED #{stream_name} ##{event["id"]}"
+    print_block("ERROR", event["status"])
+  when "fail_endpoint_error"
+    puts "[#{time}] REPORT FAIL-ENDPOINT ERROR #{stream_name} ##{event["id"]}"
+    print_block("ERROR", event["status"])
+  when "logo_skipped"
+    puts "[#{time}] REPORT LOGO SKIPPED #{stream_name} ##{event["id"]} reason=#{event["status"]}"
+  when "openai_candidate_failed"
+    puts "[#{time}] REPORT MODEL SKIPPED #{stream_name} model=#{event["model"]} reason=#{event["status"]}"
+  when "recent_reports_fallback"
+    puts "[#{time}] #{stream_name} recent reports fallback #{event["status"]}"
+  when "question"
+    puts
+    puts "[#{time}] QUESTION #{headline(event, stream_name)}"
+    print_block("Q", event["prompt"])
+    puts "context_chars=#{event["context_chars"]}" if event["context_chars"]
+  when "frontier_fallback"
+    local_model = event["local_model"].to_s.presence || "local"
+    puts "[#{time}] ROUTE #{stream_name} ##{event["id"]} qwen/local #{local_model} -> openai reason=#{event["reason"]}"
+  when "frontier_required"
+    local_model = event["local_model"].to_s.presence || "local"
+    puts "[#{time}] ROUTE #{stream_name} ##{event["id"]} qwen/local #{local_model} -> openai REQUIRED reason=#{event["reason"]}"
+  when "frontier_fallback_unavailable"
+    puts "[#{time}] ROUTE #{stream_name} ##{event["id"]} openai unavailable reason=#{event["reason"]}"
+  when "openai_empty_response"
+    diagnostic = event["openai"].is_a?(Hash) ? event["openai"] : {}
+    puts "[#{time}] OPENAI_EMPTY #{stream_name} ##{event["id"]} status=#{diagnostic["status"] || diagnostic[:status]} retrying"
+  when "answer"
+    elapsed = elapsed_for(event, stream_name)
+    elapsed_suffix = elapsed ? " elapsed=#{elapsed}" : ""
+    fallback = STATE[:fallback][key_for(event, stream_name)]
+    route_note = fallback && event["provider"].to_s == "openai" ? " route=qwen->openai" : ""
+    puts "[#{time}] ANSWER #{headline(event, stream_name)} provider=#{event["provider"]} model=#{event["model"]}#{route_note}#{elapsed_suffix}"
+    print_block("A", event["answer"])
+    usage = event["usage"].is_a?(Hash) ? event["usage"] : {}
+    puts "tokens=#{usage["total_tokens"]}" if usage["total_tokens"]
+    print_sources(event)
+  when "complete"
+    elapsed = elapsed_for(event, stream_name)
+    elapsed_suffix = elapsed ? " elapsed=#{elapsed}" : ""
+    puts "[#{time}] COMPLETE #{stream_name} ##{event["id"]} via #{event["provider"]} #{event["model"]}#{elapsed_suffix}"
+  when "error"
+    elapsed = elapsed_for(event, stream_name)
+    elapsed_suffix = elapsed ? " elapsed=#{elapsed}" : ""
+    puts "[#{time}] ERROR #{headline(event, stream_name)} #{event["error_class"]}: #{event["error"]}#{elapsed_suffix}"
+  else
+    payload = event.reject { |key, _| %w[time event worker_id].include?(key) }
+    puts "[#{time}] #{stream_name} #{kind} #{payload}"
+  end
+end
+
+def parse_line(line, stream_name)
+  return nil if line.to_s.strip.empty?
+
+  event = JSON.parse(line)
+  event["_stream"] = stream_name
+  event
+rescue JSON::ParserError => e
+  warn "Skipping invalid #{stream_name} activity line: #{e.message}"
+  nil
+end
+
+streams.each do |stream|
+  FileUtils.mkdir_p(File.dirname(stream[:path]))
+  FileUtils.touch(stream[:path])
+end
+
+puts "Watching #{streams.map { |stream| "#{stream[:name]}=#{stream[:path]}" }.join(" | ")}" unless raw
+
+initial_events = streams.flat_map do |stream|
+  events = File.readlines(stream[:path]).map { |line| parse_line(line, stream[:name]) }.compact
+  if raw || all
+    events = events.last(LINE_COUNT) unless all
+  else
+    latest_idle = events.reverse.find { |event| event["event"].to_s == "idle" }
+    STATE[:last_idle][stream[:name]] = parse_time(latest_idle["time"]) if latest_idle
+    events = events.select { |event| visible_history_event?(event, raw: raw) }.last(LINE_COUNT)
+  end
+  events
+end
+
+initial_events.sort_by { |event| [parse_time(event["time"]), event["_stream"].to_s, event["id"].to_s, event_order(event)] }.each do |event|
+  render(event, stream_name: event.delete("_stream"), raw: raw)
+end
+print_active_reports unless raw
+print_idle_summaries unless raw
+
+exit 0 unless follow
+
+files = streams.map do |stream|
+  file = File.open(stream[:path], "r")
+  file.seek(0, IO::SEEK_END)
+  stream.merge(file: file)
+end
+
+loop do
+  files.each do |stream|
+    while (line = stream[:file].gets)
+      event = parse_line(line, stream[:name])
+      render(event, stream_name: event.delete("_stream"), raw: raw) if event
+    end
+  end
+  sleep 0.5
+end
