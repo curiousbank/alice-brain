@@ -38,8 +38,8 @@ STRATEGY_PROPOSAL_STYLE_PATH = EXAMPLES_DIR / "DOPE_STRATEGY_PROPOSAL_STYLE.md"
 STRATEGY_PROPOSAL_CONTEXT_PATH = CONTEXT_DIR / "dope_strategy_proposal_style.md"
 CANVA_APP_PATHS = [Path("/Applications/Canva.app"), Path.home() / "Applications" / "Canva.app"]
 MAX_LOGO_BYTES = 5 * 1024 * 1024
-DEFAULT_MINIMUM_WORDS = 900
-DEFAULT_MINIMUM_DOCX_BYTES = 12_000
+DEFAULT_MINIMUM_WORDS = 500
+DEFAULT_MINIMUM_DOCX_BYTES = 8_000
 BRAND_RED = "D71920"
 INK = "111111"
 MUTED = "555555"
@@ -308,7 +308,7 @@ def slug(value: str) -> str:
 def minimum_docx_bytes(job: dict) -> int:
     value = job.get("output", {}).get("minimum_docx_bytes")
     try:
-        return max(int(value), DEFAULT_MINIMUM_DOCX_BYTES)
+        return max(int(value), 4_000)
     except (TypeError, ValueError):
         return DEFAULT_MINIMUM_DOCX_BYTES
 
@@ -316,7 +316,7 @@ def minimum_docx_bytes(job: dict) -> int:
 def minimum_words(job: dict) -> int:
     value = job.get("report_contract", {}).get("length", {}).get("minimum_words")
     try:
-        return max(int(value), DEFAULT_MINIMUM_WORDS)
+        return max(int(value), 250)
     except (TypeError, ValueError):
         return DEFAULT_MINIMUM_WORDS
 
@@ -382,6 +382,8 @@ def reasoning_effort_candidates() -> list[str]:
 
 
 def strategy_proposal_style_summary() -> str | None:
+    if str(env("DOPE_REPORT_INCLUDE_LOCAL_STYLE", "0")).strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
     configured = env("DOPE_STRATEGY_PROPOSAL_STYLE_PATH")
     candidate_paths = [Path(configured).expanduser()] if configured else [STRATEGY_PROPOSAL_STYLE_PATH, STRATEGY_PROPOSAL_CONTEXT_PATH]
     path = next((candidate for candidate in candidate_paths if candidate.exists()), candidate_paths[0])
@@ -441,19 +443,21 @@ def call_openai(job: dict) -> tuple[str, dict]:
         raise RuntimeError("OPENAI_API_KEY is required for DOPE market reports")
 
     minimum = minimum_words(job)
-    max_tokens = int(env("DOPE_REPORT_OPENAI_MAX_OUTPUT_TOKENS", "16000"))
-    max_tokens = max(8000, min(max_tokens, 30000))
+    max_tokens = int(env("DOPE_REPORT_OPENAI_MAX_OUTPUT_TOKENS", "6000"))
+    max_tokens = max(2500, min(max_tokens, 12000))
 
     instructions = f"""You are Alice, the private AI report desk for DOPE Marketing.
-Write professional-grade 90-day postcard/direct-mail market reports for DOPE account managers.
+Write a professional, client-facing DOPE Strategy Proposal.
 Use payload["generation_prompt"] or payload["report_contract"]["llm_prompt"] as the controlling brief.
-Use payload["reference_style_summary"] as the house style guide when present. Prefer a concise 5-page DOPE Strategy Proposal over a long AI research report unless the job contract explicitly asks for a deeper report.
-Use HubSpot labeled properties, raw properties, missing core fields, deal/company/commerce data, and uploaded media filenames/endpoints.
-Do not invent private facts. If a field is missing, call out what the AM must collect.
+SUN's report contract controls the visible section order and wording. Do not append Alice legacy sections.
+Use HubSpot labeled properties, raw properties, missing core fields, deal/company/commerce data, and uploaded media filenames/endpoints as private source context only.
+Do not invent private facts. If a field is missing, call out only the customer-facing setup item when the contract asks for it.
 No caveman voice. No generic marketing filler. No JSON.
-Return a polished Markdown proposal of at least {minimum} words with clear headings, useful tables, bullets, AM-facing actions, designer notes, print production notes, and measurement/KPI details.
-Include every required section from report_contract.required_sections. Keep recommendations tied to DOPE services: direct mail, postcards, print, EDM/email, landing pages, QR/payment links, CRM follow-up, and human approval.
-Include a Canva Data Postcard Handoff section for an 8.5x11 stylized report page: headline, core insight, key stats, 90-day visual map, proof points, CTA, source notes, asset list, and human approval gates. Do not claim Canva work was created automatically.
+Return only the visible client proposal Markdown. Target 3 to 5 pages maximum.
+The visible proposal must stop after the Let's Get Started section.
+Allowed visible sections are: Header, Title section, What We'll Build Together, Your Campaign, Investment Options, How We'll Track Success, Let's Get Started.
+Do not include 90-Day Neighborhood Marketing Roadmap, DOPE Implementation Notes, AM-Facing Actions, Designer Notes, Print Production Notes, Canva Data Postcard Handoff, Source Data Appendix, HubSpot Properties, Asset List, or Human Approval Gates.
+Keep recommendations tied to DOPE services: direct mail, postcards, print, CRM/source-data follow-up, campaign tracking, and customer approval.
 The output will be rendered into a real DOCX by Alice, so write complete report content only."""
 
     job_id = job.get("id")
@@ -1049,6 +1053,58 @@ def context_appendix_text(job: dict) -> str:
     return "\n".join(lines).strip()
 
 
+FORBIDDEN_VISIBLE_HEADINGS = {
+    "90-day neighborhood marketing roadmap",
+    "dope implementation notes",
+    "am-facing actions",
+    "am facing actions",
+    "designer notes",
+    "print production notes",
+    "canva data postcard handoff",
+    "source data appendix",
+    "hubspot properties",
+    "hubspot labeled properties",
+    "raw hubspot properties",
+    "asset list",
+    "human approval gates",
+}
+
+
+def normalized_heading(value: str) -> str:
+    text = re.sub(r"^[#>*_\-\s]+", "", value or "").strip()
+    text = text.replace("’", "'").replace("`", "")
+    text = re.sub(r"[:#*_]+$", "", text).strip().lower()
+    return re.sub(r"\s+", " ", text)
+
+
+def visible_heading(line: str) -> str | None:
+    stripped = (line or "").strip()
+    if not stripped:
+        return None
+    if stripped.startswith("#"):
+        return normalized_heading(stripped)
+    plain = normalized_heading(stripped)
+    if plain in FORBIDDEN_VISIBLE_HEADINGS or plain == "let's get started":
+        return plain
+    return None
+
+
+def client_visible_document_text(job: dict, report_text: str) -> str:
+    kept = []
+    after_get_started = False
+    for line in (report_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        heading = visible_heading(line)
+        if heading in FORBIDDEN_VISIBLE_HEADINGS:
+            break
+        if after_get_started and heading:
+            break
+        kept.append(line)
+        if heading == "let's get started":
+            after_get_started = True
+    cleaned = "\n".join(kept).strip()
+    return cleaned or (report_text or "").strip()
+
+
 def canva_app_path() -> str | None:
     for path in CANVA_APP_PATHS:
         if path.exists():
@@ -1201,9 +1257,7 @@ def canva_design_handoff_text(job: dict, report_text: str) -> str:
 
 
 def full_document_text(job: dict, report_text: str) -> str:
-    canva = canva_design_handoff_text(job, report_text)
-    appendix = context_appendix_text(job)
-    return "\n\n".join(part for part in [report_text.strip(), canva, appendix] if part)
+    return client_visible_document_text(job, report_text)
 
 
 def write_canva_packet(job: dict, report_text: str, docx_path: Path) -> dict:
