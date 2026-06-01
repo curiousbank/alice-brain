@@ -9,6 +9,10 @@ class String
   def presence
     strip.empty? ? nil : self
   end
+
+  def present?
+    !strip.empty?
+  end
 end
 
 DEFAULT_AUTOS_LOG = File.expand_path("~/.config/autos/log/autos_cc_activity.jsonl")
@@ -302,6 +306,14 @@ def render(event, stream_name:, raw:)
   when "generation_prompt"
     puts "[#{time}] REPORT PROMPT #{stream_name} ##{event["id"]} provider=#{event["provider"]}"
     print_block("BRIEF", compact_text(event["status"], 320))
+  when "local_request"
+    puts "[#{time}] REPORT LOCAL/QWEN START #{stream_name} ##{event["id"]} model=#{event["model"]} #{event["status"]}"
+  when "local_retry"
+    puts "[#{time}] REPORT LOCAL/QWEN RETRY #{stream_name} ##{event["id"]} model=#{event["model"]} #{event["status"]}"
+  when "local_response"
+    puts "[#{time}] REPORT LOCAL/QWEN DONE #{stream_name} ##{event["id"]} model=#{event["model"]} #{event["status"]}"
+  when "local_candidate_failed"
+    puts "[#{time}] REPORT LOCAL/QWEN FAILED CANDIDATE #{stream_name} ##{event["id"]} model=#{event["model"]} #{event["status"]}"
   when "openai_request"
     puts "[#{time}] REPORT OPENAI START #{stream_name} ##{event["id"]} model=#{event["model"]} #{event["status"]}"
   when "openai_retry"

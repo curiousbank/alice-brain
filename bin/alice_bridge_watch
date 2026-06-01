@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SUN_SOURCE="${ALICE_BRIDGE_SUN_SOURCE:-sun-dev:/home/wb/Desktop/alice-brain/bridge/to-alice.md}"
+LOCAL_DIR="${ALICE_BRIDGE_DIR:-$HOME/Desktop/alice-brain/bridge}"
+LOCAL_FILE="${ALICE_BRIDGE_LOCAL_FILE:-$LOCAL_DIR/to-alice.md}"
+STATE_FILE="${ALICE_BRIDGE_STATE_FILE:-$LOCAL_DIR/.to-alice.sha256}"
+EVENT_LOG="${ALICE_BRIDGE_EVENT_LOG:-$LOCAL_DIR/alice-bridge-events.log}"
+HANDLER="${ALICE_BRIDGE_HANDLER:-$HOME/Desktop/alice-brain/bin/alice_bridge_handler}"
+INTERVAL="${ALICE_BRIDGE_POLL_SECONDS:-5}"
+
+mkdir -p "$LOCAL_DIR"
+touch "$LOCAL_FILE"
+
+hash_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
+
+last_hash="$(hash_file "$LOCAL_FILE")"
+if [[ -f "$STATE_FILE" ]]; then
+  last_hash="$(cat "$STATE_FILE")"
+else
+  printf '%s' "$last_hash" > "$STATE_FILE"
+fi
+
+echo "[alice_bridge_watch] polling $SUN_SOURCE every ${INTERVAL}s"
+
+while true; do
+  tmp="$LOCAL_DIR/.to-alice.tmp.$$"
+  if scp -q "$SUN_SOURCE" "$tmp"; then
+    new_hash="$(hash_file "$tmp")"
+    if [[ "$new_hash" != "$last_hash" ]]; then
+      mv "$tmp" "$LOCAL_FILE"
+      printf '%s' "$new_hash" > "$STATE_FILE"
+      last_hash="$new_hash"
+      {
+        echo "---"
+        date --iso-8601=seconds 2>/dev/null || date
+        echo "to-alice changed sha=$new_hash bytes=$(wc -c < "$LOCAL_FILE")"
+      } >> "$EVENT_LOG"
+      echo "[alice_bridge_watch] to-alice changed sha=$new_hash"
+      if [[ -x "$HANDLER" && -s "$LOCAL_FILE" ]]; then
+        "$HANDLER" "$LOCAL_FILE" || true
+      fi
+    else
+      rm -f "$tmp"
+    fi
+  else
+    rm -f "$tmp"
+    {
+      echo "---"
+      date --iso-8601=seconds 2>/dev/null || date
+      echo "scp pull failed: $SUN_SOURCE"
+    } >> "$EVENT_LOG"
+  fi
+  sleep "$INTERVAL"
+done

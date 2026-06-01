@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WATCH_FILE="${1:-${CG_ALICE_WATCH_FILE:-/home/wb/Desktop/alice-brain/bridge/from-alice.md}}"
+BRIDGE_DIR="${CG_ALICE_BRIDGE_DIR:-/home/wb/Desktop/alice-brain/bridge}"
+HANDLER_LOG="${CG_ALICE_HANDLER_LOG:-$BRIDGE_DIR/cg-bridge-handler.log}"
+CODEX_LOG="${CG_ALICE_CODEX_LOG:-$BRIDGE_DIR/cg-codex-run.log}"
+CODEX_OUT="${CG_ALICE_CODEX_OUT:-$BRIDGE_DIR/cg-codex-last-message.md}"
+CODEX_BIN="${CG_CODEX_BIN:-/home/wb/.npm-global/bin/codex}"
+
+{
+  echo "---"
+  date --iso-8601=seconds
+  echo "from-alice changed: $WATCH_FILE"
+  if [[ -n "${CG_ALICE_EVENT_JSON:-}" ]]; then
+    echo "event: $CG_ALICE_EVENT_JSON"
+  fi
+} >> "$HANDLER_LOG"
+
+if [[ "${CG_BRIDGE_CODEX_ENABLED:-0}" != "1" ]]; then
+  echo "codex auto-run disabled; set CG_BRIDGE_CODEX_ENABLED=1 in the service environment to invoke Codex." >> "$HANDLER_LOG"
+  exit 0
+fi
+
+if [[ ! -x "$CODEX_BIN" ]]; then
+  echo "codex binary not executable: $CODEX_BIN" >> "$HANDLER_LOG"
+  exit 0
+fi
+
+PROMPT="You are CG responding to the Alice bridge. Read $WATCH_FILE and decide whether action is needed. Keep actions narrow and safe. Do not expose secrets. Do not run destructive commands. If the request needs approval, write a concise note to $BRIDGE_DIR/cg-action-needed.md and stop. If it is a status/report-worker request, inspect the relevant local files/services and write the result back to $BRIDGE_DIR/to-alice.md."
+
+{
+  echo "---"
+  date --iso-8601=seconds
+  echo "running codex from bridge"
+} >> "$CODEX_LOG"
+
+"$CODEX_BIN" exec \
+  -C /home/wb/Desktop/PB \
+  --add-dir /home/wb/Desktop/DOPE \
+  --add-dir /home/wb/Desktop/alice-brain \
+  --sandbox workspace-write \
+  --output-last-message "$CODEX_OUT" \
+  "$PROMPT" >> "$CODEX_LOG" 2>&1 || true

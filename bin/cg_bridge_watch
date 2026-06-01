@@ -1,0 +1,91 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "digest"
+require "fileutils"
+require "json"
+require "time"
+
+BRIDGE_DIR = ENV.fetch("CG_ALICE_BRIDGE_DIR", File.expand_path("~/Desktop/alice-brain/bridge"))
+WATCH_FILE = ENV.fetch("CG_ALICE_WATCH_FILE", File.join(BRIDGE_DIR, "from-alice.md"))
+STATE_FILE = ENV.fetch("CG_ALICE_STATE_FILE", File.join(BRIDGE_DIR, ".from-alice.sha256"))
+EVENT_LOG = ENV.fetch("CG_ALICE_EVENT_LOG", File.join(BRIDGE_DIR, "cg-bridge-events.jsonl"))
+TEXT_LOG = ENV.fetch("CG_ALICE_TEXT_LOG", File.join(BRIDGE_DIR, "cg-bridge-events.log"))
+LATEST_FILE = ENV.fetch("CG_ALICE_LATEST_FILE", File.join(BRIDGE_DIR, "latest-from-alice.md"))
+HANDLER = ENV.fetch("CG_ALICE_HANDLER", File.expand_path("~/Desktop/alice-brain/bin/cg_bridge_handler"))
+INTERVAL = ENV.fetch("CG_ALICE_POLL_SECONDS", "5").to_f.clamp(1.0, 60.0)
+
+FileUtils.mkdir_p(BRIDGE_DIR)
+FileUtils.touch(WATCH_FILE)
+
+
+def file_digest(path)
+  Digest::SHA256.file(path).hexdigest
+rescue Errno::ENOENT
+  "missing"
+end
+
+
+def read_text(path)
+  File.read(path, encoding: "UTF-8")
+rescue Errno::ENOENT
+  ""
+rescue Encoding::InvalidByteSequenceError, Encoding::UndefinedConversionError
+  File.binread(path).force_encoding("UTF-8").scrub
+end
+
+
+def append_json(path, payload)
+  File.open(path, "a", 0o600) { |file| file.puts(JSON.generate(payload)) }
+end
+
+
+def append_text(path, text)
+  File.open(path, "a", 0o600) { |file| file.write(text) }
+end
+
+last_digest = if File.exist?(STATE_FILE)
+  File.read(STATE_FILE).strip
+else
+  initial = file_digest(WATCH_FILE)
+  File.write(STATE_FILE, initial, mode: "w", perm: 0o600)
+  initial
+end
+
+puts "[cg_bridge_watch] watching #{WATCH_FILE} every #{INTERVAL}s", flush: true
+
+loop do
+  current_digest = file_digest(WATCH_FILE)
+  if current_digest != last_digest
+    content = read_text(WATCH_FILE)
+    timestamp = Time.now.iso8601
+    event = {
+      time: timestamp,
+      event: "from_alice_changed",
+      path: WATCH_FILE,
+      sha256: current_digest,
+      bytes: content.bytesize,
+      lines: content.lines.count,
+      handler: HANDLER,
+      content_present: !content.strip.empty?
+    }
+
+    File.write(STATE_FILE, current_digest, mode: "w", perm: 0o600)
+    File.write(LATEST_FILE, content, mode: "w", perm: 0o600)
+    append_json(EVENT_LOG, event)
+    append_text(TEXT_LOG, "\n---\n#{timestamp} from-alice.md changed sha=#{current_digest} bytes=#{content.bytesize}\n")
+    puts "[cg_bridge_watch] #{timestamp} from-alice.md changed bytes=#{content.bytesize}", flush: true
+
+    if !content.strip.empty? && File.executable?(HANDLER)
+      system({ "CG_ALICE_EVENT_JSON" => JSON.generate(event) }, HANDLER, WATCH_FILE)
+    end
+
+    last_digest = current_digest
+  end
+rescue StandardError => error
+  timestamp = Time.now.iso8601
+  append_json(EVENT_LOG, { time: timestamp, event: "watcher_error", error_class: error.class.name, error: error.message })
+  warn "[cg_bridge_watch] #{timestamp} #{error.class}: #{error.message}"
+ensure
+  sleep INTERVAL
+end

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+MESSAGE_FILE="${1:-$HOME/Desktop/alice-brain/bridge/to-alice.md}"
+BRIDGE_DIR="${ALICE_BRIDGE_DIR:-$HOME/Desktop/alice-brain/bridge}"
+LOG="$BRIDGE_DIR/alice-bridge-handler.log"
+{
+  echo "---"
+  date --iso-8601=seconds 2>/dev/null || date
+  echo "new CG/SUN bridge message: $MESSAGE_FILE"
+  echo "Alice agent should inspect this file and reply by writing $BRIDGE_DIR/from-alice.md, then scp it back to SUN."
+} >> "$LOG"

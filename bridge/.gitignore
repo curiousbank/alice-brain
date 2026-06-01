@@ -1,0 +1,7 @@
+# Runtime mailbox state; keep the protocol README tracked.
+/from-alice.md
+/to-alice.md
+/latest-from-alice.md
+/*.log
+/*.jsonl
+/.*.sha256

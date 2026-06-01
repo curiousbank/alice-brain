@@ -437,6 +437,180 @@ def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
     return json.dumps(compact_for_prompt(prompt_package), indent=2, ensure_ascii=True)
 
 
+def truthy(value) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def report_runtime(job: dict) -> dict:
+    contract_runtime = job.get("report_contract", {}).get("runtime_rules", {}) or {}
+    job_runtime = job.get("ai_runtime", {}) or {}
+    return {**contract_runtime, **job_runtime}
+
+
+def local_report_required(job: dict) -> bool:
+    runtime = report_runtime(job)
+    provider = str(runtime.get("provider") or "").lower()
+    target_model = str(runtime.get("target_model") or "").lower()
+    forbidden = " ".join(str(item).lower() for item in runtime.get("forbidden_providers", []) or [])
+    return (
+        truthy(runtime.get("qwen_only"))
+        or truthy(runtime.get("force_local"))
+        or "qwen" in provider
+        or provider in {"local", "local_qwen", "qwen/local"}
+        or "qwen" in target_model
+        or ("openai" in forbidden and not truthy(runtime.get("openai_allowed")))
+    )
+
+
+def local_model_candidates(job: dict) -> list[str]:
+    runtime = report_runtime(job)
+    candidates = [
+        env("DOPE_REPORT_LOCAL_MODEL"),
+        runtime.get("target_model"),
+        runtime.get("local_model"),
+        env("AUTOS_LOCAL_MODEL"),
+        env("OLLAMA_MODEL"),
+        "qwen3:8b",
+        "llama3.2:3b",
+    ]
+    cleaned = []
+    for item in candidates:
+        value = str(item or "").strip()
+        if not value or value.lower() in {"qwen/local", "local", "openai"}:
+            continue
+        if value not in cleaned:
+            cleaned.append(value)
+    return cleaned
+
+
+def report_generation_instructions() -> str:
+    return """You are the DOPEIPEDIA market analyzer for DOPE Marketing.
+Write a professional, client-facing DOPE Strategy Proposal.
+Use payload["generation_prompt"] or payload["report_contract"]["llm_prompt"] as the controlling brief.
+SUN's report contract controls the visible section order and wording. Do not append legacy sections.
+Use HubSpot labeled properties, raw properties, missing core fields, deal/company/commerce data, and uploaded media filenames/endpoints as private source context only.
+Do not invent private facts. If a field is missing, call out only the customer-facing setup item when the contract asks for it.
+Never mention private worker names, AI vendors, model names, tokens, HubSpot IDs, or private technical metadata in visible report copy.
+No caveman voice. No generic marketing filler. No JSON. No markdown fences. No hidden thinking tags.
+Return only the visible client proposal Markdown. Target 3 to 5 pages maximum.
+The visible client proposal must stop after the Let's Get Started section.
+Allowed visible client sections are: Header, Title section, What We'll Build Together, Your Campaign, Investment Options, How We'll Track Success, Let's Get Started.
+Allowed internal AM sections are only the sections named in the AM report contract.
+Do not include 90-Day Neighborhood Marketing Roadmap, DOPE Implementation Notes, AM-Facing Actions in client reports, Designer Notes, Print Production Notes, Canva Data Postcard Handoff, Source Data Appendix, HubSpot Properties, Asset List, or Human Approval Gates.
+Keep recommendations tied to DOPE services: direct mail, postcards, print, CRM/source-data follow-up, campaign tracking, and customer approval.
+The output will be rendered into a real DOCX by the report worker, so write complete report content only."""
+
+
+def local_report_prompt(job: dict, retry_note: str | None = None) -> str:
+    package = report_prompt_input(job, retry_note=retry_note)
+    return f"{report_generation_instructions()}\n\nPAYLOAD:\n{package}\n\nReturn the final visible report copy now."
+
+
+def ollama_report_response(model: str, prompt: str) -> dict:
+    base_url = str(env("OLLAMA_URL", "http://127.0.0.1:11434") or "http://127.0.0.1:11434").rstrip("/")
+    body = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "think": False,
+        "options": {
+            "temperature": float(env("DOPE_REPORT_LOCAL_TEMPERATURE", "0.28")),
+            "top_k": int(env("DOPE_REPORT_LOCAL_TOP_K", "30")),
+            "top_p": float(env("DOPE_REPORT_LOCAL_TOP_P", "0.86")),
+            "repeat_penalty": float(env("DOPE_REPORT_LOCAL_REPEAT_PENALTY", "1.16")),
+            "repeat_last_n": int(env("DOPE_REPORT_LOCAL_REPEAT_LAST_N", "256")),
+            "num_ctx": int(env("DOPE_REPORT_LOCAL_CONTEXT", "32768")),
+            "num_predict": int(env("DOPE_REPORT_LOCAL_MAX_TOKENS", "3600")),
+        },
+    }
+    req = urllib.request.Request(
+        f"{base_url}/api/generate",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "alice-dope-market-report-worker/2.1"},
+        method="POST",
+    )
+    timeout = int(env("DOPE_REPORT_LOCAL_TIMEOUT", "900"))
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def strip_model_thinking(text: str) -> str:
+    cleaned = re.sub(r"<think>.*?</think>", "", text or "", flags=re.I | re.S)
+    cleaned = re.sub(r"^\s*```(?:markdown|md)?\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+    return cleaned.strip()
+
+
+def call_local_qwen(job: dict) -> tuple[str, dict]:
+    minimum = minimum_words(job)
+    job_id = job.get("id")
+    primary_prompt = job.get("generation_prompt") or job.get("report_contract", {}).get("llm_prompt") or job.get("report_contract", {}).get("requested_output") or job.get("title") or ""
+    input_text = report_prompt_input(job)
+    log(
+        "generation_prompt",
+        id=job_id,
+        provider="qwen/local",
+        status=f"context_chars={len(input_text)} prompt={clip(primary_prompt, 260)}",
+    )
+
+    last_error = None
+    for model in local_model_candidates(job):
+        try:
+            prompt = local_report_prompt(job)
+            log("local_request", id=job_id, provider="qwen/local", model=model, status=f"min_words={minimum}")
+            parsed = ollama_report_response(model, prompt)
+            report_text = strip_model_thinking(str(parsed.get("response") or ""))
+            if word_count(report_text) < minimum:
+                log(
+                    "local_retry",
+                    id=job_id,
+                    provider="qwen/local",
+                    model=parsed.get("model") or model,
+                    status=f"words={word_count(report_text)} minimum={minimum}",
+                )
+                parsed = ollama_report_response(
+                    model,
+                    local_report_prompt(
+                        job,
+                        retry_note=f"The previous draft was only {word_count(report_text)} words. Rewrite and expand to at least {minimum} words while preserving every required section and staying client-friendly.",
+                    ),
+                )
+                report_text = strip_model_thinking(str(parsed.get("response") or ""))
+
+            if not report_text:
+                raise RuntimeError("local qwen returned empty report text")
+
+            log(
+                "local_response",
+                id=job_id,
+                provider="qwen/local",
+                model=parsed.get("model") or model,
+                status=f"words={word_count(report_text)}",
+            )
+            return report_text, {
+                "provider": "qwen/local",
+                "model": parsed.get("model") or model,
+                "usage": {
+                    "prompt_eval_count": parsed.get("prompt_eval_count"),
+                    "eval_count": parsed.get("eval_count"),
+                    "total_duration": parsed.get("total_duration"),
+                    "load_duration": parsed.get("load_duration"),
+                },
+                "reasoning_effort": "local",
+            }
+        except Exception as error:
+            last_error = error
+            log("local_candidate_failed", id=job_id, provider="qwen/local", model=model, status=f"{type(error).__name__}: {str(error)[:160]}")
+            continue
+
+    raise RuntimeError(f"all local qwen candidates failed: {last_error}")
+
+
+def generate_report_text(job: dict) -> tuple[str, dict]:
+    if local_report_required(job):
+        return call_local_qwen(job)
+    return call_openai(job)
+
 def call_openai(job: dict) -> tuple[str, dict]:
     api_key = env("OPENAI_API_KEY")
     if not api_key:
@@ -446,19 +620,7 @@ def call_openai(job: dict) -> tuple[str, dict]:
     max_tokens = int(env("DOPE_REPORT_OPENAI_MAX_OUTPUT_TOKENS", "6000"))
     max_tokens = max(2500, min(max_tokens, 12000))
 
-    instructions = f"""You are Alice, the private AI report desk for DOPE Marketing.
-Write a professional, client-facing DOPE Strategy Proposal.
-Use payload["generation_prompt"] or payload["report_contract"]["llm_prompt"] as the controlling brief.
-SUN's report contract controls the visible section order and wording. Do not append Alice legacy sections.
-Use HubSpot labeled properties, raw properties, missing core fields, deal/company/commerce data, and uploaded media filenames/endpoints as private source context only.
-Do not invent private facts. If a field is missing, call out only the customer-facing setup item when the contract asks for it.
-No caveman voice. No generic marketing filler. No JSON.
-Return only the visible client proposal Markdown. Target 3 to 5 pages maximum.
-The visible proposal must stop after the Let's Get Started section.
-Allowed visible sections are: Header, Title section, What We'll Build Together, Your Campaign, Investment Options, How We'll Track Success, Let's Get Started.
-Do not include 90-Day Neighborhood Marketing Roadmap, DOPE Implementation Notes, AM-Facing Actions, Designer Notes, Print Production Notes, Canva Data Postcard Handoff, Source Data Appendix, HubSpot Properties, Asset List, or Human Approval Gates.
-Keep recommendations tied to DOPE services: direct mail, postcards, print, CRM/source-data follow-up, campaign tracking, and customer approval.
-The output will be rendered into a real DOCX by Alice, so write complete report content only."""
+    instructions = report_generation_instructions()
 
     job_id = job.get("id")
     contract = job.get("report_contract", {}) or {}
@@ -607,7 +769,7 @@ def template_report(job: dict) -> dict:
     description = compact(campaign.get("deal_description"), "No deal description was provided.")
     return {
         "title": f"{company_name} 90-Day Postcard Campaign Report",
-        "subtitle": "Prepared by DOPE Marketing with Alice-assisted strategy",
+        "subtitle": "Prepared by DOPE Marketing with DOPEIPEDIA market analysis",
         "executive_summary": (
             f"{company_name} is a fit for a disciplined 90-day postcard campaign that connects CRM data, "
             f"print production, and account-manager follow-up. The current brief says: {description} "
@@ -662,7 +824,7 @@ def template_report(job: dict) -> dict:
         "data_setup": [
             f"Confirm list exports from {crm}, including contact status, owner, geography, and suppression fields.",
             "Approve creative, offer, compliance language, and mail quantity before production.",
-            "Keep human review in the workflow; Alice drafts and organizes, the team approves.",
+            "Keep human review in the workflow; DOPEIPEDIA organizes the draft and the team approves.",
         ],
         "next_steps": [
             "Confirm the campaign objective and primary audience.",
@@ -982,7 +1144,7 @@ def header_xml(job: dict) -> str:
 def footer_xml() -> str:
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-<w:p><w:pPr><w:pStyle w:val="Normal"/><w:jc w:val="center"/><w:spacing w:before="60"/></w:pPr><w:r><w:rPr><w:color w:val="{MUTED}"/><w:sz w:val="16"/></w:rPr><w:t>Human-reviewed campaign strategy draft | Generated by Alice for DOPE</w:t></w:r></w:p>
+<w:p><w:pPr><w:pStyle w:val="Normal"/><w:jc w:val="center"/><w:spacing w:before="60"/></w:pPr><w:r><w:rPr><w:color w:val="{MUTED}"/><w:sz w:val="16"/></w:rPr><w:t>Human-reviewed campaign strategy draft | Created using the DOPEIPEDIA market analyzer</w:t></w:r></w:p>
 </w:ftr>"""
 
 
@@ -1033,7 +1195,7 @@ def context_appendix_text(job: dict) -> str:
     lines = [
         "## Source Data Appendix",
         "",
-        "This appendix is included so the account manager can see the facts Alice used while preparing the report.",
+        "This appendix is included so the account manager can see the source facts used while preparing the report.",
         "",
         "### Missing Core Fields",
     ]
@@ -1219,7 +1381,7 @@ def canva_design_handoff_text(job: dict, report_text: str) -> str:
     lines = [
         "## Canva Data Postcard Handoff",
         "",
-        "Purpose: turn this strategy into a stylized 8.5x11 data postcard/report page that informs and engages the client. Alice creates the copy/data packet; a human designer finishes the Canva design and approves exports.",
+        "Purpose: turn this strategy into a stylized 8.5x11 data postcard/report page that informs and engages the client. DOPEIPEDIA creates the copy/data packet; a human designer finishes the Canva design and approves exports.",
         "",
         "### Canva Workflow",
         f"- Canva Desktop status: {'available at ' + app_path if app_path else 'not detected on this machine'}",
@@ -1276,7 +1438,7 @@ def write_canva_packet(job: dict, report_text: str, docx_path: Path) -> dict:
         "csv_path": str(csv_path),
         "format": "8.5x11 data postcard",
         "page_count": len(rows),
-        "automation_boundary": "Alice writes copy/data. Canva design/export stays human-reviewed unless an explicit Canva API integration is approved.",
+        "automation_boundary": "DOPEIPEDIA writes copy/data. Canva design/export stays human-reviewed unless an explicit Canva API integration is approved.",
         "approval_gates": ["account_manager", "customer", "designer_preflight", "production"],
     }
 
@@ -1515,7 +1677,7 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
     log("claimed", id=job_id, status=company_name)
     try:
         logo = client.fetch_logo(job)
-        report_text, ai_meta = call_openai(job)
+        report_text, ai_meta = generate_report_text(job)
         document_text = full_document_text(job, report_text)
         timestamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
         filename = f"{timestamp}-{slug(company_name)}-market-report.docx"
