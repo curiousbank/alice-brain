@@ -373,8 +373,21 @@ def minimum_docx_bytes(job: dict) -> int:
         return DEFAULT_MINIMUM_DOCX_BYTES
 
 
+def contract_quality_gate(job: dict) -> dict:
+    return job.get("report_contract", {}).get("quality_gate", {}) or {}
+
+
+def contract_length(job: dict) -> dict:
+    return job.get("report_contract", {}).get("length", {}) or {}
+
+
 def minimum_words(job: dict) -> int:
-    value = job.get("report_contract", {}).get("length", {}).get("minimum_words")
+    value = (
+        job.get("output", {}).get("minimum_words")
+        or contract_quality_gate(job).get("minimum_words")
+        or contract_quality_gate(job).get("target_words")
+        or contract_length(job).get("minimum_words")
+    )
     try:
         return max(int(value), 250)
     except (TypeError, ValueError):
@@ -384,7 +397,9 @@ def minimum_words(job: dict) -> int:
 def hard_minimum_words(job: dict) -> int:
     value = (
         job.get("output", {}).get("hard_minimum_words")
-        or job.get("report_contract", {}).get("length", {}).get("hard_minimum_words")
+        or contract_quality_gate(job).get("hard_minimum_words")
+        or contract_quality_gate(job).get("minimum_words")
+        or contract_length(job).get("hard_minimum_words")
         or env("DOPE_REPORT_HARD_MINIMUM_WORDS")
         or DEFAULT_HARD_MINIMUM_WORDS
     )
@@ -444,6 +459,56 @@ def required_section_titles(job: dict) -> list[str]:
     return titles
 
 
+def section_aliases(title: str) -> set[str]:
+    normalized = normalize_section_text(title)
+    aliases = {normalized} if normalized else set()
+    compact = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+    alias_map = {
+        "cover": {"cover", "dope marketing", "market strategy seasonality report", "market strategy report"},
+        "header": {"header", "dope marketing"},
+        "title": {"title", "title section", "marketing proposal", "strategy proposal", "market strategy report"},
+        "executive_summary": {"executive summary", "summary"},
+        "market_snapshot": {"market snapshot", "local market snapshot", "market opportunity"},
+        "seasonality_timeline": {"seasonality timeline", "seasonality analysis", "seasonality", "campaign timing", "seasonal timeline"},
+        "recommended_campaign": {"recommended campaign", "campaign recommendation", "primary campaign", "campaign strategy"},
+        "channel_strategy": {"channel strategy", "product strategy", "direct mail vs yard signs vs door hangers", "channel comparison"},
+        "neighborhood_targeting": {"neighborhood targeting", "neighborhood targeting strategy", "targeting strategy"},
+        "offer_strategy": {"offer strategy", "offer ideas", "offer stack"},
+        "launch_plan": {"launch plan", "timeline launch plan", "suggested timeline", "campaign timeline", "timeline"},
+        "final_recommendation": {"final recommendation", "final recommendation summary", "next steps", "recommendation summary"},
+    }
+    aliases.update(alias_map.get(compact, set()))
+    aliases.update(alias_map.get(normalized.replace(" ", "_"), set()))
+    return {alias for alias in aliases if alias}
+
+
+def required_table_titles(job: dict) -> list[str]:
+    titles = []
+    for table in job.get("report_contract", {}).get("required_tables", []) or []:
+        if isinstance(table, dict):
+            title = str(table.get("title") or table.get("id") or "").strip()
+        else:
+            title = str(table or "").strip()
+        if title and title not in titles:
+            titles.append(title)
+    return titles
+
+
+def required_report_outline(job: dict) -> str:
+    sections = required_section_titles(job)
+    tables = required_table_titles(job)
+    lines = []
+    if sections:
+        lines.append("Required visible sections, in order: " + "; ".join(sections) + ".")
+    if tables:
+        lines.append("Required Markdown tables: " + "; ".join(tables) + ".")
+    quality = contract_quality_gate(job)
+    page_count = quality.get("target_pages") or job.get("report_contract", {}).get("target_pages")
+    if page_count:
+        lines.append(f"Target designed report length: {page_count} skimmable pages/sections.")
+    return "\n".join(lines)
+
+
 def report_section_titles(job: dict, text: str) -> list[str]:
     titles = extract_sections(text)
     normalized_lines = [normalize_section_text(line) for line in (text or "").splitlines() if line.strip()]
@@ -461,12 +526,12 @@ def report_section_titles(job: dict, text: str) -> list[str]:
         add("Title")
 
     for title in required_section_titles(job):
-        normalized_title = normalize_section_text(title)
-        if not normalized_title:
+        aliases = section_aliases(title)
+        if not aliases:
             continue
-        if normalized_title in {"header", "title"}:
+        if aliases & {"header", "title"}:
             continue
-        if any(line == normalized_title for line in normalized_lines) or normalized_title in normalized_document:
+        if any(any(line == alias for alias in aliases) for line in normalized_lines) or any(alias in normalized_document for alias in aliases):
             add(title)
 
     seen = set()
@@ -487,10 +552,10 @@ def missing_required_section_titles(job: dict, text: str) -> list[str]:
     present = [normalize_section_text(title) for title in report_section_titles(job, text)]
     missing = []
     for title in required:
-        normalized = normalize_section_text(title)
-        if not normalized:
+        aliases = section_aliases(title)
+        if not aliases:
             continue
-        if any(value == normalized or value in normalized or normalized in value for value in present):
+        if any(any(value == alias or value in alias or alias in value for alias in aliases) for value in present):
             continue
         missing.append(title)
     return missing
@@ -909,6 +974,17 @@ def local_model_candidates(job: dict) -> list[str]:
         if value not in candidates:
             candidates.append(value)
     if candidates:
+        if strict_local_report_contract(job) and local_fallback_models_enabled(job):
+            fallback_candidates = [
+                *env_list("DOPE_REPORT_LOCAL_FALLBACK_MODELS"),
+                *DEFAULT_LOCAL_MODEL_CANDIDATES,
+            ]
+            for item in fallback_candidates:
+                value = str(item or "").strip()
+                if not value or value.lower() in {"qwen/local", "local", "openai"}:
+                    continue
+                if value not in candidates:
+                    candidates.append(value)
         return candidates
 
     candidates = [
@@ -928,6 +1004,24 @@ def local_model_candidates(job: dict) -> list[str]:
     return cleaned
 
 
+def strict_local_report_contract(job: dict) -> bool:
+    contract = job.get("report_contract", {}) or {}
+    quality_gate = contract_quality_gate(job)
+    return bool(
+        len(contract.get("required_sections", []) or []) >= 3
+        or contract.get("required_tables", [])
+        or quality_gate.get("required_sections")
+        or quality_gate.get("required_tables")
+    )
+
+
+def local_fallback_models_enabled(job: dict) -> bool:
+    runtime = report_runtime(job)
+    if truthy(runtime.get("disable_local_model_fallbacks")):
+        return False
+    return truthy(env("DOPE_REPORT_LOCAL_FALLBACKS_ENABLED", "1"))
+
+
 def local_runtime_provider(model: str) -> str:
     return "qwen/local" if "qwen" in str(model or "").lower() else "ollama/local"
 
@@ -940,31 +1034,32 @@ def local_model_family(model: str) -> str:
     return "ollama"
 
 
-def report_generation_instructions() -> str:
-    return """You are the DOPEIPEDIA market analyzer for DOPE Marketing.
-Write a professional, client-facing DOPE Strategy Proposal.
+def report_generation_instructions(job: dict | None = None) -> str:
+    outline = required_report_outline(job or {})
+    return f"""You are the DOPEIPEDIA market analyzer for DOPE Marketing.
+Write a professional, client-facing DOPE Bold Market Report.
 Use payload["generation_prompt"] or payload["report_contract"]["llm_prompt"] as the controlling brief.
-SUN's report contract controls the visible section order and wording. Do not append legacy sections.
+SUN's report contract controls the visible section order, required tables, length, and wording. Do not append legacy sections.
+{outline}
 Use HubSpot labeled properties, raw properties, missing core fields, deal/company/commerce data, and uploaded media filenames/endpoints as private source context only.
 Analyze the full account graph when present: associated companies, contacts, prior or related deals, statuses, stages, domains, amounts, and useful HubSpot properties. Use that data to sharpen audience, timing, offer, CRM follow-up, and sales-readiness recommendations.
 If associated data exists, synthesize it into practical recommendations; if it is missing, say only the customer-facing setup item when appropriate.
 Do not invent private facts. If a field is missing, call out only the customer-facing setup item when the contract asks for it.
 Never mention private worker names, AI vendors, model names, tokens, HubSpot IDs, or private technical metadata in visible report copy.
 No caveman voice. No generic marketing filler. No JSON. No markdown fences. No hidden thinking tags.
-Return only the visible client proposal Markdown. Target 3 to 5 pages maximum.
-Make the report more compelling than a plain memo: use a strong client-specific opening, short confident paragraphs, scannable bullets, concrete campaign names, and useful tables when the data supports them.
-The visible client proposal must stop after the Let's Get Started section.
-Allowed visible client sections are: Header, Title section, What We'll Build Together, Your Campaign, Investment Options, How We'll Track Success, Let's Get Started.
+Return only the visible client report Markdown.
+Make the report feel designed, not like a memo: use large useful headings, short confident paragraphs, scannable bullets, concrete campaign names, red/black callout language, and required Markdown tables.
+The visible client report must stop after the Final Recommendation section when that section exists in the contract.
 Allowed internal AM sections are only the sections named in the AM report contract.
-Do not include 90-Day Neighborhood Marketing Roadmap, DOPE Implementation Notes, AM-Facing Actions in client reports, Designer Notes, Print Production Notes, Canva Data Postcard Handoff, Source Data Appendix, HubSpot Properties, Asset List, or Human Approval Gates.
-Keep recommendations tied to DOPE services: direct mail, postcards, print, CRM/source-data follow-up, campaign tracking, and customer approval.
+Do not include AM-Facing Actions in client reports, Designer Notes, Print Production Notes, Canva Data Postcard Handoff, Source Data Appendix, HubSpot Properties, Asset List, Human Approval Gates, assumptions tables, prompt notes, payload notes, or technical metadata.
+Keep recommendations tied to DOPE services: direct mail, postcards, yard signs, door hangers, print, CRM/source-data follow-up, campaign tracking, and customer approval.
 The output will be rendered into a real DOCX by the report worker, so write complete report content only."""
 
 
 def local_report_prompt(job: dict, retry_note: str | None = None) -> str:
     package = report_prompt_input(job, retry_note=retry_note)
     return (
-        f"{report_generation_instructions()}\n\n"
+        f"{report_generation_instructions(job)}\n\n"
         "OUTPUT CONTRACT:\n"
         "- Return only the final client-visible Markdown copy.\n"
         "- Start exactly with DOPE MARKETING.\n"
@@ -1092,11 +1187,12 @@ def visible_text_quality_errors(text: str, job: dict) -> list[str]:
     if not re.match(r"^\s*(#\s*)?(\*\*)?DOPE MARKETING\b", cleaned, flags=re.I):
         errors.append("visible copy does not start with DOPE MARKETING")
     required_tables = job.get("report_contract", {}).get("required_tables", []) or []
-    if audience != "am" and len(required_tables) >= 2 and markdown_table_count(cleaned) < 2:
-        errors.append("visible client copy is missing required campaign/investment markdown tables")
+    expected_table_count = min(len(required_tables), 4)
+    if audience != "am" and expected_table_count >= 2 and markdown_table_count(cleaned) < expected_table_count:
+        errors.append(f"visible client report is missing required Markdown tables: expected at least {expected_table_count} table(s)")
     missing_sections = missing_required_section_titles(job, cleaned)
     if missing_sections:
-        errors.append(f"visible client proposal is missing required sections: {', '.join(missing_sections)}")
+        errors.append(f"visible client report is missing required sections: {', '.join(missing_sections)}")
     return errors
 
 
@@ -2304,6 +2400,7 @@ def retryable_report_error(message: str) -> bool:
         "too small",
         "visible client proposal",
         "visible client copy",
+        "visible client report",
     ]
     return any(pattern in text for pattern in retryable_patterns)
 
@@ -2313,8 +2410,8 @@ def retry_note_from_error(message: str) -> str:
     return (
         "The previous draft failed DOPE/SUN validation. Rewrite from scratch and fix this exact issue: "
         f"{cleaned[:600]}. "
-        "Return only the client-visible proposal. Start with DOPE MARKETING. Include every required section title "
-        "from the contract, including Header and Title, and include required campaign/investment Markdown tables."
+        "Return only the client-visible report. Start with DOPE MARKETING. Include every required section title "
+        "from the contract in order, and include every required Markdown table named by the report contract."
     )
 
 
