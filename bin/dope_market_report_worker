@@ -1075,15 +1075,24 @@ def local_attempt_count() -> int:
     return bounded_int(env("DOPE_REPORT_LOCAL_ATTEMPTS"), 5, 1, 8)
 
 
-def local_retry_note(report_text: str, quality_errors: list[str], minimum: int) -> str:
+def local_retry_note(job: dict, report_text: str, quality_errors: list[str], minimum: int) -> str:
     words = word_count(report_text)
     target = max(minimum + 150, 650)
     errors = "; ".join(quality_errors) or "too short"
+    audience = str(job.get("report_contract", {}).get("audience") or job.get("metadata", {}).get("report_audience") or "client").lower()
+    if audience == "am":
+        visible_label = "internal AM-facing copy"
+        section_rule = "Include all required internal sections, especially Internal Next Moves. "
+        table_rule = "Use tables only when they help the AM act faster. "
+    else:
+        visible_label = "client-visible copy"
+        section_rule = "Include all required client-facing sections. "
+        table_rule = "Include the required campaign and investment Markdown tables. "
     return (
         f"The previous draft failed preflight: words={words}, minimum={minimum}, errors={errors}. "
-        f"Rewrite from scratch with {target}-{target + 250} words while staying client-facing and concise. "
-        "Start exactly with DOPE MARKETING. Return only client-visible copy. "
-        "Include the required campaign and investment Markdown tables. Do not include planning notes, "
+        f"Rewrite from scratch with {target}-{target + 250} words while staying concise and {visible_label}. "
+        f"Start exactly with DOPE MARKETING. Return only {visible_label}. "
+        f"{section_rule}{table_rule}Do not include planning notes, "
         "payload summaries, missing-input labels, hidden thinking, or explanation of the task."
     )
 
@@ -1192,7 +1201,8 @@ def visible_text_quality_errors(text: str, job: dict) -> list[str]:
         errors.append(f"visible client report is missing required Markdown tables: expected at least {expected_table_count} table(s)")
     missing_sections = missing_required_section_titles(job, cleaned)
     if missing_sections:
-        errors.append(f"visible client report is missing required sections: {', '.join(missing_sections)}")
+        label = "internal AM brief" if audience == "am" else "client report"
+        errors.append(f"visible {label} is missing required sections: {', '.join(missing_sections)}")
     return errors
 
 
@@ -1236,6 +1246,7 @@ def call_local_ollama(job: dict) -> tuple[str, dict]:
             report_text = ""
             parsed = {}
             quality_errors = []
+            best_under_target = None
             retry_note = job.pop("_alice_retry_note", None)
             attempts = local_attempt_count()
             for attempt in range(1, attempts + 1):
@@ -1250,17 +1261,27 @@ def call_local_ollama(job: dict) -> tuple[str, dict]:
                 words = word_count(report_text)
                 if words >= target_minimum and not quality_errors:
                     break
-                if attempt == attempts and words >= hard_minimum and not quality_errors:
+                if words >= hard_minimum and not quality_errors:
+                    best_under_target = {
+                        "attempt": attempt,
+                        "parsed": parsed,
+                        "report_text": report_text,
+                        "words": words,
+                    }
+                if attempt == attempts and best_under_target:
+                    parsed = best_under_target["parsed"]
+                    report_text = best_under_target["report_text"]
+                    quality_errors = []
                     log(
                         "local_under_target_accepted",
                         id=job_id,
                         provider=provider,
                         model=parsed.get("model") or model,
-                        status=f"words={words} target_words={target_minimum} hard_min_words={hard_minimum}",
+                        status=f"attempt={best_under_target['attempt']} words={best_under_target['words']} target_words={target_minimum} hard_min_words={hard_minimum}",
                     )
                     break
 
-                retry_note = local_retry_note(report_text, quality_errors, target_minimum)
+                retry_note = local_retry_note(job, report_text, quality_errors, target_minimum)
                 model_attempt_limit = local_model_attempt_limit(job, quality_errors, attempts)
                 abandon_model = quality_errors and attempt >= model_attempt_limit
                 event = "local_candidate_failed" if abandon_model or attempt >= attempts else "local_retry"
@@ -1271,6 +1292,22 @@ def call_local_ollama(job: dict) -> tuple[str, dict]:
                     model=parsed.get("model") or model,
                     status=f"attempt={attempt} words={words} target_words={target_minimum} hard_min_words={hard_minimum} errors={'; '.join(quality_errors)[:120]}",
                 )
+                if abandon_model and best_under_target:
+                    parsed = best_under_target["parsed"]
+                    report_text = best_under_target["report_text"]
+                    quality_errors = []
+                    log(
+                        "local_under_target_accepted",
+                        id=job_id,
+                        provider=provider,
+                        model=parsed.get("model") or model,
+                        status=(
+                            f"attempt={best_under_target['attempt']} words={best_under_target['words']} "
+                            f"target_words={target_minimum} hard_min_words={hard_minimum} "
+                            "reason=best_clean_candidate_after_structural_retry"
+                        ),
+                    )
+                    break
                 if abandon_model:
                     raise RuntimeError(
                         f"local Ollama structural preflight failed after {attempt} attempts: "
