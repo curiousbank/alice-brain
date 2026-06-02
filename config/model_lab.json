@@ -1,0 +1,74 @@
+{
+  "updated_at": "2026-06-01T15:18:00-04:00",
+  "owner": "SUN/CG",
+  "purpose": "Alice local LLM experiment registry for DOPE market reports, AUTOS/Chicle answers, bridge-agent work, and local coding support.",
+  "policy": {
+    "default_safe_model": "qwen3:8b",
+    "explicit_model_selection": "hard_fail_if_missing",
+    "redis_bridge": "preferred",
+    "file_bridge": "fallback",
+    "ollama_pull_strategy": "pull in priority order, test after each, stop if disk or memory pressure becomes unsafe"
+  },
+  "models": [
+    {
+      "model": "qwen3:30b",
+      "priority": 1,
+      "size_gb": 19,
+      "context": "256K",
+      "role": "primary heavy DOPE report brain",
+      "why": "Best first heavy local test: strong reasoning, long context, Qwen agent/tool strengths, exact Ollama tag confirmed. Use for AM/client report quality comparison against qwen3:8b."
+    },
+    {
+      "model": "qwen3.6:27b",
+      "priority": 2,
+      "size_gb": 17,
+      "context": "256K",
+      "role": "new Qwen candidate for agentic stability and thinking preservation",
+      "why": "Ollama current page lists this tag; prior Alice 404 should be retested after confirming Ollama version/catalog. If it still fails, record exact error and skip."
+    },
+    {
+      "model": "gemma4:e4b",
+      "priority": 3,
+      "size_gb": 9.6,
+      "context": "128K",
+      "role": "fast business prose and multimodal candidate",
+      "why": "Good report-writing/tone candidate with smaller footprint than 20B+ models; useful for fast client-facing drafts and image-aware experiments."
+    },
+    {
+      "model": "granite4.1:8b",
+      "priority": 4,
+      "size_gb": 5.3,
+      "context": "128K",
+      "role": "enterprise RAG, structured JSON, HubSpot/account graph extraction",
+      "why": "IBM enterprise model explicitly targets RAG, tool use, structured output, extraction, and business applications."
+    },
+    {
+      "model": "devstral-small-2:24b",
+      "priority": 5,
+      "size_gb": 15,
+      "context": "384K",
+      "role": "local coding/agent engineering candidate",
+      "why": "Best fit for Alice-side codebase/tool-agent experiments; large context and agentic coding focus."
+    }
+  ],
+  "fallback_candidates": [
+    {
+      "model": "gpt-oss:20b",
+      "size_gb": 14,
+      "context": "128K",
+      "use_if": "devstral-small-2:24b is too slow/heavy or if we want an OpenAI open-weight comparison"
+    },
+    {
+      "model": "qwen3.5:27b",
+      "size_gb": 17,
+      "context": "256K",
+      "use_if": "qwen3.6:27b remains unavailable after Ollama update/retry"
+    },
+    {
+      "model": "glm-4.7-flash",
+      "size_gb": 19,
+      "context": "198K",
+      "use_if": "Alice is upgraded to the required Ollama pre-release and we want a 30B-class MoE comparison"
+    }
+  ]
+}

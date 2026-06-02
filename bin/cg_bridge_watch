@@ -13,6 +13,8 @@ EVENT_LOG = ENV.fetch("CG_ALICE_EVENT_LOG", File.join(BRIDGE_DIR, "cg-bridge-eve
 TEXT_LOG = ENV.fetch("CG_ALICE_TEXT_LOG", File.join(BRIDGE_DIR, "cg-bridge-events.log"))
 LATEST_FILE = ENV.fetch("CG_ALICE_LATEST_FILE", File.join(BRIDGE_DIR, "latest-from-alice.md"))
 HANDLER = ENV.fetch("CG_ALICE_HANDLER", File.expand_path("~/Desktop/alice-brain/bin/cg_bridge_handler"))
+AGENT_BRIDGE = ENV.fetch("CG_AGENT_BRIDGE", File.expand_path("~/Desktop/alice-brain/bin/agent_bridge"))
+REDIS_ENABLED = ENV.fetch("CG_ALICE_REDIS_ENABLED", "1") == "1"
 INTERVAL = ENV.fetch("CG_ALICE_POLL_SECONDS", "5").to_f.clamp(1.0, 60.0)
 
 FileUtils.mkdir_p(BRIDGE_DIR)
@@ -44,6 +46,15 @@ def append_text(path, text)
   File.open(path, "a", 0o600) { |file| file.write(text) }
 end
 
+
+def poll_redis_bridge
+  return unless REDIS_ENABLED && File.executable?(AGENT_BRIDGE)
+
+  system(AGENT_BRIDGE, "poll-once", "--role", "cg")
+rescue StandardError => error
+  append_json(EVENT_LOG, { time: Time.now.iso8601, event: "redis_poll_error", error_class: error.class.name, error: error.message })
+end
+
 last_digest = if File.exist?(STATE_FILE)
   File.read(STATE_FILE).strip
 else
@@ -52,9 +63,12 @@ else
   initial
 end
 
-puts "[cg_bridge_watch] watching #{WATCH_FILE} every #{INTERVAL}s", flush: true
+$stdout.puts "[cg_bridge_watch] watching #{WATCH_FILE} every #{INTERVAL}s redis=#{REDIS_ENABLED ? 'on' : 'off'}"
+$stdout.flush
 
 loop do
+  poll_redis_bridge
+
   current_digest = file_digest(WATCH_FILE)
   if current_digest != last_digest
     content = read_text(WATCH_FILE)
@@ -74,7 +88,8 @@ loop do
     File.write(LATEST_FILE, content, mode: "w", perm: 0o600)
     append_json(EVENT_LOG, event)
     append_text(TEXT_LOG, "\n---\n#{timestamp} from-alice.md changed sha=#{current_digest} bytes=#{content.bytesize}\n")
-    puts "[cg_bridge_watch] #{timestamp} from-alice.md changed bytes=#{content.bytesize}", flush: true
+    $stdout.puts "[cg_bridge_watch] #{timestamp} from-alice.md changed bytes=#{content.bytesize}"
+    $stdout.flush
 
     if !content.strip.empty? && File.executable?(HANDLER)
       system({ "CG_ALICE_EVENT_JSON" => JSON.generate(event) }, HANDLER, WATCH_FILE)

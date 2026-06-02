@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -39,7 +40,21 @@ STRATEGY_PROPOSAL_CONTEXT_PATH = CONTEXT_DIR / "dope_strategy_proposal_style.md"
 CANVA_APP_PATHS = [Path("/Applications/Canva.app"), Path.home() / "Applications" / "Canva.app"]
 MAX_LOGO_BYTES = 5 * 1024 * 1024
 DEFAULT_MINIMUM_WORDS = 500
+DEFAULT_HARD_MINIMUM_WORDS = 250
 DEFAULT_MINIMUM_DOCX_BYTES = 8_000
+DEFAULT_EMBEDDER_MODEL = "nomic-embed-text"
+DEFAULT_EMBEDDING_TOP_K = 10
+DEFAULT_EMBEDDING_CHUNK_CHARS = 1800
+DEFAULT_EMBEDDING_MAX_CHUNKS = 80
+DEFAULT_LOCAL_MODEL_CANDIDATES = [
+    "qwen3:8b",
+    "qwen3:30b",
+    "qwen3.6:27b",
+    "devstral-small-2:24b",
+    "granite4.1:8b",
+    "gemma4:e4b",
+    "llama3.2:3b",
+]
 BRAND_RED = "D71920"
 INK = "111111"
 MUTED = "555555"
@@ -74,6 +89,11 @@ def env(name: str, default: str | None = None) -> str | None:
     return value if value not in (None, "") else default
 
 
+def env_list(name: str) -> list[str]:
+    value = env(name, "")
+    return [item.strip() for item in re.split(r"[\s,]+", value or "") if item.strip()]
+
+
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -100,7 +120,7 @@ class DopeClient:
         self.worker_id = env("DOPE_REPORT_WORKER_ID", DEFAULT_WORKER_ID)
         self.token = require_token()
 
-    def request(self, method: str, path: str, body: bytes | None = None, headers: dict[str, str] | None = None):
+    def request(self, method: str, path: str, body: bytes | None = None, headers: dict[str, str] | None = None, timeout: int | None = None):
         url = f"{self.base_url}{path}"
         request_headers = {
             "Authorization": f"Bearer {self.token}",
@@ -109,8 +129,9 @@ class DopeClient:
         }
         request_headers.update(headers or {})
         req = urllib.request.Request(url, data=body, headers=request_headers, method=method)
+        request_timeout = timeout or int(env("DOPE_REPORT_HTTP_TIMEOUT", "180"))
         try:
-            with urllib.request.urlopen(req, timeout=120) as response:
+            with urllib.request.urlopen(req, timeout=request_timeout) as response:
                 return response.status, response.headers, response.read()
         except urllib.error.HTTPError as error:
             return error.code, error.headers, error.read()
@@ -195,6 +216,7 @@ class DopeClient:
             endpoint,
             body=form,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=int(env("DOPE_REPORT_COMPLETE_TIMEOUT", "900")),
         )
         if code != 200:
             raise RuntimeError(f"complete failed HTTP {code}: {body.decode(errors='replace')[:500]}")
@@ -204,6 +226,44 @@ class DopeClient:
         endpoint = job.get("output", {}).get("fail_endpoint") or f"/dope_worker/reports/{job['id']}/fail"
         form = urllib.parse.urlencode({"error": message[:1800], "worker_id": self.worker_id}).encode("utf-8")
         self.request("POST", endpoint, body=form, headers={"Content-Type": "application/x-www-form-urlencoded"})
+
+    def heartbeat(self, job: dict) -> None:
+        endpoint = job.get("output", {}).get("heartbeat_endpoint") or f"/dope_worker/reports/{job['id']}/heartbeat"
+        code, _headers, body = self.request("POST", endpoint, body=b"")
+        if code not in (200, 204):
+            log("heartbeat_rejected", id=job.get("id"), status=f"HTTP {code}: {body.decode(errors='replace')[:160]}")
+
+
+class ReportHeartbeat:
+    def __init__(self, client: DopeClient, job: dict) -> None:
+        self.client = client
+        self.job = job
+        try:
+            self.interval = max(int(env("DOPE_REPORT_HEARTBEAT_SECONDS", "60") or "60"), 15)
+        except ValueError:
+            self.interval = 60
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="dope-report-heartbeat", daemon=True)
+
+    def __enter__(self):
+        self._beat()
+        self.thread.start()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        self.stop_event.set()
+        self.thread.join(timeout=2)
+        return False
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(self.interval):
+            self._beat()
+
+    def _beat(self) -> None:
+        try:
+            self.client.heartbeat(self.job)
+        except Exception as error:
+            log("heartbeat_error", id=self.job.get("id"), status=f"{type(error).__name__}: {str(error)[:160]}")
 
 
 def image_extension(data: bytes, content_type: str) -> str | None:
@@ -321,6 +381,19 @@ def minimum_words(job: dict) -> int:
         return DEFAULT_MINIMUM_WORDS
 
 
+def hard_minimum_words(job: dict) -> int:
+    value = (
+        job.get("output", {}).get("hard_minimum_words")
+        or job.get("report_contract", {}).get("length", {}).get("hard_minimum_words")
+        or env("DOPE_REPORT_HARD_MINIMUM_WORDS")
+        or DEFAULT_HARD_MINIMUM_WORDS
+    )
+    try:
+        return max(int(value), DEFAULT_HARD_MINIMUM_WORDS)
+    except (TypeError, ValueError):
+        return DEFAULT_HARD_MINIMUM_WORDS
+
+
 def word_count(text: str) -> int:
     return len(re.findall(r"\b[\w'$%-]+\b", text or ""))
 
@@ -348,6 +421,81 @@ def extract_sections(text: str) -> list[str]:
     return unique
 
 
+def normalize_section_text(value: str) -> str:
+    text = re.sub(r"^[#>*_\-\s]+", "", str(value or "")).strip()
+    text = text.replace("’", "'").replace("`", "")
+    text = re.sub(r"[:#*_]+$", "", text).strip().lower()
+    text = re.sub(r"[^a-z0-9'&/(). -]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def section_title_value(section) -> str:
+    if isinstance(section, dict):
+        return str(section.get("title") or section.get("id") or "").strip()
+    return str(section or "").strip()
+
+
+def required_section_titles(job: dict) -> list[str]:
+    titles = []
+    for section in job.get("report_contract", {}).get("required_sections", []) or []:
+        title = section_title_value(section)
+        if title and title not in titles:
+            titles.append(title)
+    return titles
+
+
+def report_section_titles(job: dict, text: str) -> list[str]:
+    titles = extract_sections(text)
+    normalized_lines = [normalize_section_text(line) for line in (text or "").splitlines() if line.strip()]
+    normalized_document = "\n".join(normalized_lines)
+
+    def add(title: str) -> None:
+        if title and title not in titles:
+            titles.append(title)
+
+    if re.match(r"^\s*(#\s*)?(\*\*)?DOPE MARKETING\b", text or "", flags=re.I):
+        add("Header")
+
+    first_lines = normalized_lines[:12]
+    if any("marketing proposal" in line or "strategy proposal" in line or "client strategy proposal" in line for line in first_lines):
+        add("Title")
+
+    for title in required_section_titles(job):
+        normalized_title = normalize_section_text(title)
+        if not normalized_title:
+            continue
+        if normalized_title in {"header", "title"}:
+            continue
+        if any(line == normalized_title for line in normalized_lines) or normalized_title in normalized_document:
+            add(title)
+
+    seen = set()
+    unique = []
+    for title in titles:
+        key = normalize_section_text(title)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(title)
+    return unique
+
+
+def missing_required_section_titles(job: dict, text: str) -> list[str]:
+    required = required_section_titles(job)
+    if not required:
+        return []
+    present = [normalize_section_text(title) for title in report_section_titles(job, text)]
+    missing = []
+    for title in required:
+        normalized = normalize_section_text(title)
+        if not normalized:
+            continue
+        if any(value == normalized or value in normalized or normalized in value for value in present):
+            continue
+        missing.append(title)
+    return missing
+
+
 def compact_for_prompt(value, limit: int = 4000):
     if isinstance(value, dict):
         return {str(k): compact_for_prompt(v, limit) for k, v in value.items() if v not in (None, "", [], {})}
@@ -355,6 +503,271 @@ def compact_for_prompt(value, limit: int = 4000):
         return [compact_for_prompt(item, limit) for item in value if item not in (None, "", [], {})]
     text = str(value or "")
     return text if len(text) <= limit else f"{text[:limit].rstrip()}..."
+
+
+def bounded_int(value, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def embedding_runtime(job: dict) -> dict:
+    payload_runtime = job.get("embedding_runtime", {}) or {}
+    contract_runtime = job.get("report_contract", {}).get("embedding_runtime", {}) or {}
+    runtime = {**contract_runtime, **payload_runtime}
+    requested_model = str(
+        runtime.get("model")
+        or runtime.get("embedder_model")
+        or runtime.get("target_model")
+        or env("DOPE_REPORT_EMBEDDER_MODEL")
+        or DEFAULT_EMBEDDER_MODEL
+    ).strip()
+    fallback_model = str(
+        runtime.get("fallback_model")
+        or runtime.get("fallback")
+        or env("DOPE_REPORT_EMBEDDER_FALLBACK")
+        or DEFAULT_EMBEDDER_MODEL
+    ).strip()
+    return {
+        **runtime,
+        "model": requested_model or DEFAULT_EMBEDDER_MODEL,
+        "fallback_model": fallback_model or DEFAULT_EMBEDDER_MODEL,
+        "top_k": bounded_int(runtime.get("top_k") or env("DOPE_REPORT_EMBEDDING_TOP_K"), DEFAULT_EMBEDDING_TOP_K, 2, 40),
+        "chunk_chars": bounded_int(runtime.get("chunk_chars") or env("DOPE_REPORT_EMBEDDING_CHUNK_CHARS"), DEFAULT_EMBEDDING_CHUNK_CHARS, 500, 6000),
+        "max_chunks": bounded_int(runtime.get("max_chunks") or env("DOPE_REPORT_EMBEDDING_MAX_CHUNKS"), DEFAULT_EMBEDDING_MAX_CHUNKS, 10, 240),
+    }
+
+
+def stringify_source(value) -> str:
+    if value in (None, "", [], {}):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return json.dumps(compact_for_prompt(value, limit=1800), indent=2, ensure_ascii=True)
+
+
+def split_source_text(label: str, text: str, chunk_chars: int) -> list[dict]:
+    text = re.sub(r"\n{3,}", "\n\n", str(text or "").strip())
+    if not text:
+        return []
+
+    chunks = []
+    current: list[str] = []
+    current_size = 0
+    for line in text.splitlines():
+        addition = len(line) + 1
+        if current and current_size + addition > chunk_chars:
+            chunks.append({"label": label, "text": "\n".join(current).strip()})
+            current = []
+            current_size = 0
+        current.append(line)
+        current_size += addition
+    if current:
+        chunks.append({"label": label, "text": "\n".join(current).strip()})
+
+    expanded = []
+    for index, chunk in enumerate(chunks, start=1):
+        expanded.append({"label": f"{label} #{index}" if len(chunks) > 1 else label, "text": chunk["text"]})
+    return expanded
+
+
+def source_context_chunks(job: dict, chunk_chars: int) -> list[dict]:
+    chunks: list[dict] = []
+
+    def add(label: str, value) -> None:
+        chunks.extend(split_source_text(label, stringify_source(value), chunk_chars))
+
+    contract = job.get("report_contract", {}) or {}
+    hubspot = job.get("hubspot_context", {}) or {}
+    assets = job.get("assets", {}) or {}
+    account_graph = job.get("account_graph", {}) or {}
+
+    add("Primary generation prompt", job.get("generation_prompt") or contract.get("llm_prompt") or contract.get("requested_output"))
+    add("Reference style summary", strategy_proposal_style_summary())
+    add("Report contract", contract)
+    add("Deal", job.get("deal", {}))
+    add("Company", job.get("company", {}))
+    add("Commerce", job.get("commerce", {}))
+    add("Campaign context", job.get("campaign_context", {}))
+    add("HubSpot labeled properties", hubspot.get("labeled_properties", {}))
+    add("HubSpot raw properties", hubspot.get("raw_properties", {}))
+    add("HubSpot missing core fields", hubspot.get("missing_core_fields", []))
+    add("Associated companies", account_graph.get("companies", []))
+    add("Associated contacts", account_graph.get("contacts", []))
+    add("Associated deals", account_graph.get("deals", []))
+    add("Uploaded media", assets.get("uploaded_media", []))
+
+    clean = []
+    seen = set()
+    for chunk in chunks:
+        text = chunk.get("text", "").strip()
+        if not text:
+            continue
+        key = (chunk.get("label"), text[:240])
+        if key in seen:
+            continue
+        seen.add(key)
+        clean.append(chunk)
+    return clean
+
+
+def retrieval_query(job: dict) -> str:
+    contract = job.get("report_contract", {}) or {}
+    deal = job.get("deal", {}) or {}
+    company = job.get("company", {}) or {}
+    campaign = job.get("campaign_context", {}) or {}
+    parts = [
+        job.get("generation_prompt"),
+        contract.get("llm_prompt"),
+        contract.get("requested_output"),
+        " ".join(str(item) for item in contract.get("required_sections", []) or []),
+        company.get("name"),
+        company.get("industry"),
+        deal.get("name"),
+        deal.get("stage"),
+        campaign.get("deal_description"),
+    ]
+    return "\n".join(str(part).strip() for part in parts if str(part or "").strip())
+
+
+def ollama_embed(model: str, inputs: list[str]) -> list[list[float]]:
+    base_url = str(env("OLLAMA_URL", "http://127.0.0.1:11434") or "http://127.0.0.1:11434").rstrip("/")
+    body = {
+        "model": model,
+        "input": inputs,
+        "options": {
+            "num_ctx": bounded_int(env("DOPE_REPORT_EMBEDDING_CONTEXT"), 8192, 2048, 16384),
+        },
+    }
+    req = urllib.request.Request(
+        f"{base_url}/api/embed",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "alice-dope-market-report-worker/2.2"},
+        method="POST",
+    )
+    timeout = int(env("DOPE_REPORT_EMBEDDING_TIMEOUT", "180"))
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        parsed = json.loads(response.read().decode("utf-8"))
+
+    embeddings = parsed.get("embeddings")
+    if isinstance(embeddings, list) and embeddings and isinstance(embeddings[0], list):
+        return embeddings
+    embedding = parsed.get("embedding")
+    if isinstance(embedding, list):
+        return [embedding]
+    raise RuntimeError(f"Ollama embed returned no embeddings for {model}")
+
+
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    if not left or not right:
+        return 0.0
+    size = min(len(left), len(right))
+    dot = sum(left[index] * right[index] for index in range(size))
+    left_norm = sum(left[index] * left[index] for index in range(size)) ** 0.5
+    right_norm = sum(right[index] * right[index] for index in range(size)) ** 0.5
+    if not left_norm or not right_norm:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+def rank_source_chunks(model: str, query: str, chunks: list[dict], top_k: int) -> list[dict]:
+    inputs = [query] + [chunk["text"] for chunk in chunks]
+    embeddings = ollama_embed(model, inputs)
+    if len(embeddings) < 2:
+        raise RuntimeError(f"Ollama embed returned too few vectors for {model}")
+    query_vector = embeddings[0]
+    ranked = []
+    for chunk, vector in zip(chunks, embeddings[1:]):
+        ranked.append({**chunk, "score": cosine_similarity(query_vector, vector)})
+    ranked.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+    return ranked[:top_k]
+
+
+def lexical_rank_source_chunks(query: str, chunks: list[dict], top_k: int) -> list[dict]:
+    terms = {term.lower() for term in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", query or "")}
+    ranked = []
+    for chunk in chunks:
+        text = chunk["text"].lower()
+        score = sum(1 for term in terms if term in text)
+        ranked.append({**chunk, "score": float(score)})
+    ranked.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+    return ranked[:top_k]
+
+
+def format_retrieval_context(ranked_chunks: list[dict], meta: dict) -> str:
+    if not ranked_chunks:
+        return ""
+    lines = [
+        "LOCAL_RETRIEVAL_CONTEXT",
+        f"embedder_model={meta.get('embedder_model')}",
+        f"embedding_provider={meta.get('embedding_provider')}",
+        f"embedding_top_k={meta.get('embedding_top_k')}",
+        "Use these ranked chunks first when choosing facts, recommendations, budget framing, and setup gaps.",
+        "",
+    ]
+    for index, chunk in enumerate(ranked_chunks, start=1):
+        score = chunk.get("score", 0.0)
+        lines.append(f"[{index}] {chunk.get('label')} score={score:.4f}")
+        lines.append(chunk.get("text", "").strip())
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def ensure_embedding_context(job: dict) -> tuple[str, dict]:
+    if "_alice_embedding_context" in job and "_alice_embedding_meta" in job:
+        return job["_alice_embedding_context"], job["_alice_embedding_meta"]
+
+    runtime = embedding_runtime(job)
+    chunks = source_context_chunks(job, runtime["chunk_chars"])[: runtime["max_chunks"]]
+    query = retrieval_query(job) or stringify_source(job.get("deal", {})) or "DOPE market report"
+    requested_model = runtime["model"]
+    fallback_model = runtime["fallback_model"]
+    ranked_chunks: list[dict] = []
+    selected_model = requested_model
+    fallback_used = None
+    error_messages = []
+
+    for candidate in [requested_model, fallback_model]:
+        if not candidate:
+            continue
+        if ranked_chunks:
+            break
+        try:
+            ranked_chunks = rank_source_chunks(candidate, query, chunks, runtime["top_k"])
+            selected_model = candidate
+            if candidate != requested_model:
+                fallback_used = candidate
+        except Exception as error:
+            error_messages.append(f"{candidate}: {type(error).__name__}: {str(error)[:180]}")
+            log("embedding_candidate_failed", id=job.get("id"), provider="ollama/local", model=candidate, status=str(error)[:160])
+
+    if not ranked_chunks:
+        ranked_chunks = lexical_rank_source_chunks(query, chunks, runtime["top_k"])
+        selected_model = requested_model
+        fallback_used = "lexical"
+
+    meta = {
+        "embedding_provider": "ollama/local",
+        "embedder_model": selected_model,
+        "requested_embedder_model": requested_model,
+        "embedding_chunks_count": len(chunks),
+        "embedding_top_k": min(runtime["top_k"], len(ranked_chunks)),
+        "embedder_model_fallback": fallback_used,
+        "embedding_errors": error_messages,
+    }
+    context = format_retrieval_context(ranked_chunks, meta)
+    job["_alice_embedding_context"] = context
+    job["_alice_embedding_meta"] = meta
+    log(
+        "embedding_context_ready",
+        id=job.get("id"),
+        provider="ollama/local",
+        model=selected_model,
+        status=f"chunks={len(chunks)} top_k={meta['embedding_top_k']} fallback={fallback_used or 'none'}",
+    )
+    return context, meta
 
 
 def openai_model_candidates() -> list[str]:
@@ -401,10 +814,14 @@ def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
     contract = job.get("report_contract", {}) or {}
     primary_prompt = job.get("generation_prompt") or contract.get("llm_prompt") or contract.get("requested_output")
     uploaded_media = job.get("assets", {}).get("uploaded_media", []) or []
+    retrieval_context, embedding_meta = ensure_embedding_context(job)
     prompt_package = {
         "primary_generation_prompt": primary_prompt,
         "retry_note": retry_note,
         "reference_style_summary": strategy_proposal_style_summary(),
+        "local_retrieval_context": retrieval_context,
+        "embedding_runtime": job.get("embedding_runtime", {}) or {},
+        "embedding_summary": embedding_meta,
         "report_contract": contract,
         "required_sections": contract.get("required_sections", []),
         "writing_rules": contract.get("writing_rules", []),
@@ -412,6 +829,12 @@ def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
         "company": job.get("company", {}),
         "commerce": job.get("commerce", {}),
         "campaign_context": job.get("campaign_context", {}),
+        "account_graph": job.get("account_graph", {}),
+        "associated_data_summary": {
+            "associated_company_count": len((job.get("account_graph", {}) or {}).get("companies", []) or []),
+            "associated_contact_count": len((job.get("account_graph", {}) or {}).get("contacts", []) or []),
+            "associated_deal_count": len((job.get("account_graph", {}) or {}).get("deals", []) or []),
+        },
         "hubspot_context": {
             "labeled_properties": job.get("hubspot_context", {}).get("labeled_properties", {}),
             "raw_properties": job.get("hubspot_context", {}).get("raw_properties", {}),
@@ -429,7 +852,8 @@ def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
             for item in uploaded_media
         ],
         "quality_gate": {
-            "minimum_words": minimum_words(job),
+            "target_words": minimum_words(job),
+            "hard_minimum_words": hard_minimum_words(job),
             "minimum_docx_bytes": minimum_docx_bytes(job),
             "docx_signature": "PK",
         },
@@ -464,14 +888,35 @@ def local_report_required(job: dict) -> bool:
 
 def local_model_candidates(job: dict) -> list[str]:
     runtime = report_runtime(job)
-    candidates = [
-        env("DOPE_REPORT_LOCAL_MODEL"),
-        runtime.get("target_model"),
+    metadata = job.get("metadata", {}) or {}
+    contract = job.get("report_contract", {}) or {}
+
+    # If SUN queued an explicit per-report model, do not silently downgrade to
+    # the env/default fallback. A missing selected model should fail loudly so
+    # the DOPE UI does not claim a 27B report was produced by an 8B fallback.
+    explicit_candidates = [
         runtime.get("local_model"),
+        runtime.get("target_model"),
+        metadata.get("report_local_model"),
+        contract.get("target_model"),
+    ]
+
+    candidates = []
+    for item in explicit_candidates:
+        value = str(item or "").strip()
+        if not value or value.lower() in {"qwen/local", "local", "openai"}:
+            continue
+        if value not in candidates:
+            candidates.append(value)
+    if candidates:
+        return candidates
+
+    candidates = [
+        *env_list("DOPE_REPORT_LOCAL_MODEL_CANDIDATES"),
+        env("DOPE_REPORT_LOCAL_MODEL"),
         env("AUTOS_LOCAL_MODEL"),
         env("OLLAMA_MODEL"),
-        "qwen3:8b",
-        "llama3.2:3b",
+        *DEFAULT_LOCAL_MODEL_CANDIDATES,
     ]
     cleaned = []
     for item in candidates:
@@ -483,16 +928,31 @@ def local_model_candidates(job: dict) -> list[str]:
     return cleaned
 
 
+def local_runtime_provider(model: str) -> str:
+    return "qwen/local" if "qwen" in str(model or "").lower() else "ollama/local"
+
+
+def local_model_family(model: str) -> str:
+    lowered = str(model or "").lower()
+    for family in ["qwen", "devstral", "granite", "gemma", "llama"]:
+        if family in lowered:
+            return family
+    return "ollama"
+
+
 def report_generation_instructions() -> str:
     return """You are the DOPEIPEDIA market analyzer for DOPE Marketing.
 Write a professional, client-facing DOPE Strategy Proposal.
 Use payload["generation_prompt"] or payload["report_contract"]["llm_prompt"] as the controlling brief.
 SUN's report contract controls the visible section order and wording. Do not append legacy sections.
 Use HubSpot labeled properties, raw properties, missing core fields, deal/company/commerce data, and uploaded media filenames/endpoints as private source context only.
+Analyze the full account graph when present: associated companies, contacts, prior or related deals, statuses, stages, domains, amounts, and useful HubSpot properties. Use that data to sharpen audience, timing, offer, CRM follow-up, and sales-readiness recommendations.
+If associated data exists, synthesize it into practical recommendations; if it is missing, say only the customer-facing setup item when appropriate.
 Do not invent private facts. If a field is missing, call out only the customer-facing setup item when the contract asks for it.
 Never mention private worker names, AI vendors, model names, tokens, HubSpot IDs, or private technical metadata in visible report copy.
 No caveman voice. No generic marketing filler. No JSON. No markdown fences. No hidden thinking tags.
 Return only the visible client proposal Markdown. Target 3 to 5 pages maximum.
+Make the report more compelling than a plain memo: use a strong client-specific opening, short confident paragraphs, scannable bullets, concrete campaign names, and useful tables when the data supports them.
 The visible client proposal must stop after the Let's Get Started section.
 Allowed visible client sections are: Header, Title section, What We'll Build Together, Your Campaign, Investment Options, How We'll Track Success, Let's Get Started.
 Allowed internal AM sections are only the sections named in the AM report contract.
@@ -503,7 +963,34 @@ The output will be rendered into a real DOCX by the report worker, so write comp
 
 def local_report_prompt(job: dict, retry_note: str | None = None) -> str:
     package = report_prompt_input(job, retry_note=retry_note)
-    return f"{report_generation_instructions()}\n\nPAYLOAD:\n{package}\n\nReturn the final visible report copy now."
+    return (
+        f"{report_generation_instructions()}\n\n"
+        "OUTPUT CONTRACT:\n"
+        "- Return only the final client-visible Markdown copy.\n"
+        "- Start exactly with DOPE MARKETING.\n"
+        "- Do not explain what you are creating.\n"
+        "- Do not echo the payload, report_contract, section list, missing inputs, or instructions.\n"
+        "- Include required Markdown tables using pipe table syntax where the contract asks for tables.\n"
+        "- No <think> tags, hidden reasoning, planning notes, analysis preface, or notes after the final section.\n\n"
+        f"PAYLOAD:\n{package}\n\nReturn the final visible report copy now."
+    )
+
+
+def local_attempt_count() -> int:
+    return bounded_int(env("DOPE_REPORT_LOCAL_ATTEMPTS"), 5, 1, 8)
+
+
+def local_retry_note(report_text: str, quality_errors: list[str], minimum: int) -> str:
+    words = word_count(report_text)
+    target = max(minimum + 150, 650)
+    errors = "; ".join(quality_errors) or "too short"
+    return (
+        f"The previous draft failed preflight: words={words}, minimum={minimum}, errors={errors}. "
+        f"Rewrite from scratch with {target}-{target + 250} words while staying client-facing and concise. "
+        "Start exactly with DOPE MARKETING. Return only client-visible copy. "
+        "Include the required campaign and investment Markdown tables. Do not include planning notes, "
+        "payload summaries, missing-input labels, hidden thinking, or explanation of the task."
+    )
 
 
 def ollama_report_response(model: str, prompt: str) -> dict:
@@ -519,7 +1006,7 @@ def ollama_report_response(model: str, prompt: str) -> dict:
             "top_p": float(env("DOPE_REPORT_LOCAL_TOP_P", "0.86")),
             "repeat_penalty": float(env("DOPE_REPORT_LOCAL_REPEAT_PENALTY", "1.16")),
             "repeat_last_n": int(env("DOPE_REPORT_LOCAL_REPEAT_LAST_N", "256")),
-            "num_ctx": int(env("DOPE_REPORT_LOCAL_CONTEXT", "32768")),
+            "num_ctx": int(env("DOPE_REPORT_LOCAL_CONTEXT", "16384")),
             "num_predict": int(env("DOPE_REPORT_LOCAL_MAX_TOKENS", "3600")),
         },
     }
@@ -536,60 +1023,159 @@ def ollama_report_response(model: str, prompt: str) -> dict:
 
 def strip_model_thinking(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text or "", flags=re.I | re.S)
+    # Some local reasoning models occasionally emit only a dangling closing tag.
+    # In that case, everything before the final close tag is internal planning.
+    if re.search(r"</think\s*>", cleaned, flags=re.I):
+        cleaned = re.split(r"</think\s*>", cleaned, flags=re.I)[-1]
+    cleaned = re.sub(r"</?think\s*>", "", cleaned, flags=re.I)
     cleaned = re.sub(r"^\s*```(?:markdown|md)?\s*", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\s*```\s*$", "", cleaned)
     return cleaned.strip()
 
 
-def call_local_qwen(job: dict) -> tuple[str, dict]:
-    minimum = minimum_words(job)
+META_LEAK_PATTERNS = [
+    r"\bwe are creating\b",
+    r"\bthe visible document\b",
+    r"\breport_contract\b",
+    r"\bpayload specifies\b",
+    r"\bfrom the payload\b",
+    r"\bvisible markdown content\b",
+    r"\bconverted to docx\b",
+    r"\blet'?s structure\b",
+    r"\bnow,?\s+we write\b",
+    r"\bclient inputs\b",
+    r"\bmissing inputs\b",
+    r"\bwe have the following sections\b",
+    r"\bwe are to write\b",
+    r"\bimportant:\b",
+    r"\bnote:\b",
+    r"</?think\s*>",
+]
+
+
+def contains_meta_leak(text: str) -> bool:
+    lowered = text or ""
+    return any(re.search(pattern, lowered, flags=re.I) for pattern in META_LEAK_PATTERNS)
+
+
+def sanitize_visible_report_text(text: str) -> str:
+    cleaned = strip_model_thinking(text)
+    starts = [match.start() for match in re.finditer(r"\bDOPE MARKETING\b", cleaned, flags=re.I)]
+    if len(starts) > 1 and contains_meta_leak(cleaned[: starts[1]]):
+        cleaned = cleaned[starts[1]:]
+    elif starts and starts[0] > 0 and contains_meta_leak(cleaned[: starts[0]]):
+        cleaned = cleaned[starts[0]:]
+    cleaned = re.sub(r"\bworkswith\b", "works with", cleaned, flags=re.I)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+def markdown_table_count(text: str) -> int:
+    count = 0
+    in_table = False
+    for line in (text or "").splitlines():
+        is_table_line = line.strip().startswith("|") and "|" in line.strip()[1:]
+        if is_table_line and not in_table:
+            count += 1
+            in_table = True
+        elif not is_table_line:
+            in_table = False
+    return count
+
+
+def visible_text_quality_errors(text: str, job: dict) -> list[str]:
+    errors = []
+    cleaned = text or ""
+    audience = str(job.get("report_contract", {}).get("audience") or job.get("metadata", {}).get("report_audience") or "client")
+    if contains_meta_leak(cleaned):
+        errors.append("visible copy contains model planning or prompt echo")
+    if not re.match(r"^\s*(#\s*)?(\*\*)?DOPE MARKETING\b", cleaned, flags=re.I):
+        errors.append("visible copy does not start with DOPE MARKETING")
+    required_tables = job.get("report_contract", {}).get("required_tables", []) or []
+    if audience != "am" and len(required_tables) >= 2 and markdown_table_count(cleaned) < 2:
+        errors.append("visible client copy is missing required campaign/investment markdown tables")
+    missing_sections = missing_required_section_titles(job, cleaned)
+    if missing_sections:
+        errors.append(f"visible client proposal is missing required sections: {', '.join(missing_sections)}")
+    return errors
+
+
+def call_local_ollama(job: dict) -> tuple[str, dict]:
+    target_minimum = minimum_words(job)
+    hard_minimum = hard_minimum_words(job)
     job_id = job.get("id")
     primary_prompt = job.get("generation_prompt") or job.get("report_contract", {}).get("llm_prompt") or job.get("report_contract", {}).get("requested_output") or job.get("title") or ""
     input_text = report_prompt_input(job)
     log(
         "generation_prompt",
         id=job_id,
-        provider="qwen/local",
+        provider="ollama/local",
         status=f"context_chars={len(input_text)} prompt={clip(primary_prompt, 260)}",
     )
 
     last_error = None
     for model in local_model_candidates(job):
+        provider = local_runtime_provider(model)
         try:
-            prompt = local_report_prompt(job)
-            log("local_request", id=job_id, provider="qwen/local", model=model, status=f"min_words={minimum}")
-            parsed = ollama_report_response(model, prompt)
-            report_text = strip_model_thinking(str(parsed.get("response") or ""))
-            if word_count(report_text) < minimum:
-                log(
-                    "local_retry",
-                    id=job_id,
-                    provider="qwen/local",
-                    model=parsed.get("model") or model,
-                    status=f"words={word_count(report_text)} minimum={minimum}",
-                )
+            report_text = ""
+            parsed = {}
+            quality_errors = []
+            retry_note = job.pop("_alice_retry_note", None)
+            attempts = local_attempt_count()
+            for attempt in range(1, attempts + 1):
+                log("local_request", id=job_id, provider=provider, model=model, status=f"attempt={attempt} target_words={target_minimum} hard_min_words={hard_minimum}")
                 parsed = ollama_report_response(
                     model,
-                    local_report_prompt(
-                        job,
-                        retry_note=f"The previous draft was only {word_count(report_text)} words. Rewrite and expand to at least {minimum} words while preserving every required section and staying client-friendly.",
-                    ),
+                    local_report_prompt(job, retry_note=retry_note),
                 )
-                report_text = strip_model_thinking(str(parsed.get("response") or ""))
+                report_text = sanitize_visible_report_text(str(parsed.get("response") or ""))
+                document_preview = full_document_text(job, report_text)
+                quality_errors = visible_text_quality_errors(document_preview, job)
+                words = word_count(report_text)
+                if words >= target_minimum and not quality_errors:
+                    break
+                if attempt == attempts and words >= hard_minimum and not quality_errors:
+                    log(
+                        "local_under_target_accepted",
+                        id=job_id,
+                        provider=provider,
+                        model=parsed.get("model") or model,
+                        status=f"words={words} target_words={target_minimum} hard_min_words={hard_minimum}",
+                    )
+                    break
+
+                retry_note = local_retry_note(report_text, quality_errors, target_minimum)
+                event = "local_retry" if attempt < attempts else "local_candidate_failed"
+                log(
+                    event,
+                    id=job_id,
+                    provider=provider,
+                    model=parsed.get("model") or model,
+                    status=f"attempt={attempt} words={words} target_words={target_minimum} hard_min_words={hard_minimum} errors={'; '.join(quality_errors)[:120]}",
+                )
+
+            words = word_count(report_text)
+            if words < hard_minimum or quality_errors:
+                raise RuntimeError(
+                    f"local Ollama preflight failed after {attempts} attempts: "
+                    f"words={words}, hard_minimum={hard_minimum}, target_words={target_minimum}, errors={'; '.join(quality_errors) or 'too short'}"
+                )
 
             if not report_text:
-                raise RuntimeError("local qwen returned empty report text")
+                raise RuntimeError("local Ollama returned empty report text")
 
             log(
                 "local_response",
                 id=job_id,
-                provider="qwen/local",
+                provider=provider,
                 model=parsed.get("model") or model,
                 status=f"words={word_count(report_text)}",
             )
             return report_text, {
-                "provider": "qwen/local",
+                "provider": provider,
                 "model": parsed.get("model") or model,
+                "local_runtime_provider": "ollama/local",
+                "local_model_family": local_model_family(parsed.get("model") or model),
                 "usage": {
                     "prompt_eval_count": parsed.get("prompt_eval_count"),
                     "eval_count": parsed.get("eval_count"),
@@ -600,16 +1186,16 @@ def call_local_qwen(job: dict) -> tuple[str, dict]:
             }
         except Exception as error:
             last_error = error
-            log("local_candidate_failed", id=job_id, provider="qwen/local", model=model, status=f"{type(error).__name__}: {str(error)[:160]}")
+            log("local_candidate_failed", id=job_id, provider=provider, model=model, status=f"{type(error).__name__}: {str(error)[:160]}")
             continue
 
-    raise RuntimeError(f"all local qwen candidates failed: {last_error}")
+    raise RuntimeError(f"all local Ollama candidates failed: {last_error}")
 
 
 def generate_report_text(job: dict) -> tuple[str, dict]:
-    if local_report_required(job):
-        return call_local_qwen(job)
-    return call_openai(job)
+    if not local_report_required(job):
+        log("forcing_local_report", id=job.get("id"), provider="ollama/local", status="DOPE reports are local-only")
+    return call_local_ollama(job)
 
 def call_openai(job: dict) -> tuple[str, dict]:
     api_key = env("OPENAI_API_KEY")
@@ -890,12 +1476,18 @@ def paragraph(
     ppr_bits = []
     if style:
         ppr_bits.append(f"<w:pStyle w:val=\"{style}\"/>")
+    if style == "Heading1":
+        ppr_bits.append(f"<w:pBdr><w:bottom w:val=\"single\" w:sz=\"8\" w:space=\"6\" w:color=\"{BRAND_RED}\"/></w:pBdr>")
     if keep_next:
         ppr_bits.append("<w:keepNext/>")
     if shading:
         ppr_bits.append(f"<w:shd w:fill=\"{shading}\"/>")
     ppr_bits.append("<w:spacing w:before=\"80\" w:after=\"120\" w:line=\"276\" w:lineRule=\"auto\"/>")
     ppr = f"<w:pPr>{''.join(ppr_bits)}</w:pPr>"
+    return f"<w:p>{ppr}{formatted_runs(text, bold=bold, italic=italic, color=color, size=size)}</w:p>"
+
+
+def run_properties(bold: bool = False, italic: bool = False, color: str | None = None, size: int | None = None) -> str:
     rpr_bits = []
     if bold:
         rpr_bits.append("<w:b/>")
@@ -905,8 +1497,29 @@ def paragraph(
         rpr_bits.append(f"<w:color w:val=\"{color}\"/>")
     if size:
         rpr_bits.append(f"<w:sz w:val=\"{size}\"/>")
-    rpr = f"<w:rPr>{''.join(rpr_bits)}</w:rPr>" if rpr_bits else ""
-    return f"<w:p>{ppr}<w:r>{rpr}<w:t xml:space=\"preserve\">{safe_text(text)}</w:t></w:r></w:p>"
+    return f"<w:rPr>{''.join(rpr_bits)}</w:rPr>" if rpr_bits else ""
+
+
+def formatted_runs(text: str, bold: bool = False, italic: bool = False, color: str | None = None, size: int | None = None) -> str:
+    parts = re.split(r"(\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*)", str(text or ""))
+    runs = []
+    for part in parts:
+        if not part:
+            continue
+        part_bold = bold
+        part_italic = italic
+        value = part
+        if (part.startswith("**") and part.endswith("**")) or (part.startswith("__") and part.endswith("__")):
+            part_bold = True
+            value = part[2:-2]
+        elif part.startswith("*") and part.endswith("*"):
+            part_italic = True
+            value = part[1:-1]
+        if not value:
+            continue
+        rpr = run_properties(bold=part_bold, italic=part_italic, color=color, size=size)
+        runs.append(f"<w:r>{rpr}<w:t xml:space=\"preserve\">{safe_text(value)}</w:t></w:r>")
+    return "".join(runs)
 
 
 def bullet(text: str) -> str:
@@ -917,8 +1530,7 @@ def bullet(text: str) -> str:
         "<w:p><w:pPr><w:pStyle w:val=\"ListParagraph\"/>"
         "<w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr>"
         "<w:spacing w:before=\"40\" w:after=\"80\" w:line=\"276\" w:lineRule=\"auto\"/>"
-        "</w:pPr><w:r><w:t xml:space=\"preserve\">"
-        f"{safe_text(text)}</w:t></w:r></w:p>"
+        f"</w:pPr>{formatted_runs(text)}</w:p>"
     )
 
 
@@ -932,10 +1544,10 @@ def page_break() -> str:
 
 def cell_paragraph(text: str, header: bool = False) -> str:
     text = str(text or "").strip() or " "
-    rpr = "<w:rPr><w:b/><w:color w:val=\"FFFFFF\"/></w:rPr>" if header else ""
+    color = "FFFFFF" if header else INK
     return (
         "<w:p><w:pPr><w:spacing w:before=\"20\" w:after=\"60\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>"
-        f"<w:r>{rpr}<w:t xml:space=\"preserve\">{safe_text(text)}</w:t></w:r></w:p>"
+        f"{formatted_runs(text, bold=header, color=color)}</w:p>"
     )
 
 
@@ -960,7 +1572,7 @@ def table(rows: list[list[str]]) -> str:
         for index in range(column_count):
             value = row[index] if index < len(row) else ""
             header = row_index == 0
-            shade = f"<w:shd w:fill=\"{BRAND_RED}\"/>" if header else ""
+            shade = f"<w:shd w:fill=\"{BRAND_RED}\"/>" if header else ("<w:shd w:fill=\"F7F7F8\"/>" if row_index % 2 == 0 else "")
             cells.append(
                 "<w:tc><w:tcPr>"
                 f"<w:tcW w:w=\"{widths[index]}\" w:type=\"dxa\"/>"
@@ -1113,12 +1725,14 @@ mc:Ignorable="w14 wp14">
 def styles_xml() -> str:
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:pPr><w:spacing w:after="120" w:line="276" w:lineRule="auto"/></w:pPr><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:color w:val="{INK}"/><w:sz w:val="21"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="120" w:after="260"/></w:pPr><w:rPr><w:b/><w:color w:val="{INK}"/><w:sz w:val="42"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:pPr><w:keepNext/><w:spacing w:before="360" w:after="140"/></w:pPr><w:rPr><w:b/><w:color w:val="{BRAND_RED}"/><w:sz w:val="30"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:pPr><w:keepNext/><w:spacing w:before="220" w:after="100"/></w:pPr><w:rPr><w:b/><w:color w:val="{INK}"/><w:sz w:val="24"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Callout"><w:name w:val="Callout"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="160" w:after="160"/><w:ind w:left="180" w:right="180"/></w:pPr><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="21"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:pPr><w:ind w:left="540" w:hanging="260"/><w:spacing w:after="80"/></w:pPr><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="21"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:pPr><w:spacing w:after="120" w:line="276" w:lineRule="auto"/></w:pPr><w:rPr><w:rFonts w:ascii="Aptos" w:hAnsi="Aptos" w:cs="Aptos"/><w:color w:val="{INK}"/><w:sz w:val="21"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Kicker"><w:name w:val="Kicker"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="40" w:after="80"/></w:pPr><w:rPr><w:b/><w:caps/><w:color w:val="{BRAND_RED}"/><w:sz w:val="18"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="80" w:after="220"/></w:pPr><w:rPr><w:b/><w:color w:val="{INK}"/><w:sz w:val="40"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Subtitle"><w:name w:val="Subtitle"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="40" w:after="160"/></w:pPr><w:rPr><w:color w:val="{MUTED}"/><w:sz w:val="23"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:pPr><w:keepNext/><w:spacing w:before="320" w:after="120"/></w:pPr><w:rPr><w:b/><w:color w:val="{BRAND_RED}"/><w:sz w:val="29"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:pPr><w:keepNext/><w:spacing w:before="200" w:after="90"/></w:pPr><w:rPr><w:b/><w:color w:val="{INK}"/><w:sz w:val="23"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Callout"><w:name w:val="Callout"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="150" w:after="150"/><w:ind w:left="220" w:right="220"/></w:pPr><w:rPr><w:rFonts w:ascii="Aptos" w:hAnsi="Aptos"/><w:sz w:val="21"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:pPr><w:ind w:left="520" w:hanging="240"/><w:spacing w:after="70"/></w:pPr><w:rPr><w:rFonts w:ascii="Aptos" w:hAnsi="Aptos"/><w:sz w:val="21"/></w:rPr></w:style>
 </w:styles>"""
 
 
@@ -1254,7 +1868,8 @@ def visible_heading(line: str) -> str | None:
 def client_visible_document_text(job: dict, report_text: str) -> str:
     kept = []
     after_get_started = False
-    for line in (report_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+    cleaned_source = sanitize_visible_report_text(report_text)
+    for line in cleaned_source.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         heading = visible_heading(line)
         if heading in FORBIDDEN_VISIBLE_HEADINGS:
             break
@@ -1264,7 +1879,7 @@ def client_visible_document_text(job: dict, report_text: str) -> str:
         if heading == "let's get started":
             after_get_started = True
     cleaned = "\n".join(kept).strip()
-    return cleaned or (report_text or "").strip()
+    return cleaned or cleaned_source.strip()
 
 
 def canva_app_path() -> str | None:
@@ -1297,14 +1912,12 @@ def canva_rows(job: dict, report_text: str) -> list[dict]:
     commerce = job.get("commerce", {}) or {}
     hubspot = job.get("hubspot_context", {}) or {}
     media = job.get("assets", {}).get("uploaded_media", []) or []
-    missing = hubspot.get("missing_core_fields", []) or []
     company_name = compact(company.get("name") or deal.get("company_name"), "Client")
     industry = compact(company.get("industry") or deal.get("industry"), "Industry to confirm")
     amount = compact(deal.get("amount"), "Amount TBD")
     stage = compact(deal.get("stage"), "Stage TBD")
     quote_link = compact(commerce.get("quote_purchase_link"), "Confirm QR/payment link")
     insight = report_teaser(report_text)
-    missing_note = ", ".join(map(str, missing[:8])) if missing else "No core missing fields flagged."
     return [
         {
             "page": "Strategy Snapshot",
@@ -1318,7 +1931,7 @@ def canva_rows(job: dict, report_text: str) -> list[dict]:
             "stat_3_value": industry,
             "body": "Use this page as the client-facing summary: what we know, where the opportunity is, and what DOPE recommends first.",
             "cta": f"Approve creative direction and confirm CTA: {quote_link}",
-            "source_note": f"Missing fields to collect: {missing_note}",
+            "source_note": "Use final approved brand assets and campaign details before sending to the client.",
         },
         {
             "page": "90-Day Campaign Map",
@@ -1419,7 +2032,7 @@ def canva_design_handoff_text(job: dict, report_text: str) -> str:
 
 
 def full_document_text(job: dict, report_text: str) -> str:
-    return client_visible_document_text(job, report_text)
+    return client_visible_document_text(job, sanitize_visible_report_text(report_text))
 
 
 def write_canva_packet(job: dict, report_text: str, docx_path: Path) -> dict:
@@ -1456,7 +2069,10 @@ def markdown_table(lines: list[str]) -> list[list[str]]:
 
 
 def markdown_to_word_body(text: str, logo: tuple[bytes, str] | None) -> str:
-    body = [paragraph("DOPE MARKETING", bold=True, color=BRAND_RED, size=24, keep_next=True)]
+    body = [
+        paragraph("DOPE MARKETING", style="Kicker", keep_next=True),
+        paragraph("Client Strategy Proposal", style="Subtitle", keep_next=True),
+    ]
     if logo:
         width, height = image_size(logo[0])
         body.append(image_run(width, height))
@@ -1483,6 +2099,8 @@ def markdown_to_word_body(text: str, logo: tuple[bytes, str] | None) -> str:
             body.append(paragraph(stripped[3:].strip(), style="Heading1", keep_next=True))
         elif stripped.startswith("# "):
             body.append(paragraph(stripped[2:].strip(), style="Title", keep_next=True))
+        elif re.match(r"^(prepared for|prepared by|date|investment|total|timeline)\s*:", stripped, re.I):
+            body.append(paragraph(stripped, style="Subtitle"))
         elif stripped.startswith(">"):
             body.append(callout(stripped.lstrip(">").strip()))
         elif stripped.startswith(("- ", "* ")):
@@ -1570,9 +2188,10 @@ def validate_report_file(job: dict, docx_path: Path, document_text: str) -> list
     if byte_size < min_bytes:
         errors.append(f"generated DOCX is too small ({byte_size} bytes; minimum {min_bytes})")
     words = word_count(document_text)
-    min_words = minimum_words(job)
-    if words < min_words:
-        errors.append(f"generated report is too short ({words} words; minimum {min_words})")
+    hard_min_words = hard_minimum_words(job)
+    if words < hard_min_words:
+        errors.append(f"generated report is too short ({words} words; hard minimum {hard_min_words})")
+    errors.extend(visible_text_quality_errors(document_text, job))
     return errors
 
 
@@ -1589,6 +2208,9 @@ def write_local_report_record(job: dict, docx_path: Path, manifest: dict, comple
         "byte_size": manifest.get("byte_size"),
         "model": manifest.get("model"),
         "provider": manifest.get("provider"),
+        "embedder_model": manifest.get("embedder_model"),
+        "embedding_provider": manifest.get("embedding_provider"),
+        "embedder_model_fallback": manifest.get("embedder_model_fallback"),
         "generated_at": manifest.get("generated_at"),
         "completed_at": now_iso(),
         "logo_embedded": manifest.get("logo_embedded"),
@@ -1666,6 +2288,36 @@ def sync_local_report_records(records: list[dict]) -> None:
             handle.write(json.dumps(record, ensure_ascii=True) + "\n")
 
 
+def report_job_attempt_count() -> int:
+    return bounded_int(env("DOPE_REPORT_JOB_ATTEMPTS"), 5, 1, 8)
+
+
+def retryable_report_error(message: str) -> bool:
+    text = str(message or "").lower()
+    retryable_patterns = [
+        "http 422",
+        "missing required sections",
+        "missing required tables",
+        "prompt echo",
+        "scratchpad",
+        "too short",
+        "too small",
+        "visible client proposal",
+        "visible client copy",
+    ]
+    return any(pattern in text for pattern in retryable_patterns)
+
+
+def retry_note_from_error(message: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(message or "")).strip()
+    return (
+        "The previous draft failed DOPE/SUN validation. Rewrite from scratch and fix this exact issue: "
+        f"{cleaned[:600]}. "
+        "Return only the client-visible proposal. Start with DOPE MARKETING. Include every required section title "
+        "from the contract, including Header and Title, and include required campaign/investment Markdown tables."
+    )
+
+
 def process_one(client: DopeClient, dry_run: bool = False) -> bool:
     job = client.next_report()
     if not job:
@@ -1676,63 +2328,101 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
     company_name = compact(job.get("company", {}).get("name") or job.get("deal", {}).get("company_name"), "unknown")
     log("claimed", id=job_id, status=company_name)
     try:
-        logo = client.fetch_logo(job)
-        report_text, ai_meta = generate_report_text(job)
-        document_text = full_document_text(job, report_text)
-        timestamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
-        filename = f"{timestamp}-{slug(company_name)}-market-report.docx"
-        REPORT_DIR.mkdir(parents=True, exist_ok=True)
-        docx_path = REPORT_DIR / filename
-        create_report_docx(job, document_text, logo, docx_path)
-        canva_packet = write_canva_packet(job, report_text, docx_path)
-        log("canva_packet", id=job_id, status=f"{canva_packet['format']} csv={canva_packet['csv_path']}")
-        sections = extract_sections(document_text)
-        words = word_count(document_text)
-        quality_errors = validate_report_file(job, docx_path, document_text)
-        logo_reason = logo_missing_reason(job, logo)
-        manifest = {
-            "worker_id": client.worker_id,
-            "generated_at": now_iso(),
-            "provider": ai_meta["provider"],
-            "model": ai_meta["model"],
-            "usage": ai_meta.get("usage", {}),
-            "reasoning_effort": ai_meta.get("reasoning_effort"),
-            "word_count": words,
-            "minimum_words": minimum_words(job),
-            "minimum_docx_bytes": minimum_docx_bytes(job),
-            "byte_size": docx_path.stat().st_size,
-            "docx_signature": docx_path.read_bytes()[:2].decode("ascii", errors="replace"),
-            "report_title": sections[0] if sections else company_name,
-            "summary": report_text[:500],
-            "logo_embedded": bool(logo),
-            "logo_reason": logo_reason,
-            "media": {
-                "logo_embedded": bool(logo),
-                "logo_source": logo[2] if logo and len(logo) > 2 else None,
-                "logo_reason": logo_reason,
-                "uploaded_media_count": len(job.get("assets", {}).get("uploaded_media", []) or []),
-                "embedded_image_count": 1 if logo else 0,
-                "fetch_errors": [] if logo else [logo_reason],
-            },
-            "canva": canva_packet,
-            "local_path": str(docx_path),
-            "source_artifact_id": job_id,
-            "source_deal_id": job.get("deal", {}).get("id"),
-            "sections": sections,
-            "required_sections": job.get("report_contract", {}).get("required_sections", []),
-            "quality_errors": quality_errors,
-            "quality_warnings": [],
-        }
-        if quality_errors:
-            raise RuntimeError("quality failed before complete: " + "; ".join(quality_errors))
-        if dry_run:
-            write_local_report_record(job, docx_path, manifest, {"status": "dry_run"})
-            log("dry_run_ready", id=job_id, provider=ai_meta["provider"], model=ai_meta["model"], status=str(docx_path))
-            return True
-        result = client.complete(job, docx_path, manifest)
-        write_local_report_record(job, docx_path, manifest, result)
-        log("completed", id=job_id, provider=ai_meta["provider"], model=ai_meta["model"], status=result.get("status"))
-        return True
+        with ReportHeartbeat(client, job):
+            logo = client.fetch_logo(job)
+            max_attempts = report_job_attempt_count()
+            last_error = None
+            for job_attempt in range(1, max_attempts + 1):
+                if job_attempt > 1:
+                    log("rebuild_retry", id=job_id, status=f"attempt={job_attempt} of {max_attempts}")
+                report_text, ai_meta = generate_report_text(job)
+                _retrieval_context, embedding_meta = ensure_embedding_context(job)
+                document_text = full_document_text(job, report_text)
+                timestamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
+                filename = f"{timestamp}-{slug(company_name)}-market-report.docx"
+                REPORT_DIR.mkdir(parents=True, exist_ok=True)
+                docx_path = REPORT_DIR / filename
+                create_report_docx(job, document_text, logo, docx_path)
+                canva_packet = write_canva_packet(job, document_text, docx_path)
+                log("canva_packet", id=job_id, status=f"{canva_packet['format']} csv={canva_packet['csv_path']}")
+                sections = report_section_titles(job, document_text)
+                words = word_count(document_text)
+                quality_errors = validate_report_file(job, docx_path, document_text)
+                logo_reason = logo_missing_reason(job, logo)
+                manifest = {
+                    "worker_id": client.worker_id,
+                    "generated_at": now_iso(),
+                    "provider": ai_meta["provider"],
+                    "model": ai_meta["model"],
+                    "local_runtime_provider": ai_meta.get("local_runtime_provider"),
+                    "local_model_family": ai_meta.get("local_model_family"),
+                    "usage": ai_meta.get("usage", {}),
+                    "reasoning_effort": ai_meta.get("reasoning_effort"),
+                    "embedder_model": embedding_meta.get("embedder_model"),
+                    "embedding_provider": embedding_meta.get("embedding_provider"),
+                    "embedding_chunks_count": embedding_meta.get("embedding_chunks_count"),
+                    "embedding_top_k": embedding_meta.get("embedding_top_k"),
+                    "embedder_model_fallback": embedding_meta.get("embedder_model_fallback"),
+                    "requested_embedder_model": embedding_meta.get("requested_embedder_model"),
+                    "embedding_errors": embedding_meta.get("embedding_errors", []),
+                    "word_count": words,
+                    "minimum_words": minimum_words(job),
+                    "target_words": minimum_words(job),
+                    "hard_minimum_words": hard_minimum_words(job),
+                    "minimum_docx_bytes": minimum_docx_bytes(job),
+                    "byte_size": docx_path.stat().st_size,
+                    "docx_signature": docx_path.read_bytes()[:2].decode("ascii", errors="replace"),
+                    "report_title": sections[0] if sections else company_name,
+                    "summary": report_text[:500],
+                    "logo_embedded": bool(logo),
+                    "logo_reason": logo_reason,
+                    "media": {
+                        "logo_embedded": bool(logo),
+                        "logo_source": logo[2] if logo and len(logo) > 2 else None,
+                        "logo_reason": logo_reason,
+                        "uploaded_media_count": len(job.get("assets", {}).get("uploaded_media", []) or []),
+                        "embedded_image_count": 1 if logo else 0,
+                        "fetch_errors": [] if logo else [logo_reason],
+                    },
+                    "canva": canva_packet,
+                    "local_path": str(docx_path),
+                    "source_artifact_id": job_id,
+                    "source_deal_id": job.get("deal", {}).get("id"),
+                    "sections": sections,
+                    "required_sections": job.get("report_contract", {}).get("required_sections", []),
+                    "quality_errors": quality_errors,
+                    "quality_warnings": [],
+                    "job_attempt": job_attempt,
+                    "max_job_attempts": max_attempts,
+                }
+                if quality_errors:
+                    message = "quality failed before complete: " + "; ".join(quality_errors)
+                    last_error = RuntimeError(message)
+                    if job_attempt < max_attempts and retryable_report_error(message):
+                        job["_alice_retry_note"] = retry_note_from_error(message)
+                        log("quality_retry", id=job_id, status=f"attempt={job_attempt} {message[:140]}")
+                        continue
+                    raise last_error
+                if dry_run:
+                    write_local_report_record(job, docx_path, manifest, {"status": "dry_run"})
+                    log("dry_run_ready", id=job_id, provider=ai_meta["provider"], model=ai_meta["model"], status=str(docx_path))
+                    return True
+                try:
+                    result = client.complete(job, docx_path, manifest)
+                except Exception as complete_error:
+                    last_error = complete_error
+                    message = f"{type(complete_error).__name__}: {complete_error}"
+                    if job_attempt < max_attempts and retryable_report_error(message):
+                        job["_alice_retry_note"] = retry_note_from_error(message)
+                        log("complete_retry", id=job_id, status=f"attempt={job_attempt} {message[:140]}")
+                        continue
+                    raise
+                write_local_report_record(job, docx_path, manifest, result)
+                log("completed", id=job_id, provider=ai_meta["provider"], model=ai_meta["model"], status=result.get("status"))
+                return True
+            if last_error:
+                raise last_error
+            raise RuntimeError(f"report failed after {max_attempts} attempts")
     except Exception as error:
         message = f"{type(error).__name__}: {error}"
         log("failed", id=job_id, status=message[:160])
@@ -1767,7 +2457,7 @@ def main() -> int:
     status = client.status()
     log("status", status=f"enabled={status.get('enabled')}", queued=status.get("queued"))
     if args.status:
-        print(json.dumps({k: status.get(k) for k in ["ok", "worker_id", "enabled", "queued", "generating", "ready", "failed", "archived", "completed"]}, indent=2))
+        print(json.dumps({k: status.get(k) for k in ["ok", "worker_id", "enabled", "queued", "generating", "stale_generating", "worker_lease_seconds", "ready", "failed", "archived", "completed"]}, indent=2))
         return 0
 
     if args.once:

@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""Mirror Alice AUTOS watch logs to SUN for the RoRe portal."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+HOME = Path.home()
+SOURCES = [
+    ("PINBALL.AUTOS", HOME / ".config/autos/log/autos_cc_activity.jsonl"),
+    ("DOPE.AUTOS", HOME / ".config/autos/log/dope_cc_activity.jsonl"),
+    ("DOPE.REPORTS", HOME / ".config/autos/log/dope_market_report_worker.jsonl"),
+]
+BRIDGE_DIR = HOME / ".config/autos/bridge"
+LOCAL_FEED = Path(os.environ.get("AUTOS_WATCH_FEED_LOCAL", BRIDGE_DIR / "autos-watch-feed.jsonl")).expanduser()
+STATE_PATH = Path(os.environ.get("AUTOS_WATCH_FEED_STATE", BRIDGE_DIR / "autos-watch-feed.state.json")).expanduser()
+SUN_DEST = os.environ.get("AUTOS_WATCH_FEED_SUN_DEST", "sun-dev:/home/wb/Desktop/alice-brain/bridge/autos-watch-feed.jsonl")
+SYNC_SECONDS = float(os.environ.get("AUTOS_WATCH_FEED_SYNC_SECONDS", "2"))
+BACKFILL_LINES = int(os.environ.get("AUTOS_WATCH_FEED_BACKFILL_LINES", "150"))
+
+
+SECRET_KEY_PATTERN = re.compile(r"(token|secret|password|authorization|api[_-]?key|bearer)", re.I)
+SECRET_VALUE_PATTERNS = [
+    re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{12,}", re.I),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+]
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        STATE_PATH.chmod(0o600)
+    except OSError:
+        pass
+
+
+def redact(value):
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if SECRET_KEY_PATTERN.search(str(key)):
+                redacted[key] = "[REDACTED]"
+            else:
+                redacted[key] = redact(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+    if isinstance(value, str):
+        text = value
+        for pattern in SECRET_VALUE_PATTERNS:
+            text = pattern.sub("[REDACTED]", text)
+        return text
+    return value
+
+
+def parse_line(line: str):
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return {"raw": stripped}
+    return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+
+def append_record(record: dict) -> None:
+    LOCAL_FEED.parent.mkdir(parents=True, exist_ok=True)
+    with LOCAL_FEED.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(redact(record), ensure_ascii=True, separators=(",", ":")) + "\n")
+    try:
+        LOCAL_FEED.chmod(0o600)
+    except OSError:
+        pass
+
+
+def tail_backfill(path: Path, limit: int) -> list[str]:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return []
+    return lines[-limit:] if limit > 0 else []
+
+
+def source_state_key(label: str, path: Path) -> str:
+    return f"{label}:{path}"
+
+
+def read_new_lines(label: str, path: Path, state: dict) -> list[tuple[int, str]]:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return []
+
+    key = source_state_key(label, path)
+    current = state.get(key, {})
+    previous_inode = current.get("inode")
+    previous_offset = int(current.get("offset", 0) or 0)
+    offset = previous_offset if previous_inode == stat.st_ino and previous_offset <= stat.st_size else 0
+
+    records = []
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        for raw in handle:
+            offset = handle.tell()
+            line = raw.decode("utf-8", errors="replace").rstrip("\n")
+            if line.strip():
+                records.append((offset, line))
+
+    state[key] = {"inode": stat.st_ino, "offset": offset, "size": stat.st_size, "updated_at_ms": now_ms()}
+    return records
+
+
+def initialize_backfill(state: dict) -> bool:
+    wrote = False
+    for label, path in SOURCES:
+        key = source_state_key(label, path)
+        if key in state:
+            continue
+        for line in tail_backfill(path, BACKFILL_LINES):
+            payload = parse_line(line)
+            if payload is None:
+                continue
+            append_record({
+                "mirrored_at_ms": now_ms(),
+                "source_label": label,
+                "source_path": str(path),
+                "backfill": True,
+                **payload,
+            })
+            wrote = True
+        try:
+            stat = path.stat()
+            state[key] = {"inode": stat.st_ino, "offset": stat.st_size, "size": stat.st_size, "updated_at_ms": now_ms()}
+        except FileNotFoundError:
+            state[key] = {"inode": None, "offset": 0, "size": 0, "updated_at_ms": now_ms()}
+    return wrote
+
+
+def collect_once(state: dict) -> bool:
+    wrote = False
+    for label, path in SOURCES:
+        for offset, line in read_new_lines(label, path, state):
+            payload = parse_line(line)
+            if payload is None:
+                continue
+            append_record({
+                "mirrored_at_ms": now_ms(),
+                "source_label": label,
+                "source_path": str(path),
+                "source_offset": offset,
+                **payload,
+            })
+            wrote = True
+    return wrote
+
+
+def sync_to_sun() -> bool:
+    if not LOCAL_FEED.exists():
+        return False
+    result = subprocess.run(
+        ["/usr/bin/scp", "-q", str(LOCAL_FEED), SUN_DEST],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        print(f"autos_watch_feed_mirror sync failed: {result.stderr.strip()}", file=sys.stderr, flush=True)
+        return False
+    return True
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Mirror Alice AUTOS watch feed to SUN RoRe.")
+    parser.add_argument("--once", action="store_true", help="Collect and sync once, then exit.")
+    args = parser.parse_args()
+
+    state = load_state()
+    changed = initialize_backfill(state)
+    changed = collect_once(state) or changed
+    save_state(state)
+    if changed:
+        sync_to_sun()
+    if args.once:
+        print(json.dumps({"ok": True, "local_feed": str(LOCAL_FEED), "sun_dest": SUN_DEST, "changed": changed}))
+        return 0
+
+    last_sync = 0.0
+    while True:
+        state = load_state()
+        changed = collect_once(state)
+        save_state(state)
+        now = time.monotonic()
+        if changed or now - last_sync >= SYNC_SECONDS:
+            sync_to_sun()
+            last_sync = now
+        time.sleep(max(0.5, SYNC_SECONDS))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

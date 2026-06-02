@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""Redis-first, file-fallback bridge for CG/Alice agent messages."""
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(os.environ.get("AGENT_BRIDGE_DIR", str(Path.home() / "Desktop/alice-brain/bridge"))).expanduser()
+REDIS_CLI = os.environ.get("AGENT_BRIDGE_REDIS_CLI", "redis-cli")
+REDIS_URL = os.environ.get("AGENT_BRIDGE_REDIS_URL", "redis://127.0.0.1:6379/15")
+MAXLEN = os.environ.get("AGENT_BRIDGE_STREAM_MAXLEN", "1000")
+
+STREAM_TO_ALICE = os.environ.get("AGENT_BRIDGE_STREAM_TO_ALICE", "agent:cg:to_alice")
+STREAM_TO_CG = os.environ.get("AGENT_BRIDGE_STREAM_TO_CG", "agent:alice:to_cg")
+STREAM_HEALTH = os.environ.get("AGENT_BRIDGE_STREAM_HEALTH", "agent:health")
+STREAM_EVENTS = os.environ.get("AGENT_BRIDGE_STREAM_EVENTS", "agent:events")
+EVENT_LOG = Path(os.environ.get("AGENT_BRIDGE_EVENT_LOG", str(ROOT / "agent-bridge-events.jsonl"))).expanduser()
+
+
+class BridgeError(Exception):
+    pass
+
+
+class RedisBridgeError(BridgeError):
+    pass
+
+
+def now_iso():
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def safe_url(url):
+    return re.sub(r"://([^:/]+):([^@]+)@", "://***:***@", url)
+
+
+def redis_json(*args):
+    result = subprocess.run(
+        [REDIS_CLI, "-u", REDIS_URL, "--json", *map(str, args)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RedisBridgeError((result.stderr or result.stdout).strip())
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RedisBridgeError(f"redis json parse failed: {error}") from error
+
+
+def redis_raw(*args):
+    result = subprocess.run(
+        [REDIS_CLI, "-u", REDIS_URL, "--raw", *map(str, args)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RedisBridgeError((result.stderr or result.stdout).strip())
+    return result.stdout.strip()
+
+
+def redis_available():
+    try:
+        return redis_json("PING") == "PONG"
+    except RedisBridgeError:
+        return False
+
+
+def locked_append(path, text):
+    path = Path(path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.write(text)
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def write_text(path, text):
+    path = Path(path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def read_text(path):
+    try:
+        return Path(path).expanduser().read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except UnicodeDecodeError:
+        return Path(path).expanduser().read_bytes().decode("utf-8", errors="replace")
+
+
+def append_json(payload):
+    locked_append(EVENT_LOG, json.dumps(payload, separators=(",", ":")) + "\n")
+
+
+def state_path(role):
+    return ROOT / f".redis-{role}.lastid"
+
+
+def incoming_stream(role):
+    if role == "cg":
+        return STREAM_TO_CG
+    if role == "alice":
+        return STREAM_TO_ALICE
+    raise BridgeError(f"unknown role: {role!r}")
+
+
+def outgoing_stream(from_agent, to_agent):
+    pair = (from_agent.lower(), to_agent.lower())
+    if pair == ("cg", "alice"):
+        return STREAM_TO_ALICE
+    if pair == ("alice", "cg"):
+        return STREAM_TO_CG
+    return STREAM_EVENTS
+
+
+def incoming_file(role):
+    if role == "cg":
+        return Path(os.environ.get("CG_ALICE_WATCH_FILE", str(ROOT / "from-alice.md"))).expanduser()
+    if role == "alice":
+        return Path(os.environ.get("ALICE_BRIDGE_LOCAL_FILE", str(ROOT / "to-alice.md"))).expanduser()
+    raise BridgeError(f"unknown role: {role!r}")
+
+
+def latest_file(role):
+    if role == "cg":
+        return Path(os.environ.get("CG_ALICE_LATEST_FILE", str(ROOT / "latest-from-alice.md"))).expanduser()
+    return ROOT / "latest-to-alice.md"
+
+
+def outbound_file(from_agent, to_agent):
+    pair = (from_agent.lower(), to_agent.lower())
+    if pair == ("cg", "alice"):
+        return Path(os.environ.get("CG_ALICE_TO_ALICE_FILE", str(ROOT / "to-alice.md"))).expanduser()
+    if pair == ("alice", "cg"):
+        return Path(os.environ.get("ALICE_BRIDGE_REPLY_FILE", str(ROOT / "from-alice.md"))).expanduser()
+    return ROOT / "agent-events.md"
+
+
+def format_message(fields, redis_id=None, transport="redis-stream"):
+    from_agent = fields.get("from", "unknown")
+    to_agent = fields.get("to", "unknown")
+    created_at = fields.get("created_at", now_iso())
+    subject = fields.get("subject", "agent bridge message")
+    priority = fields.get("priority", "normal")
+    body = str(fields.get("body", "")).rstrip()
+    redis_line = f"Redis-Id: {redis_id}\n" if redis_id else ""
+    return (
+        f"\n## {created_at} {from_agent} -> {to_agent}\n"
+        f"Subject: {subject}\n"
+        f"Transport: {transport}\n"
+        f"{redis_line}"
+        f"Priority: {priority}\n\n"
+        f"{body}\n"
+        "---\n"
+    )
+
+
+def xadd(stream, fields):
+    args = ["XADD", stream, "MAXLEN", "~", MAXLEN, "*"]
+    for key, value in fields.items():
+        args.extend([key, str(value)])
+    return redis_raw(*args)
+
+
+def record_health(role):
+    start = dt.datetime.now()
+    ok = redis_available()
+    ping_ms = round((dt.datetime.now() - start).total_seconds() * 1000, 2)
+    payload = {
+        "time": now_iso(),
+        "role": role,
+        "redis": {"ok": ok, "url": safe_url(REDIS_URL), "ping_ms": ping_ms},
+        "file_fallback": {
+            "ok": True,
+            "bridge_dir": str(ROOT),
+            "incoming_file": str(incoming_file(role)),
+            "latest_file": str(latest_file(role)),
+        },
+        "preferred_transport": "redis_stream" if ok else "file_fallback",
+    }
+    append_json({**payload, "event": "health"})
+    if ok:
+        xadd(STREAM_HEALTH, {key: json.dumps(value) if not isinstance(value, str) else value for key, value in payload.items()})
+    return payload
+
+
+def command_health(args):
+    payload = record_health(args.role)
+    print(json.dumps(payload, indent=2))
+    return 0 if payload["redis"]["ok"] else 1
+
+
+def command_status(args):
+    payload = record_health(args.role)
+    state = state_path(args.role)
+    payload["streams"] = {
+        "incoming": incoming_stream(args.role),
+        "to_alice": STREAM_TO_ALICE,
+        "to_cg": STREAM_TO_CG,
+        "health": STREAM_HEALTH,
+    }
+    payload["state_file"] = str(state)
+    payload["state_last_id"] = read_text(state).strip() if state.exists() else None
+    print(json.dumps(payload, indent=2))
+    return 0 if payload["redis"]["ok"] else 1
+
+
+def command_send(args):
+    body = args.body
+    if body is None and args.body_file:
+        body = read_text(args.body_file)
+    if body is None or body == "":
+        body = sys.stdin.read()
+
+    fields = {
+        "from": args.from_agent,
+        "to": args.to_agent,
+        "type": args.type,
+        "priority": args.priority,
+        "subject": args.subject,
+        "body": body,
+        "created_at": now_iso(),
+        "requires_ack": "true" if args.requires_ack else "false",
+    }
+
+    stream = outgoing_stream(args.from_agent, args.to_agent)
+    transport = "file_fallback"
+    redis_id = None
+    redis_error = None
+    try:
+        redis_id = xadd(stream, fields)
+        transport = "redis_stream"
+    except RedisBridgeError as error:
+        redis_error = str(error)
+
+    file_path = outbound_file(args.from_agent, args.to_agent)
+    if not args.no_file_mirror:
+        locked_append(file_path, format_message(fields, redis_id=redis_id, transport=transport))
+
+    append_json({
+        "time": now_iso(),
+        "event": "send",
+        "from": args.from_agent,
+        "to": args.to_agent,
+        "stream": stream,
+        "redis_id": redis_id,
+        "transport": transport,
+        "redis_error": redis_error,
+        "file": None if args.no_file_mirror else str(file_path),
+    })
+
+    if transport == "file_fallback" and args.from_agent == "alice":
+        dest = os.environ.get("ALICE_BRIDGE_SUN_REPLY_DEST")
+        if dest:
+            subprocess.run(["scp", "-q", str(file_path), dest], check=False)
+
+    print(json.dumps({
+        "ok": True,
+        "transport": transport,
+        "stream": stream,
+        "redis_id": redis_id,
+        "file": None if args.no_file_mirror else str(file_path),
+        "redis_error": redis_error,
+    }))
+    return 0 if transport == "redis_stream" else 1
+
+
+def flat_fields_to_dict(flat_fields):
+    fields = {}
+    for index in range(0, len(flat_fields), 2):
+        key = str(flat_fields[index])
+        value = "" if index + 1 >= len(flat_fields) else str(flat_fields[index + 1])
+        fields[key] = value
+    return fields
+
+
+def command_poll_once(args):
+    role = args.role
+    stream = incoming_stream(role)
+    state = state_path(role)
+    last_id = read_text(state).strip() if state.exists() else "0-0"
+    if not last_id:
+        last_id = "0-0"
+
+    try:
+        data = redis_json("XREAD", "COUNT", str(args.count), "STREAMS", stream, last_id)
+    except RedisBridgeError as error:
+        append_json({"time": now_iso(), "event": "redis_unavailable", "role": role, "error": str(error), "fallback": "file"})
+        return 1
+
+    if not data:
+        return 2
+    entries = data.get(stream, []) if isinstance(data, dict) else []
+    if not entries:
+        return 2
+
+    file_path = incoming_file(role)
+    latest_path = latest_file(role)
+    blocks = []
+    newest_id = last_id
+    for entry in entries:
+        entry_id, flat_fields = entry
+        fields = flat_fields_to_dict(flat_fields or [])
+        block = format_message(fields, redis_id=entry_id, transport="redis-stream")
+        blocks.append(block)
+        newest_id = entry_id
+        append_json({
+            "time": now_iso(),
+            "event": "receive",
+            "role": role,
+            "stream": stream,
+            "redis_id": entry_id,
+            "from": fields.get("from"),
+            "to": fields.get("to"),
+            "subject": fields.get("subject"),
+            "file": str(file_path),
+        })
+
+    locked_append(file_path, "".join(blocks))
+    if blocks:
+        write_text(latest_path, blocks[-1])
+    write_text(state, newest_id)
+    print(json.dumps({"ok": True, "role": role, "stream": stream, "received": len(entries), "last_id": newest_id, "file": str(file_path)}))
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Redis-first/file-fallback CG/Alice bridge")
+    subparsers = parser.add_subparsers(dest="command")
+
+    status = subparsers.add_parser("status")
+    status.add_argument("--role", default=os.environ.get("AGENT_BRIDGE_ROLE", "cg"), choices=["cg", "alice"])
+    status.set_defaults(func=command_status)
+
+    health = subparsers.add_parser("health")
+    health.add_argument("--role", default=os.environ.get("AGENT_BRIDGE_ROLE", "cg"), choices=["cg", "alice"])
+    health.set_defaults(func=command_health)
+
+    send = subparsers.add_parser("send")
+    send.add_argument("--from", dest="from_agent", default=os.environ.get("AGENT_BRIDGE_FROM", "cg"))
+    send.add_argument("--to", dest="to_agent", default=os.environ.get("AGENT_BRIDGE_TO", "alice"))
+    send.add_argument("--subject", default="agent bridge message")
+    send.add_argument("--body")
+    send.add_argument("--body-file")
+    send.add_argument("--type", default="message")
+    send.add_argument("--priority", default="normal")
+    send.add_argument("--requires-ack", action="store_true")
+    send.add_argument("--no-file-mirror", action="store_true")
+    send.set_defaults(func=command_send)
+
+    poll = subparsers.add_parser("poll-once")
+    poll.add_argument("--role", default=os.environ.get("AGENT_BRIDGE_ROLE", "cg"), choices=["cg", "alice"])
+    poll.add_argument("--count", type=int, default=20)
+    poll.set_defaults(func=command_poll_once)
+
+    return parser
+
+
+def main(argv):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not hasattr(args, "func"):
+        args = parser.parse_args(["status", *argv])
+    try:
+        return args.func(args)
+    except BridgeError as error:
+        print(f"agent_bridge: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -7,6 +7,8 @@ LOCAL_FILE="${ALICE_BRIDGE_LOCAL_FILE:-$LOCAL_DIR/to-alice.md}"
 STATE_FILE="${ALICE_BRIDGE_STATE_FILE:-$LOCAL_DIR/.to-alice.sha256}"
 EVENT_LOG="${ALICE_BRIDGE_EVENT_LOG:-$LOCAL_DIR/alice-bridge-events.log}"
 HANDLER="${ALICE_BRIDGE_HANDLER:-$HOME/Desktop/alice-brain/bin/alice_bridge_handler}"
+AGENT_BRIDGE="${ALICE_AGENT_BRIDGE:-$HOME/Desktop/alice-brain/bin/agent_bridge}"
+REDIS_ENABLED="${ALICE_BRIDGE_REDIS_ENABLED:-1}"
 INTERVAL="${ALICE_BRIDGE_POLL_SECONDS:-5}"
 
 mkdir -p "$LOCAL_DIR"
@@ -27,9 +29,28 @@ else
   printf '%s' "$last_hash" > "$STATE_FILE"
 fi
 
-echo "[alice_bridge_watch] polling $SUN_SOURCE every ${INTERVAL}s"
+echo "[alice_bridge_watch] polling redis first, then $SUN_SOURCE every ${INTERVAL}s"
 
 while true; do
+  if [[ "$REDIS_ENABLED" == "1" && -x "$AGENT_BRIDGE" ]]; then
+    if "$AGENT_BRIDGE" poll-once --role alice >> "$EVENT_LOG" 2>&1; then
+      new_hash="$(hash_file "$LOCAL_FILE")"
+      printf '%s' "$new_hash" > "$STATE_FILE"
+      last_hash="$new_hash"
+      {
+        echo "---"
+        date --iso-8601=seconds 2>/dev/null || date
+        echo "redis to-alice changed sha=$new_hash bytes=$(wc -c < "$LOCAL_FILE")"
+      } >> "$EVENT_LOG"
+      echo "[alice_bridge_watch] redis to-alice changed sha=$new_hash"
+      if [[ -x "$HANDLER" && -s "$LOCAL_FILE" ]]; then
+        "$HANDLER" "$LOCAL_FILE" || true
+      fi
+      sleep "$INTERVAL"
+      continue
+    fi
+  fi
+
   tmp="$LOCAL_DIR/.to-alice.tmp.$$"
   if scp -q "$SUN_SOURCE" "$tmp"; then
     new_hash="$(hash_file "$tmp")"
@@ -40,9 +61,9 @@ while true; do
       {
         echo "---"
         date --iso-8601=seconds 2>/dev/null || date
-        echo "to-alice changed sha=$new_hash bytes=$(wc -c < "$LOCAL_FILE")"
+        echo "file to-alice changed sha=$new_hash bytes=$(wc -c < "$LOCAL_FILE")"
       } >> "$EVENT_LOG"
-      echo "[alice_bridge_watch] to-alice changed sha=$new_hash"
+      echo "[alice_bridge_watch] file to-alice changed sha=$new_hash"
       if [[ -x "$HANDLER" && -s "$LOCAL_FILE" ]]; then
         "$HANDLER" "$LOCAL_FILE" || true
       fi
