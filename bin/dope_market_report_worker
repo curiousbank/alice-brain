@@ -1196,6 +1196,26 @@ def visible_text_quality_errors(text: str, job: dict) -> list[str]:
     return errors
 
 
+def structural_quality_errors(errors: list[str]) -> bool:
+    text = " ".join(str(error or "").lower() for error in errors)
+    return any(
+        marker in text
+        for marker in [
+            "missing required markdown tables",
+            "missing required sections",
+            "does not start with dope marketing",
+            "prompt echo",
+            "model planning",
+        ]
+    )
+
+
+def local_model_attempt_limit(job: dict, errors: list[str], default_attempts: int) -> int:
+    if not errors or not structural_quality_errors(errors):
+        return default_attempts
+    return bounded_int(env("DOPE_REPORT_STRUCTURAL_ATTEMPTS_PER_MODEL"), 2, 1, default_attempts)
+
+
 def call_local_ollama(job: dict) -> tuple[str, dict]:
     target_minimum = minimum_words(job)
     hard_minimum = hard_minimum_words(job)
@@ -1241,7 +1261,9 @@ def call_local_ollama(job: dict) -> tuple[str, dict]:
                     break
 
                 retry_note = local_retry_note(report_text, quality_errors, target_minimum)
-                event = "local_retry" if attempt < attempts else "local_candidate_failed"
+                model_attempt_limit = local_model_attempt_limit(job, quality_errors, attempts)
+                abandon_model = quality_errors and attempt >= model_attempt_limit
+                event = "local_candidate_failed" if abandon_model or attempt >= attempts else "local_retry"
                 log(
                     event,
                     id=job_id,
@@ -1249,6 +1271,11 @@ def call_local_ollama(job: dict) -> tuple[str, dict]:
                     model=parsed.get("model") or model,
                     status=f"attempt={attempt} words={words} target_words={target_minimum} hard_min_words={hard_minimum} errors={'; '.join(quality_errors)[:120]}",
                 )
+                if abandon_model:
+                    raise RuntimeError(
+                        f"local Ollama structural preflight failed after {attempt} attempts: "
+                        f"words={words}, hard_minimum={hard_minimum}, target_words={target_minimum}, errors={'; '.join(quality_errors)}"
+                    )
 
             words = word_count(report_text)
             if words < hard_minimum or quality_errors:
