@@ -173,6 +173,71 @@ def format_message(fields, redis_id=None, transport="redis-stream"):
         "---\n"
     )
 
+def truthy(value):
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_ack_message(fields):
+    message_type = str(fields.get("type", "")).strip().lower()
+    subject = str(fields.get("subject", "")).strip().lower()
+    body = str(fields.get("body", "")).lstrip().lower()
+    return (
+        message_type in {"ack", "receipt_ack"}
+        or subject.startswith("ack")
+        or subject.startswith("receipt_ack")
+        or body.startswith("receipt_ack")
+    )
+
+
+def send_receipt_ack(role, fields, received_redis_id):
+    if is_ack_message(fields):
+        return None
+
+    sender = str(fields.get("from") or fields.get("sender") or "").strip().lower()
+    if not sender or sender == role:
+        return None
+
+    original_subject = str(fields.get("subject") or "agent bridge message").strip()
+    original_id = received_redis_id or str(fields.get("message_id") or fields.get("correlation_id") or "").strip()
+    ack_fields = {
+        "from": role,
+        "to": sender,
+        "type": "ack",
+        "priority": "normal",
+        "subject": f"RECEIPT_ACK {original_subject[:72]}",
+        "body": f"RECEIPT_ACK received_by={role} received_at={now_iso()} ack_for={original_id} subject={original_subject}",
+        "created_at": now_iso(),
+        "requires_ack": "false",
+        "ack_for": original_id,
+        "reply_to": original_id,
+    }
+
+    stream = outgoing_stream(role, sender)
+    transport = "file_fallback"
+    redis_id = None
+    redis_error = None
+    try:
+        redis_id = xadd(stream, ack_fields)
+        transport = "redis_stream"
+    except RedisBridgeError as error:
+        redis_error = str(error)
+
+    file_path = outbound_file(role, sender)
+    locked_append(file_path, format_message(ack_fields, redis_id=redis_id, transport=transport))
+    append_json({
+        "time": now_iso(),
+        "event": "receipt_ack",
+        "role": role,
+        "to": sender,
+        "stream": stream,
+        "ack_for": original_id,
+        "redis_id": redis_id,
+        "transport": transport,
+        "redis_error": redis_error,
+        "file": str(file_path),
+    })
+    return {"transport": transport, "redis_id": redis_id, "file": str(file_path), "redis_error": redis_error}
+
 
 def xadd(stream, fields):
     args = ["XADD", stream, "MAXLEN", "~", MAXLEN, "*"]
@@ -334,7 +399,8 @@ def command_poll_once(args):
             "subject": fields.get("subject"),
             "file": str(file_path),
         })
-
+        if not args.no_auto_ack:
+            send_receipt_ack(role, fields, entry_id)
     locked_append(file_path, "".join(blocks))
     if blocks:
         write_text(latest_path, blocks[-1])
@@ -370,6 +436,7 @@ def build_parser():
     poll = subparsers.add_parser("poll-once")
     poll.add_argument("--role", default=os.environ.get("AGENT_BRIDGE_ROLE", "cg"), choices=["cg", "alice"])
     poll.add_argument("--count", type=int, default=20)
+    poll.add_argument("--no-auto-ack", action="store_true")
     poll.set_defaults(func=command_poll_once)
 
     return parser

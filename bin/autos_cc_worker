@@ -17,8 +17,10 @@ class AutosCcWorker
     @worker_id = env("AUTOS_WORKER_ID", "alice-cc-01")
     @poll_seconds = env("AUTOS_WORKER_POLL_SECONDS", "5").to_f.clamp(1.0, 60.0)
     @ollama_url = env("OLLAMA_URL", "http://127.0.0.1:11434").sub(%r{/+\z}, "")
-    @local_model = env("AUTOS_LOCAL_MODEL", "llama3.2:3b")
+    @local_model = env("AUTOS_LOCAL_MODEL", "qwen3.5:9b-mlx")
+    @local_frontier_model = env("AUTOS_LOCAL_FRONTIER_MODEL", "qwen3.6:35b-mlx")
     @local_think = truthy?(env("AUTOS_LOCAL_THINK", "false"))
+    @local_frontier_think = truthy?(env("AUTOS_LOCAL_FRONTIER_THINK", "false"))
     @context_cache = AliceContextCache.new(ollama_url: @ollama_url, logger: method(:log))
     @openai_fallback = truthy?(ENV["AUTOS_WORKER_OPENAI_FALLBACK"])
     @activity_log = env("AUTOS_WORKER_ACTIVITY_LOG", File.expand_path("../log/autos_cc_activity.jsonl", __dir__))
@@ -27,8 +29,8 @@ class AutosCcWorker
   end
 
   def run
-    log "Alice node starting as #{@worker_id} against #{@base_url} using #{@local_model}"
-    activity("startup", base_url: @base_url, local_model: @local_model)
+    log "Alice node starting as #{@worker_id} against #{@base_url} using #{@local_model} step_up=#{@local_frontier_model}"
+    activity("startup", base_url: @base_url, local_model: @local_model, local_frontier_model: @local_frontier_model)
     log_status
 
     loop do
@@ -60,7 +62,10 @@ class AutosCcWorker
         enabled: status["enabled"],
         queued: status["queued"],
         local_model: @local_model,
+        local_frontier_model: @local_frontier_model,
         server_local_model: status["local_model"],
+        server_local_frontier_model: status["local_frontier_model"],
+        server_embedder_model: status["embedder_model"],
         free_lane: status["free_lane"],
         paid_lane: status["paid_lane"]
       )
@@ -105,6 +110,7 @@ rescue StandardError => e
 end
 
   def local_answer(job)
+    frontier_attempted = false
     semantic_scope = worker_scope(job)
     semantic_chunks = @context_cache.search(job["prompt"], scope: semantic_scope)
     semantic_context = @context_cache.format_results(semantic_chunks)
@@ -144,23 +150,29 @@ end
 
     forced_frontier_reason = frontier_required_reason(job)
     if forced_frontier_reason
+      activity("frontier_required", job_snapshot(job).merge(reason: forced_frontier_reason, local_model: @local_model, local_frontier_model: local_frontier_model_for(job)))
+      frontier_attempted = true
+      frontier_payload = local_frontier_answer(
+        job,
+        prompt: prompt,
+        context_used: context_used,
+        semantic_chunks: semantic_chunks,
+        reason: forced_frontier_reason,
+        forced: true
+      )
+      qwen_fallback_reason = frontier_fallback_reason(frontier_payload[:answer], job: job, semantic_chunks: semantic_chunks)
+      return frontier_payload unless qwen_fallback_reason
+
       if openai_available?
-        progress(job, status: "frontier", provider: "openai", model: openai_model_for(job), reason: forced_frontier_reason)
-        activity("frontier_required", job_snapshot(job).merge(reason: forced_frontier_reason, local_model: @local_model))
-        return openai_answer(job, fallback_reason: forced_frontier_reason)
+        progress(job, status: "frontier", provider: "openai", model: openai_model_for(job), reason: "#{forced_frontier_reason}; qwen=#{qwen_fallback_reason}")
+        activity("frontier_required_openai", job_snapshot(job).merge(reason: forced_frontier_reason, qwen_reason: qwen_fallback_reason, local_frontier_model: frontier_payload[:model]))
+        return openai_answer(job, fallback_reason: "#{forced_frontier_reason}; qwen=#{qwen_fallback_reason}")
       end
 
-      log "frontier required for ##{job["id"]} but OPENAI_API_KEY is not configured"
-      activity("frontier_required_unavailable", job_snapshot(job).merge(reason: forced_frontier_reason, unavailable_reason: "missing_openai_api_key"))
-      answer = "αὐτός needs OpenAI frontier check for betting, prediction-market, or money-strategy questions. Me will not guess or recommend a market without that review."
-      return {
-        answer: answer,
-        provider: "local_cc",
-        model: @local_model,
-        context_used: context_used,
-        usage: approximate_usage(prompt, answer),
-        semantic_sources: semantic_chunks.map { |chunk| { path: chunk["path"], score: chunk["score"] } }
-      }
+      activity("frontier_required_openai_unavailable", job_snapshot(job).merge(reason: forced_frontier_reason, qwen_reason: qwen_fallback_reason, unavailable_reason: "missing_openai_api_key"))
+      answer = strip_local_uncertainty_marker(frontier_payload[:answer])
+      answer = "αὐτός needs stronger review for betting, prediction-market, or money-strategy questions. Me will not guess or recommend a market without that review." if answer.strip.empty?
+      return frontier_payload.merge(answer: answer)
     end
 
     update_active_runtime(provider: "local_cc", model: @local_model)
@@ -171,15 +183,28 @@ end
 
     fallback_reason = frontier_fallback_reason(answer, job: job, semantic_chunks: semantic_chunks)
     if fallback_reason
+      activity("qwen_step_up", job_snapshot(job).merge(reason: fallback_reason, local_model: response["model"] || @local_model, local_frontier_model: local_frontier_model_for(job)))
+      frontier_attempted = true
+      frontier_payload = local_frontier_answer(
+        job,
+        prompt: prompt,
+        context_used: context_used,
+        semantic_chunks: semantic_chunks,
+        reason: fallback_reason,
+        forced: false
+      )
+      qwen_fallback_reason = frontier_fallback_reason(frontier_payload[:answer], job: job, semantic_chunks: semantic_chunks)
+      return frontier_payload unless qwen_fallback_reason
+
       if openai_available?
-        progress(job, status: "frontier", provider: "openai", model: openai_model_for(job), reason: fallback_reason)
-        activity("frontier_fallback", job_snapshot(job).merge(reason: fallback_reason, local_model: response["model"] || @local_model))
-        return openai_answer(job, fallback_reason: fallback_reason)
+        progress(job, status: "frontier", provider: "openai", model: openai_model_for(job), reason: "#{fallback_reason}; qwen=#{qwen_fallback_reason}")
+        activity("frontier_fallback", job_snapshot(job).merge(reason: fallback_reason, qwen_reason: qwen_fallback_reason, local_model: response["model"] || @local_model, local_frontier_model: frontier_payload[:model]))
+        return openai_answer(job, fallback_reason: "#{fallback_reason}; qwen=#{qwen_fallback_reason}")
       end
 
-      log "frontier fallback needed for ##{job["id"]} but OPENAI_API_KEY is not configured"
-      activity("frontier_fallback_unavailable", job_snapshot(job).merge(reason: fallback_reason, unavailable_reason: "missing_openai_api_key"))
-      answer = strip_local_uncertainty_marker(answer)
+      log "OpenAI fallback needed for ##{job["id"]} but OPENAI_API_KEY is not configured"
+      activity("frontier_fallback_unavailable", job_snapshot(job).merge(reason: fallback_reason, qwen_reason: qwen_fallback_reason, unavailable_reason: "missing_openai_api_key"))
+      answer = strip_local_uncertainty_marker(frontier_payload[:answer])
     end
 
     {
@@ -191,9 +216,85 @@ end
       semantic_sources: semantic_chunks.map { |chunk| { path: chunk["path"], score: chunk["score"] } }
     }
   rescue StandardError => e
+    unless frontier_attempted
+      begin
+        fallback_prompt = defined?(prompt) && prompt ? prompt : job["prompt"].to_s
+        fallback_context = defined?(context_used) && context_used ? context_used : job["context"].to_s
+        fallback_chunks = defined?(semantic_chunks) && semantic_chunks ? semantic_chunks : []
+        reason = "local_error_#{e.class.name}: #{e.message.to_s[0, 220]}"
+        activity("qwen_step_up_after_local_error", job_snapshot(job).merge(reason: reason, local_model: @local_model, local_frontier_model: local_frontier_model_for(job)))
+        return local_frontier_answer(
+          job,
+          prompt: fallback_prompt,
+          context_used: fallback_context,
+          semantic_chunks: fallback_chunks,
+          reason: reason,
+          forced: false
+        )
+      rescue StandardError => frontier_error
+        activity(
+          "local_frontier_after_error_failed",
+          job_snapshot(job).merge(
+            original_error_class: e.class.name,
+            original_error: e.message,
+            error_class: frontier_error.class.name,
+            error: frontier_error.message,
+            local_frontier_model: local_frontier_model_for(job)
+          )
+        )
+      end
+    end
+
     raise e unless openai_available?
 
+    activity("openai_after_local_error", job_snapshot(job).merge(error_class: e.class.name, error: e.message, local_frontier_model: local_frontier_model_for(job)))
     openai_answer(job, fallback_reason: e.message)
+  end
+
+  def local_frontier_answer(job, prompt:, context_used:, semantic_chunks:, reason:, forced:)
+    model = local_frontier_model_for(job)
+    update_active_runtime(provider: "qwen/local", model: model)
+    progress(job, status: "local_frontier", provider: "qwen/local", model: model, reason: reason)
+
+    frontier_prompt = <<~PROMPT
+      #{prompt}
+
+      QWEN LOCAL STEP-UP REVIEW:
+      - This prompt would normally spend OpenAI or the fast local lane was uncertain.
+      - You are the stronger local Qwen review lane. Answer only if you understand.
+      - Use supplied context first. For general safe questions, answer from broad knowledge.
+      - If still not confident, start with LOCAL_UNCERTAIN: and one short reason.
+      - For betting, financial, gambling, trading, arbitrage, or system-gaming prompts, give risk-aware safety guidance. Never recommend exploiting systems, guaranteed profit, or spam betting.
+      - Brevity is priceless: default to 1 to 2 short sentences. Hard ceiling: 4 short lines.
+    PROMPT
+
+    response = ollama_generate(frontier_prompt, model: model, frontier: true)
+    answer = sanitize_answer(response.fetch("response", "").to_s.strip)
+    raise "empty local frontier answer" if answer.empty?
+
+    activity(
+      "local_frontier_answer",
+      job_snapshot(job).merge(reason: reason, forced: forced, model: response["model"] || model, answer: answer)
+    )
+
+    {
+      answer: answer,
+      provider: "qwen/local",
+      model: response["model"] || model,
+      context_used: context_used,
+      usage: approximate_usage(frontier_prompt, answer),
+      semantic_sources: semantic_chunks.map { |chunk| { path: chunk["path"], score: chunk["score"] } },
+      local_frontier_reason: reason
+    }
+  rescue StandardError => e
+    activity("local_frontier_error", job_snapshot(job).merge(error_class: e.class.name, error: e.message, reason: reason, model: model))
+    raise e
+  end
+
+  def local_frontier_model_for(job)
+    config = job.fetch("local_frontier", {})
+    model = config["model"].to_s.strip
+    model.empty? ? @local_frontier_model : model
   end
 
   def frontier_fallback_reason(answer, job: nil, semantic_chunks: [])
@@ -382,26 +483,27 @@ def update_active_runtime(provider:, model:)
   @active_model = model.to_s.empty? ? @local_model : model.to_s
 end
 
-  def ollama_generate(prompt)
+  def ollama_generate(prompt, model: @local_model, frontier: false)
     uri = URI("#{@ollama_url}/api/generate")
     req = Net::HTTP::Post.new(uri)
     req["Content-Type"] = "application/json"
     req.body = {
-      model: @local_model,
+      model: model,
       prompt: prompt,
       stream: false,
-      think: @local_think,
+      think: frontier ? @local_frontier_think : @local_think,
       options: {
-        temperature: env("AUTOS_LOCAL_TEMPERATURE", "0.25").to_f,
-        top_k: env("AUTOS_LOCAL_TOP_K", "30").to_i,
-        top_p: env("AUTOS_LOCAL_TOP_P", "0.85").to_f,
-        repeat_penalty: env("AUTOS_LOCAL_REPEAT_PENALTY", "1.25").to_f,
-        repeat_last_n: env("AUTOS_LOCAL_REPEAT_LAST_N", "128").to_i,
-        num_predict: env("AUTOS_LOCAL_MAX_TOKENS", "220").to_i
+        temperature: env(frontier ? "AUTOS_LOCAL_FRONTIER_TEMPERATURE" : "AUTOS_LOCAL_TEMPERATURE", frontier ? "0.18" : "0.25").to_f,
+        top_k: env(frontier ? "AUTOS_LOCAL_FRONTIER_TOP_K" : "AUTOS_LOCAL_TOP_K", "30").to_i,
+        top_p: env(frontier ? "AUTOS_LOCAL_FRONTIER_TOP_P" : "AUTOS_LOCAL_TOP_P", frontier ? "0.82" : "0.85").to_f,
+        repeat_penalty: env(frontier ? "AUTOS_LOCAL_FRONTIER_REPEAT_PENALTY" : "AUTOS_LOCAL_REPEAT_PENALTY", frontier ? "1.18" : "1.25").to_f,
+        repeat_last_n: env(frontier ? "AUTOS_LOCAL_FRONTIER_REPEAT_LAST_N" : "AUTOS_LOCAL_REPEAT_LAST_N", frontier ? "192" : "128").to_i,
+        num_predict: env(frontier ? "AUTOS_LOCAL_FRONTIER_MAX_TOKENS" : "AUTOS_LOCAL_MAX_TOKENS", frontier ? "360" : "220").to_i
       }
     }.to_json
 
-    res = http(uri).request(req)
+    read_timeout = env(frontier ? "AUTOS_LOCAL_FRONTIER_READ_TIMEOUT" : "AUTOS_LOCAL_READ_TIMEOUT", frontier ? "420" : "180").to_i.clamp(30, 900)
+    res = http(uri, read_timeout: read_timeout).request(req)
     raise "ollama HTTP #{res.code}: #{res.body}" unless res.is_a?(Net::HTTPSuccess)
 
     JSON.parse(res.body)

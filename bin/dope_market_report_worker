@@ -42,17 +42,13 @@ MAX_LOGO_BYTES = 5 * 1024 * 1024
 DEFAULT_MINIMUM_WORDS = 500
 DEFAULT_HARD_MINIMUM_WORDS = 250
 DEFAULT_MINIMUM_DOCX_BYTES = 8_000
-DEFAULT_EMBEDDER_MODEL = "nomic-embed-text"
+DEFAULT_EMBEDDER_MODEL = "qwen3-embedding:8b-q4_K_M"
 DEFAULT_EMBEDDING_TOP_K = 10
 DEFAULT_EMBEDDING_CHUNK_CHARS = 1800
 DEFAULT_EMBEDDING_MAX_CHUNKS = 80
 DEFAULT_LOCAL_MODEL_CANDIDATES = [
     "qwen3:8b",
     "qwen3:30b",
-    "qwen3.6:27b",
-    "devstral-small-2:24b",
-    "granite4.1:8b",
-    "gemma4:e4b",
     "llama3.2:3b",
 ]
 BRAND_RED = "D71920"
@@ -951,6 +947,25 @@ def local_report_required(job: dict) -> bool:
     )
 
 
+def normalize_local_model_name(value: str) -> str:
+    cleaned = str(value or "").strip()
+    lowered = cleaned.lower()
+    aliases = {
+        "qwen3.5:9b": "qwen3:8b",
+        "qwen3.5:9b-mlx": "qwen3:8b",
+        "qwen3.6:27b": "qwen3:30b",
+        "qwen3.6:27b-mlx": "qwen3:30b",
+        "qwen3.6:35b": "qwen3:30b",
+        "qwen3.6:35b-mlx": "qwen3:30b",
+        "qwen3:30b-a3b": "qwen3:30b",
+        "qwen3:14b": "qwen3:8b",
+        "devstral-small-2:24b": "qwen3:8b",
+        "gemma4:e4b": "qwen3:8b",
+        "granite4.1:8b": "qwen3:8b",
+    }
+    return aliases.get(lowered, cleaned)
+
+
 def local_model_candidates(job: dict) -> list[str]:
     runtime = report_runtime(job)
     metadata = job.get("metadata", {}) or {}
@@ -959,16 +974,19 @@ def local_model_candidates(job: dict) -> list[str]:
     # If SUN queued an explicit per-report model, do not silently downgrade to
     # the env/default fallback. A missing selected model should fail loudly so
     # the DOPE UI does not claim a 27B report was produced by an 8B fallback.
-    explicit_candidates = [
+    explicit_candidates = []
+    for item in runtime.get("model_ladder") or runtime.get("models") or []:
+        explicit_candidates.append(item)
+    explicit_candidates.extend([
         runtime.get("local_model"),
         runtime.get("target_model"),
         metadata.get("report_local_model"),
         contract.get("target_model"),
-    ]
+    ])
 
     candidates = []
     for item in explicit_candidates:
-        value = str(item or "").strip()
+        value = normalize_local_model_name(item)
         if not value or value.lower() in {"qwen/local", "local", "openai"}:
             continue
         if value not in candidates:
@@ -980,7 +998,7 @@ def local_model_candidates(job: dict) -> list[str]:
                 *DEFAULT_LOCAL_MODEL_CANDIDATES,
             ]
             for item in fallback_candidates:
-                value = str(item or "").strip()
+                value = normalize_local_model_name(item)
                 if not value or value.lower() in {"qwen/local", "local", "openai"}:
                     continue
                 if value not in candidates:
@@ -996,7 +1014,7 @@ def local_model_candidates(job: dict) -> list[str]:
     ]
     cleaned = []
     for item in candidates:
-        value = str(item or "").strip()
+        value = normalize_local_model_name(item)
         if not value or value.lower() in {"qwen/local", "local", "openai"}:
             continue
         if value not in cleaned:
@@ -1093,7 +1111,9 @@ def local_retry_note(job: dict, report_text: str, quality_errors: list[str], min
         f"Rewrite from scratch with {target}-{target + 250} words while staying concise and {visible_label}. "
         f"Start exactly with DOPE MARKETING. Return only {visible_label}. "
         f"{section_rule}{table_rule}Do not include planning notes, "
-        "payload summaries, missing-input labels, hidden thinking, or explanation of the task."
+        "payload summaries, missing-input labels, hidden thinking, or explanation of the task. "
+        "Do not use unsupported exact percentages or statistics. Do not use internal ticket/status words like abandoned, SAM, HubSpot ID, or workflow stage names in client copy. "
+        "Do not leave any section heading empty or duplicate section headings."
     )
 
 
@@ -1187,6 +1207,105 @@ def markdown_table_count(text: str) -> int:
     return count
 
 
+def normalized_heading_title(line: str) -> str | None:
+    cleaned = re.sub(r"^\s*#{1,6}\s*", "", line or "")
+    cleaned = re.sub(r"^\s*[-*_]{3,}\s*$", "", cleaned).strip()
+    cleaned = re.sub(r"[:\s]+$", "", cleaned).strip()
+    if not cleaned or len(cleaned) > 90:
+        return None
+    if re.search(r"[.!?]\s+", cleaned):
+        return None
+    if re.match(r"^(DOPE MARKETING|Header / Cover|Executive Summary|Market Snapshot|Seasonality Timeline|Recommended Campaign|Campaign Recommendation|Channel Strategy|Neighborhood Targeting|Offer Strategy|Timeline / Launch Plan|Final Recommendation|Best Opportunity Callout|Big Stat Cards|Customer Mindset|Buying Triggers|Why Print/Direct Mail Fits|Offer Card \d+)$", cleaned, flags=re.I):
+        return cleaned.lower()
+    if re.match(r"^[A-Z][A-Za-z0-9 /&+-]{2,80}$", cleaned) and len(cleaned.split()) <= 7:
+        return cleaned.lower()
+    return None
+
+
+def duplicate_heading_titles(text: str) -> list[str]:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for line in (text or "").splitlines():
+        title = normalized_heading_title(line)
+        if not title:
+            continue
+        if title in seen and title not in duplicates:
+            duplicates.append(title)
+        seen.add(title)
+    return duplicates
+
+
+def empty_heading_titles(text: str) -> list[str]:
+    lines = (text or "").splitlines()
+    empties: list[str] = []
+    for index, line in enumerate(lines):
+        title = normalized_heading_title(line)
+        if not title:
+            continue
+        if title == "dope marketing":
+            continue
+        following = []
+        for next_line in lines[index + 1:index + 4]:
+            stripped = next_line.strip()
+            if stripped in {"---", "--", "___"}:
+                continue
+            following.append(stripped)
+        if not any(following) or any(normalized_heading_title(item) for item in following[:1]):
+            empties.append(title)
+    return empties
+
+
+def unsupported_exact_stats(text: str, job: dict) -> list[str]:
+    source_blob = json.dumps(
+        {
+            "deal": job.get("deal", {}),
+            "company": job.get("company", {}),
+            "commerce": job.get("commerce", {}),
+            "campaign_context": job.get("campaign_context", {}),
+            "hubspot_context": job.get("hubspot_context", {}),
+            "account_graph": job.get("account_graph", {}),
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+    found = []
+    for match in re.finditer(r"(?<![\w.])\d+(?:\.\d+)?\s*%", text or ""):
+        stat = re.sub(r"\s+", "", match.group(0))
+        if stat not in source_blob.replace(" ", ""):
+            found.append(stat)
+    return sorted(set(found))
+
+
+def visible_client_forbidden_terms(text: str) -> list[str]:
+    terms = []
+    patterns = {
+        "abandoned": r"\babandoned\b",
+        "sam": r"\bSAM\b",
+        "hubspot id": r"\bHubSpot\s+ID\b|\bhs_[a-z0-9_]+\b",
+        "internal status": r"\bChecklist Not Completed\b|\bDesign Uploaded\b|\bWaiting for Approval\b|\bDemo Call Scheduled\b",
+        "ai/model mention": r"\bAlice\b|\bQwen\b|\bOpenAI\b|\bOllama\b|\bMLX\b",
+    }
+    for label, pattern in patterns.items():
+        if re.search(pattern, text or "", flags=re.I):
+            terms.append(label)
+    return terms
+
+
+def generic_report_markers(text: str, job: dict) -> list[str]:
+    markers = []
+    company_name = str((job.get("company") or {}).get("name") or (job.get("deal") or {}).get("company_name") or "").strip()
+    business_name = str((job.get("report_contract") or {}).get("client", {}).get("business_name") or company_name).strip()
+    visible_name = business_name or company_name
+    if visible_name and visible_name.lower() not in (text or "").lower():
+        markers.append("client name missing")
+    industry = str((job.get("report_contract") or {}).get("client", {}).get("industry") or (job.get("company") or {}).get("industry") or "").strip()
+    if industry and industry.lower() != "local service business" and industry.lower() not in (text or "").lower():
+        markers.append("specific industry missing")
+    if re.search(r"\blocal service business\b", text or "", flags=re.I) and industry and industry.lower() not in {"", "local service business"}:
+        markers.append("generic local service business wording")
+    return markers
+
+
 def visible_text_quality_errors(text: str, job: dict) -> list[str]:
     errors = []
     cleaned = text or ""
@@ -1203,6 +1322,22 @@ def visible_text_quality_errors(text: str, job: dict) -> list[str]:
     if missing_sections:
         label = "internal AM brief" if audience == "am" else "client report"
         errors.append(f"visible {label} is missing required sections: {', '.join(missing_sections)}")
+    duplicate_headings = duplicate_heading_titles(cleaned)
+    if duplicate_headings:
+        errors.append(f"visible copy repeats section headings: {', '.join(duplicate_headings[:5])}")
+    empty_headings = empty_heading_titles(cleaned)
+    if empty_headings:
+        errors.append(f"visible copy has empty section headings: {', '.join(empty_headings[:5])}")
+    if audience != "am":
+        forbidden_terms = visible_client_forbidden_terms(cleaned)
+        if forbidden_terms:
+            errors.append(f"visible client report leaks internal language: {', '.join(forbidden_terms)}")
+        fake_stats = unsupported_exact_stats(cleaned, job)
+        if fake_stats:
+            errors.append(f"visible client report includes unsupported exact percentages/statistics: {', '.join(fake_stats[:6])}")
+        generic_markers = generic_report_markers(cleaned, job)
+        if generic_markers:
+            errors.append(f"visible client report is too generic: {', '.join(generic_markers)}")
     return errors
 
 
@@ -1216,6 +1351,11 @@ def structural_quality_errors(errors: list[str]) -> bool:
             "does not start with dope marketing",
             "prompt echo",
             "model planning",
+            "unsupported exact percentages",
+            "leaks internal language",
+            "empty section headings",
+            "repeats section headings",
+            "too generic",
         ]
     )
 

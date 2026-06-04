@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-06-01T15:18:00-04:00",
+  "updated_at": "2026-06-03T00:00:00-04:00",
   "owner": "SUN/CG",
   "purpose": "Alice local LLM experiment registry for DOPE market reports, AUTOS/Chicle answers, bridge-agent work, and local coding support.",
   "policy": {
@@ -7,68 +7,95 @@
     "explicit_model_selection": "hard_fail_if_missing",
     "redis_bridge": "preferred",
     "file_bridge": "fallback",
-    "ollama_pull_strategy": "pull in priority order, test after each, stop if disk or memory pressure becomes unsafe"
+    "ollama_pull_strategy": "regular Qwen and MLX Qwen report models are active experiments; selected model IDs must be honored exactly"
   },
   "models": [
     {
-      "model": "qwen3:30b",
+      "model": "qwen3:8b",
       "priority": 1,
+      "size_gb": 5,
+      "context": "128K+",
+      "role": "fast regular Ollama report writer and scout model",
+      "why": "Baseline fast report model for comparing RAG embedder quality."
+    },
+    {
+      "model": "qwen3:30b",
+      "priority": 2,
       "size_gb": 19,
       "context": "256K",
-      "role": "primary heavy DOPE report brain",
-      "why": "Best first heavy local test: strong reasoning, long context, Qwen agent/tool strengths, exact Ollama tag confirmed. Use for AM/client report quality comparison against qwen3:8b."
+      "role": "heavy regular Ollama report writer",
+      "why": "Stable non-MLX heavy Qwen model for report quality tests."
     },
     {
-      "model": "qwen3.6:27b",
-      "priority": 2,
-      "size_gb": 17,
-      "context": "256K",
-      "role": "new Qwen candidate for agentic stability and thinking preservation",
-      "why": "Ollama current page lists this tag; prior Alice 404 should be retested after confirming Ollama version/catalog. If it still fails, record exact error and skip."
-    },
-    {
-      "model": "gemma4:e4b",
+      "model": "qwen3.5:9b-mlx",
       "priority": 3,
-      "size_gb": 9.6,
-      "context": "128K",
-      "role": "fast business prose and multimodal candidate",
-      "why": "Good report-writing/tone candidate with smaller footprint than 20B+ models; useful for fast client-facing drafts and image-aware experiments."
+      "size_gb": "TBD",
+      "context": "TBD",
+      "role": "MLX fast Mac report writer",
+      "why": "Apple Silicon MLX experiment for faster local generation."
     },
     {
-      "model": "granite4.1:8b",
+      "model": "qwen3.6:27b-mlx",
       "priority": 4,
-      "size_gb": 5.3,
-      "context": "128K",
-      "role": "enterprise RAG, structured JSON, HubSpot/account graph extraction",
-      "why": "IBM enterprise model explicitly targets RAG, tool use, structured output, extraction, and business applications."
+      "size_gb": "TBD",
+      "context": "TBD",
+      "role": "MLX balanced/heavy Mac report writer",
+      "why": "Apple Silicon MLX experiment between 9B speed and 35B quality."
     },
     {
-      "model": "devstral-small-2:24b",
+      "model": "qwen3.6:35b-mlx",
       "priority": 5,
-      "size_gb": 15,
-      "context": "384K",
-      "role": "local coding/agent engineering candidate",
-      "why": "Best fit for Alice-side codebase/tool-agent experiments; large context and agentic coding focus."
+      "size_gb": "TBD",
+      "context": "TBD",
+      "role": "MLX high-quality Mac report writer",
+      "why": "Apple Silicon MLX frontier local report experiment."
     }
   ],
-  "fallback_candidates": [
+  "report_flows": [
     {
-      "model": "gpt-oss:20b",
-      "size_gb": 14,
-      "context": "128K",
-      "use_if": "devstral-small-2:24b is too slow/heavy or if we want an OpenAI open-weight comparison"
-    },
-    {
-      "model": "qwen3.5:27b",
-      "size_gb": 17,
-      "context": "256K",
-      "use_if": "qwen3.6:27b remains unavailable after Ollama update/retry"
-    },
-    {
-      "model": "glm-4.7-flash",
-      "size_gb": 19,
-      "context": "198K",
-      "use_if": "Alice is upgraded to the required Ollama pre-release and we want a 30B-class MoE comparison"
+      "flow": "selected embedder -> selected qwen -> selected qwen",
+      "role": "dynamic two-round RAG report builder"
     }
-  ]
+  ],
+  "embedders": [
+    {
+      "model": "qwen3-embedding:0.6b",
+      "role": "fast scout retrieval",
+      "why": "Fastest Qwen embedder for quick comparisons."
+    },
+    {
+      "model": "qwen3-embedding:4b",
+      "role": "balanced retrieval",
+      "why": "Middle retrieval quality/speed lane."
+    },
+    {
+      "model": "qwen3-embedding:8b-q4_K_M",
+      "role": "deep retrieval",
+      "why": "Best Qwen-family embedder for high-value report context."
+    }
+  ],
+  "inactive_models": [
+    "gemma4:e4b",
+    "granite4.1:8b",
+    "bge-m3",
+    "nomic-embed-text"
+  ],
+  "report_lanes": [],
+  "report_dropdowns": {
+    "embedders_first": [
+      "qwen3-embedding:0.6b",
+      "qwen3-embedding:4b",
+      "qwen3-embedding:8b-q4_K_M"
+    ],
+    "qwen_models_second": [
+      "qwen3:8b",
+      "qwen3:30b",
+      "qwen3.5:9b-mlx",
+      "qwen3.6:27b-mlx",
+      "qwen3.6:35b-mlx"
+    ],
+    "rounds": 2,
+    "model_ladder": "[selected_model, selected_model]",
+    "retry_context_strategy": "round 2 vectorizes HubSpot facts + first draft + validation errors/retry note, never validation errors alone"
+  }
 }

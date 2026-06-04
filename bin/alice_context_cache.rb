@@ -8,7 +8,7 @@ require "time"
 require "uri"
 
 class AliceContextCache
-  DEFAULT_PATTERNS = [
+  DEFAULT_AUTOS_PATTERNS = [
     "README.md",
     "config/routes.rb",
     "config/autos/**/*.{md,txt,rb}",
@@ -33,21 +33,42 @@ class AliceContextCache
     "app/channels/pow_wow*.rb"
   ].freeze
 
+  DEFAULT_DOPE_PATTERNS = [
+    "README.md",
+    "config/routes.rb",
+    "config/autos/**/*.{md,txt,rb}",
+    "app/controllers/asks_controller.rb",
+    "app/controllers/autos_worker_controller.rb",
+    "app/controllers/dope_worker_controller.rb",
+    "app/controllers/deal_queues_controller.rb",
+    "app/controllers/data_maps_controller.rb",
+    "app/models/autos*.rb",
+    "app/models/crm_record.rb",
+    "app/models/report_artifact.rb",
+    "app/services/autos/**/*.rb",
+    "app/services/deal_reports/**/*.rb",
+    "app/services/hubspot/**/*.rb",
+    "app/services/data_maps/**/*.rb",
+    "app/services/canva/**/*.rb",
+    "app/views/asks/**/*.{erb,html}",
+    "app/views/deal_queues/**/*.{erb,html}",
+    "app/views/data_maps/**/*.{erb,html}",
+    "docs/**/*.{md,txt}"
+  ].freeze
+
   def initialize(ollama_url: nil, logger: nil)
     @ollama_url = (ollama_url || env("OLLAMA_URL", "http://127.0.0.1:11434")).sub(%r{/+\z}, "")
-    @embed_model = env("AUTOS_CC_EMBED_MODEL", "nomic-embed-text")
+    @embed_model = env("AUTOS_CC_EMBED_MODEL", "qwen3-embedding:8b-q4_K_M")
     @enabled = truthy?(env("AUTOS_CC_EMBED_ENABLED", "1"))
-    @root = File.expand_path(env("AUTOS_CC_ROOT", default_root))
-    @context_dir = File.expand_path(env("AUTOS_CC_CONTEXT_DIR", File.expand_path("context", __dir__)))
-    @index_path = File.expand_path(env("AUTOS_CC_INDEX_PATH", File.expand_path("log/alice_context_index.json", __dir__)))
     @max_chunks = env("AUTOS_CC_MAX_CHUNKS", "5").to_i.clamp(1, 12)
     @min_score = env("AUTOS_CC_MIN_SCORE", "0.18").to_f
     @chunk_chars = env("AUTOS_CC_CHUNK_CHARS", "1200").to_i.clamp(400, 3000)
-    @index_max_chunks = env("AUTOS_CC_INDEX_MAX_CHUNKS", "360").to_i.clamp(20, 1000)
+    @index_max_chunks = env("AUTOS_CC_INDEX_MAX_CHUNKS", "420").to_i.clamp(20, 1200)
     @batch_size = env("AUTOS_CC_EMBED_BATCH", "12").to_i.clamp(1, 32)
     @rebuild_seconds = env("AUTOS_CC_REBUILD_SECONDS", "3600").to_i.clamp(60, 86_400)
     @skip_stale_check = truthy?(env("AUTOS_CC_SKIP_STALE_CHECK", "1"))
     @logger = logger
+    @profiles = build_profiles
   end
 
   def enabled?
@@ -60,18 +81,18 @@ class AliceContextCache
     query = query.to_s.strip
     return [] if query.empty?
 
-    index = load_or_rebuild
+    scope_name = profile_key(scope)
+    index = load_or_rebuild(scope_name)
     query_embedding = embed_many([query]).first
-    wanted_scope = scope.to_s
 
     Array(index["chunks"])
-      .select { |chunk| ["common", wanted_scope].include?(chunk["scope"].to_s) }
+      .select { |chunk| ["common", scope_name].include?(chunk["scope"].to_s) }
       .map { |chunk| chunk.merge("score" => cosine(query_embedding, chunk["embedding"])) }
       .select { |chunk| chunk["score"].finite? && chunk["score"] >= @min_score }
       .sort_by { |chunk| -chunk["score"] }
       .first(@max_chunks)
   rescue StandardError => e
-    log "semantic context failed #{e.class}: #{e.message}"
+    log "semantic context failed scope=#{scope} #{e.class}: #{e.message}"
     []
   end
 
@@ -87,12 +108,80 @@ class AliceContextCache
     end.join("\n\n")
   end
 
-  def rebuild!
+  def rebuild!(scope: "autos")
     raise "semantic context disabled" unless enabled?
 
-    sources = source_files
+    if scope.to_s == "all"
+      return @profiles.keys.each_with_object({}) { |key, built| built[key] = rebuild_profile!(key) }
+    end
+
+    rebuild_profile!(profile_key(scope))
+  end
+
+  private
+
+  def build_profiles
+    legacy_root = env("AUTOS_CC_ROOT", default_autos_root)
+    legacy_context_dir = env("AUTOS_CC_CONTEXT_DIR", File.expand_path("context", __dir__))
+    index_dir = File.expand_path(env("AUTOS_CC_INDEX_DIR", File.expand_path("log", __dir__)))
+
+    autos_root = File.expand_path(env("AUTOS_CC_AUTOS_ROOT", legacy_root))
+    dope_root = File.expand_path(env("AUTOS_CC_DOPE_ROOT", default_dope_root))
+
+    {
+      "autos" => {
+        scope: "autos",
+        label: "pb",
+        root: autos_root,
+        context_dirs: context_dirs("AUTOS_CC_AUTOS_CONTEXT_DIRS", [
+          File.expand_path("context/autos", __dir__),
+          File.expand_path(legacy_context_dir)
+        ]),
+        index_path: File.expand_path(env("AUTOS_CC_AUTOS_INDEX_PATH", File.join(index_dir, "alice_context_autos.json"))),
+        patterns: DEFAULT_AUTOS_PATTERNS
+      },
+      "dope" => {
+        scope: "dope",
+        label: "dope",
+        root: dope_root,
+        context_dirs: context_dirs("AUTOS_CC_DOPE_CONTEXT_DIRS", [
+          File.expand_path("context/dope", __dir__),
+          File.expand_path("~/Desktop/alice-brain/report_refs"),
+          File.expand_path("~/.config/autos/context/dope")
+        ]),
+        index_path: File.expand_path(env("AUTOS_CC_DOPE_INDEX_PATH", File.join(index_dir, "alice_context_dope.json"))),
+        patterns: DEFAULT_DOPE_PATTERNS
+      }
+    }
+  end
+
+  def profile_key(scope)
+    value = scope.to_s.downcase
+    return "dope" if value.include?("dope") || value.include?("8182")
+
+    "autos"
+  end
+
+  def context_dirs(env_name, defaults)
+    configured = ENV[env_name].to_s.split(":").map(&:strip).reject(&:empty?)
+    dirs = configured.empty? ? defaults : configured
+    dirs.map { |dir| File.expand_path(dir) }.uniq
+  end
+
+  def load_or_rebuild(scope_name)
+    profile = @profiles.fetch(scope_name)
+    return rebuild_profile!(scope_name) if index_stale?(profile)
+
+    JSON.parse(File.read(profile[:index_path]))
+  rescue JSON::ParserError
+    rebuild_profile!(scope_name)
+  end
+
+  def rebuild_profile!(scope_name)
+    profile = @profiles.fetch(scope_name)
+    sources = source_files(profile)
     chunks = sources.flat_map { |source| chunks_for(source) }.first(@index_max_chunks)
-    raise "no context chunks found under #{@root} / #{@context_dir}" if chunks.empty?
+    raise "no #{scope_name} context chunks found under #{profile[:root]} / #{profile[:context_dirs].join(', ')}" if chunks.empty?
 
     embedded = []
     chunks.each_slice(@batch_size) do |batch|
@@ -103,10 +192,11 @@ class AliceContextCache
     end
 
     payload = {
-      version: 1,
+      version: 2,
+      scope: scope_name,
       generated_at: Time.now.iso8601,
-      root: @root,
-      context_dir: @context_dir,
+      root_label: profile[:label],
+      context_dirs: profile[:context_dirs].select { |dir| Dir.exist?(dir) }.map { |dir| safe_context_label(dir) },
       model: @embed_model,
       chunk_count: embedded.length,
       chunks: embedded.map do |chunk|
@@ -120,49 +210,47 @@ class AliceContextCache
       end
     }
 
-    FileUtils.mkdir_p(File.dirname(@index_path))
-    tmp_path = "#{@index_path}.tmp-#{$$}"
+    FileUtils.mkdir_p(File.dirname(profile[:index_path]))
+    tmp_path = "#{profile[:index_path]}.tmp-#{$$}"
     File.write(tmp_path, JSON.generate(payload))
-    File.rename(tmp_path, @index_path)
-    log "semantic context indexed #{embedded.length} chunks from #{sources.length} files using #{@embed_model}"
+    File.rename(tmp_path, profile[:index_path])
+    log "semantic context indexed scope=#{scope_name} chunks=#{embedded.length} files=#{sources.length} model=#{@embed_model}"
     payload
   ensure
     FileUtils.rm_f(tmp_path) if defined?(tmp_path) && tmp_path && File.exist?(tmp_path)
   end
 
-  private
+  def index_stale?(profile)
+    return true unless File.file?(profile[:index_path])
 
-  def load_or_rebuild
-    return rebuild! if index_stale?
-
-    JSON.parse(File.read(@index_path))
-  rescue JSON::ParserError
-    rebuild!
-  end
-
-  def index_stale?
-    return true unless File.file?(@index_path)
-
-    index = JSON.parse(File.read(@index_path))
+    index = JSON.parse(File.read(profile[:index_path]))
+    return true unless index["version"].to_i >= 2
+    return true unless index["scope"] == profile[:scope]
     return true unless index["model"] == @embed_model
-    return true unless index["root"] == @root
+    return true unless index["root_label"] == profile[:label]
     return false if @skip_stale_check
-    return true if Time.now - File.mtime(@index_path) > @rebuild_seconds
+    return true if Time.now - File.mtime(profile[:index_path]) > @rebuild_seconds
 
-    index_mtime = File.mtime(@index_path)
-    source_files.any? { |source| File.mtime(source[:absolute]) > index_mtime }
+    index_mtime = File.mtime(profile[:index_path])
+    source_files(profile).any? { |source| File.mtime(source[:absolute]) > index_mtime }
   rescue StandardError
     true
   end
 
-  def source_files
-    paths = DEFAULT_PATTERNS.flat_map { |pattern| Dir.glob(File.join(@root, pattern), File::FNM_EXTGLOB) }
-    paths.concat(Dir.glob(File.join(@context_dir, "**/*.{md,txt}"), File::FNM_EXTGLOB)) if Dir.exist?(@context_dir)
+  def source_files(profile)
+    paths = []
+    if Dir.exist?(profile[:root])
+      paths.concat(profile[:patterns].flat_map { |pattern| Dir.glob(File.join(profile[:root], pattern), File::FNM_EXTGLOB) })
+    end
+
+    profile[:context_dirs].each do |context_dir|
+      paths.concat(Dir.glob(File.join(context_dir, "**/*.{md,txt}"), File::FNM_EXTGLOB)) if Dir.exist?(context_dir)
+    end
 
     paths.uniq.select do |path|
       File.file?(path) && File.size(path) <= 250_000 && !sensitive_path?(path)
     end.sort.map do |path|
-      { absolute: path, relative: relative_path(path), scope: scope_for(path) }
+      { absolute: path, relative: relative_path(path, profile), scope: scope_for(path, profile) }
     end
   end
 
@@ -262,32 +350,41 @@ class AliceContextCache
     end
   end
 
-  def relative_path(path)
+  def relative_path(path, profile)
     expanded = File.expand_path(path)
-    if expanded.start_with?("#{@root}/")
-      expanded.delete_prefix("#{@root}/")
-    elsif expanded.start_with?("#{@context_dir}/")
-      "alice_context/#{expanded.delete_prefix("#{@context_dir}/")}" 
+    if expanded.start_with?("#{profile[:root]}/")
+      "#{profile[:label]}:#{expanded.delete_prefix("#{profile[:root]}/")}" 
     else
-      expanded
+      context_dir = profile[:context_dirs].find { |dir| expanded.start_with?("#{dir}/") }
+      return "#{profile[:label]}_context:#{expanded.delete_prefix("#{context_dir}/")}" if context_dir
+
+      File.basename(expanded)
     end
   end
 
-  def scope_for(path)
-    rel = relative_path(path).downcase
-    return "dope" if rel.include?("dope") || rel.include?("pow_wow") || rel.include?("shop")
-    return "autos" if rel.include?("autos") || rel.include?("pinball") || rel.include?("thumper") || rel.include?("cc_context")
+  def scope_for(path, profile)
+    rel = relative_path(path, profile).downcase
+    return "common" if rel.include?("common/") || rel.include?("shared/")
 
-    "common"
+    profile[:scope]
+  end
+
+  def safe_context_label(dir)
+    File.basename(File.expand_path(dir))
   end
 
   def sensitive_path?(path)
     path.downcase.match?(%r{(credentials|master\.key|secret|database\.yml|application\.yml|\.env|token|storage\.yml)})
   end
 
-  def default_root
+  def default_autos_root
     candidate = File.expand_path("~/Desktop/PB")
     Dir.exist?(candidate) ? candidate : Dir.pwd
+  end
+
+  def default_dope_root
+    candidate = File.expand_path("~/Desktop/DOPE")
+    Dir.exist?(candidate) ? candidate : default_autos_root
   end
 
   def env(name, fallback)
