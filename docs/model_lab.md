@@ -1,44 +1,33 @@
-# Alice Model Lab
+# Alice Brain Model Baseline
 
-SUN/CG switched DOPE market reports back to dynamic RAG dropdowns.
+This is the default model stack for a secure Alice Brain node.
 
-## Active Dropdowns
+## Required
 
-First dropdown: embedder
+```sh
+ollama pull qwen3-embedding:4b
+ollama pull qwen3:8b
+ollama pull qwen3-vl:8b
+```
 
-- `qwen3-embedding:0.6b`
-- `qwen3-embedding:4b`
-- `qwen3-embedding:8b-q4_K_M`
+Roles:
 
-Second dropdown: Qwen writer model
+- `qwen3-embedding:4b` - local retrieval and context matching.
+- `qwen3:8b` - default local writing, answering, repair, and report drafting.
+- `qwen3-vl:8b` - visual media scan and finished-page QA.
 
-- `qwen3:8b`
-- `qwen3:30b`
-- `qwen3.5:9b-mlx`
-- `qwen3.6:27b-mlx`
-- `qwen3.6:35b-mlx`
+## Optional OCR
 
-MLX model IDs are first-class selections. Do not rewrite `*-mlx` values to regular Ollama models. If a selected MLX model is unavailable, fail clearly or report the fallback in the manifest.
+```sh
+ollama pull glm-ocr:bf16
+```
 
-## Runtime Contract
+Use this only when jobs enable explicit OCR extraction. `qwen3-vl:8b` remains the visual inspector.
 
-DOPE sends:
+## Policy
 
-- `ai_runtime.model_ladder = [selected_model, selected_model]`
-- `ai_runtime.pipeline_mode = dynamic_two_round_rag`
-- `ai_runtime.retry_context_strategy = vectorize_hubspot_facts_first_draft_and_quality_errors_before_second_round`
-
-## Required Worker Behavior
-
-Round 1:
-
-- Run the selected embedder over HubSpot/account/media/report-contract data.
-- Generate the first draft with the selected Qwen model.
-
-Round 2:
-
-- Build a second retrieval query from HubSpot facts, first draft copy, validation errors, and the retry note.
-- Run the same selected embedder again against that second query.
-- Rewrite with the same selected Qwen model.
-
-Do not vectorize validation errors alone. Keep HubSpot facts in the retry vector so the report stays client-specific instead of merely validator-specific.
+- Keep the default node small enough for a 32 GB Mac or equivalent PC.
+- Report the actual model used in every completed manifest.
+- Do not silently promote heavy local models into production lanes.
+- Let SUN/PB decide which workers are trusted for which job classes.
+- Keep OpenAI/frontier fallback as a SUN/PB policy decision, not a node decision.

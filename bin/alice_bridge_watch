@@ -33,7 +33,11 @@ echo "[alice_bridge_watch] polling redis first, then $SUN_SOURCE every ${INTERVA
 
 while true; do
   if [[ "$REDIS_ENABLED" == "1" && -x "$AGENT_BRIDGE" ]]; then
-    if "$AGENT_BRIDGE" poll-once --role alice >> "$EVENT_LOG" 2>&1; then
+    set +e
+    "$AGENT_BRIDGE" poll-once --role alice >> "$EVENT_LOG" 2>&1
+    redis_status=$?
+    set -e
+    if [[ "$redis_status" == "0" ]]; then
       new_hash="$(hash_file "$LOCAL_FILE")"
       printf '%s' "$new_hash" > "$STATE_FILE"
       last_hash="$new_hash"
@@ -49,6 +53,10 @@ while true; do
       sleep "$INTERVAL"
       continue
     fi
+    if [[ "$redis_status" == "2" ]]; then
+      sleep "$INTERVAL"
+      continue
+    fi
   fi
 
   tmp="$LOCAL_DIR/.to-alice.tmp.$$"
@@ -61,9 +69,9 @@ while true; do
       {
         echo "---"
         date --iso-8601=seconds 2>/dev/null || date
-        echo "file to-alice changed sha=$new_hash bytes=$(wc -c < "$LOCAL_FILE")"
+        echo "to-alice changed sha=$new_hash bytes=$(wc -c < "$LOCAL_FILE")"
       } >> "$EVENT_LOG"
-      echo "[alice_bridge_watch] file to-alice changed sha=$new_hash"
+      echo "[alice_bridge_watch] to-alice changed sha=$new_hash"
       if [[ -x "$HANDLER" && -s "$LOCAL_FILE" ]]; then
         "$HANDLER" "$LOCAL_FILE" || true
       fi

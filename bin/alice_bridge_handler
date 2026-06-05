@@ -3,9 +3,68 @@ set -euo pipefail
 MESSAGE_FILE="${1:-$HOME/Desktop/alice-brain/bridge/to-alice.md}"
 BRIDGE_DIR="${ALICE_BRIDGE_DIR:-$HOME/Desktop/alice-brain/bridge}"
 LOG="$BRIDGE_DIR/alice-bridge-handler.log"
+ACTION_FILE="${ALICE_BRIDGE_ACTION_FILE:-$BRIDGE_DIR/alice-action-needed.md}"
+LATEST_FILE="${ALICE_BRIDGE_LATEST_FILE:-$BRIDGE_DIR/latest-to-alice.md}"
+AGENT_BRIDGE="${ALICE_AGENT_BRIDGE:-$HOME/Desktop/alice-brain/bin/agent_bridge}"
+SOURCE_FILE="$MESSAGE_FILE"
+
+if [[ -s "$LATEST_FILE" ]]; then
+  SOURCE_FILE="$LATEST_FILE"
+fi
+
+subject="$(sed -n 's/^Subject: //p' "$SOURCE_FILE" 2>/dev/null | tail -1 || true)"
+redis_id="$(sed -n 's/^Redis-Id: //p' "$SOURCE_FILE" 2>/dev/null | tail -1 || true)"
+priority="$(sed -n 's/^Priority: //p' "$SOURCE_FILE" 2>/dev/null | tail -1 || true)"
+is_telegram_request=0
+if grep -Eiq 'Telegram /alice|TELEGRAM OWNER REQUEST TO ALICE|source[":= ]+telegram|command[":= ]+/alice' "$SOURCE_FILE"; then
+  is_telegram_request=1
+fi
+
 {
   echo "---"
   date --iso-8601=seconds 2>/dev/null || date
   echo "new CG/SUN bridge message: $MESSAGE_FILE"
-  echo "Alice agent should inspect this file and reply by writing $BRIDGE_DIR/from-alice.md, then scp it back to SUN."
+  echo "latest source: $SOURCE_FILE"
+  echo "subject: ${subject:-unknown}"
+  echo "redis_id: ${redis_id:-unknown}"
+  echo "priority: ${priority:-normal}"
+  if [[ "$is_telegram_request" == "1" ]]; then
+    echo "telegram_alice_request: yes"
+  fi
 } >> "$LOG"
+
+if [[ "$is_telegram_request" == "1" ]]; then
+  {
+    echo "# Alice Action Needed"
+    echo
+    echo "A Telegram /alice request reached this Mac through Rotary Relay."
+    echo
+    echo "- received_at: $(date --iso-8601=seconds 2>/dev/null || date)"
+    echo "- subject: ${subject:-unknown}"
+    echo "- redis_id: ${redis_id:-unknown}"
+    echo "- priority: ${priority:-normal}"
+    echo "- source_file: $SOURCE_FILE"
+    echo
+    echo "## Safety"
+    echo
+    echo "- Inspect only unless the operator explicitly approves a write action."
+    echo "- Do not print secrets, tokens, private keys, or env contents."
+    echo "- Do not send, spend, bridge, tip, or move MAZA without explicit approval."
+    echo "- If SUN/PB changes are needed, report the smallest change back to CG."
+    echo
+    echo "## Message"
+    echo
+    sed -n '1,220p' "$SOURCE_FILE"
+  } > "$ACTION_FILE"
+
+  if [[ -x "$AGENT_BRIDGE" ]]; then
+    "$AGENT_BRIDGE" send \
+      --from alice \
+      --to cg \
+      --type ack \
+      --priority normal \
+      --subject "TASK_ACK ${subject:-Telegram /alice}" \
+      --body "Alice handler queued Telegram request locally at $ACTION_FILE. Receipt only; operator/Codex still must inspect and act safely. redis_id=${redis_id:-unknown}" \
+      --no-file-mirror >> "$LOG" 2>&1 || true
+  fi
+fi

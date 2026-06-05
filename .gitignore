@@ -1,13 +1,38 @@
 .env
 .env.*
 !.env.example
+
+# Local worker output
+log/
+logs/
+reports/
+tmp/
 *.log
 *.jsonl
-log/
-reports/
+*.manifest.json
+*.docx
+*.pdf
+*.png
+*.wav
+
+# RoRe runtime state and audit mirrors
+bridge/*.md
+!bridge/README.md
+!bridge/README.redis.md
+bridge/*.log
+bridge/*.jsonl
+bridge/.redis-*.lastid
+bridge/.from-*.sha256
+bridge/.to-*.sha256
+
+# Python/Ruby/Node local state
 __pycache__/
 *.pyc
-tmp/
-.DS_Store
-node_modules/
+.bundle/
 vendor/bundle/
+node_modules/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

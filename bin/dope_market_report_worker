@@ -11,11 +11,14 @@ import argparse
 import base64
 import csv
 import datetime as dt
+import hashlib
 import html
 import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -42,14 +45,12 @@ MAX_LOGO_BYTES = 5 * 1024 * 1024
 DEFAULT_MINIMUM_WORDS = 500
 DEFAULT_HARD_MINIMUM_WORDS = 250
 DEFAULT_MINIMUM_DOCX_BYTES = 8_000
-DEFAULT_EMBEDDER_MODEL = "qwen3-embedding:8b-q4_K_M"
+DEFAULT_EMBEDDER_MODEL = "qwen3-embedding:4b"
 DEFAULT_EMBEDDING_TOP_K = 10
 DEFAULT_EMBEDDING_CHUNK_CHARS = 1800
 DEFAULT_EMBEDDING_MAX_CHUNKS = 80
 DEFAULT_LOCAL_MODEL_CANDIDATES = [
     "qwen3:8b",
-    "qwen3:30b",
-    "llama3.2:3b",
 ]
 BRAND_RED = "D71920"
 INK = "111111"
@@ -60,6 +61,8 @@ SOFT_GRAY = "F4F4F5"
 
 def load_env_files() -> None:
     for path in [
+        Path.home() / "Desktop" / "alice-brain" / ".env",
+        Path.home() / ".config" / "alice-brain" / "node.env",
         Path.home() / ".config" / "autos" / "alice.env",
         Path.home() / "Desktop" / "PB" / ".env.alice",
     ]:
@@ -103,6 +106,11 @@ def log(event: str, **data) -> None:
     print(f"[dope_report_worker] {record['time']} {event} {printable}".rstrip(), flush=True)
 
 
+def ollama_visible_text(parsed: dict) -> str:
+    message = parsed.get("message") if isinstance(parsed.get("message"), dict) else {}
+    return str(parsed.get("response") or message.get("content") or parsed.get("thinking") or "").strip()
+
+
 def require_token() -> str:
     token = env("DOPE_REPORT_WORKER_TOKEN") or env("AUTOS_WORKER_TOKEN")
     if not token:
@@ -110,10 +118,18 @@ def require_token() -> str:
     return token
 
 
+def node_maza_address() -> str:
+    return str(env("MAZA_ADDRESS", "") or "").strip()
+
+
+def node_id(default: str = DEFAULT_WORKER_ID) -> str:
+    return str(env("ALICE_NODE_ID", env("NODE_ID", default)) or default).strip()
+
+
 class DopeClient:
     def __init__(self) -> None:
         self.base_url = (env("DOPE_REPORT_WORKER_BASE_URL") or env("DOPE_WORKER_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
-        self.worker_id = env("DOPE_REPORT_WORKER_ID", DEFAULT_WORKER_ID)
+        self.worker_id = env("DOPE_REPORT_WORKER_ID", node_id(DEFAULT_WORKER_ID))
         self.token = require_token()
 
     def request(self, method: str, path: str, body: bytes | None = None, headers: dict[str, str] | None = None, timeout: int | None = None):
@@ -123,6 +139,8 @@ class DopeClient:
             "X-Dope-Worker-Id": self.worker_id,
             "User-Agent": "alice-dope-market-report-worker/1.0",
         }
+        if node_maza_address():
+            request_headers["X-Alice-Maza-Address"] = node_maza_address()
         request_headers.update(headers or {})
         req = urllib.request.Request(url, data=body, headers=request_headers, method=method)
         request_timeout = timeout or int(env("DOPE_REPORT_HTTP_TIMEOUT", "180"))
@@ -172,6 +190,70 @@ class DopeClient:
             return body, "jpg" if ext == "jpeg" else ext, source
         return None
 
+    def fetch_report_images(self, job: dict, logo: tuple | None = None) -> tuple[list[dict], list[str]]:
+        limit = bounded_int(env("DOPE_REPORT_MAX_EMBEDDED_MEDIA_IMAGES"), 4, 0, 8)
+        if limit <= 0:
+            return [], []
+
+        errors: list[str] = []
+        images: list[dict] = []
+        seen_digests = set()
+        if logo:
+            seen_digests.add(hashlib.sha256(logo[0]).hexdigest())
+
+        for item in job.get("assets", {}).get("uploaded_media", []) or []:
+            if len(images) >= limit:
+                break
+            content_type = str(item.get("content_type") or "").split(";")[0].strip().lower()
+            if not content_type.startswith("image/"):
+                continue
+            endpoint = item.get("endpoint")
+            if not endpoint:
+                continue
+
+            code, headers, body = self.fetch_asset(endpoint)
+            label = str(item.get("filename") or item.get("id") or endpoint)
+            if code == 204 or not body:
+                errors.append(f"{label}: empty")
+                continue
+            if code not in (200, 302):
+                errors.append(f"{label}: http_{code}")
+                continue
+            if len(body) > MAX_LOGO_BYTES:
+                errors.append(f"{label}: too_large")
+                continue
+            response_type = headers.get("Content-Type", content_type).split(";")[0].strip().lower()
+            ext = image_extension(body, response_type)
+            if ext not in {"png", "jpg", "jpeg", "gif"}:
+                errors.append(f"{label}: unsupported_{response_type or content_type or 'unknown'}")
+                continue
+
+            digest = hashlib.sha256(body).hexdigest()
+            if digest in seen_digests:
+                continue
+            seen_digests.add(digest)
+            width, height = image_size(body)
+            images.append(
+                {
+                    "bytes": body,
+                    "ext": "jpg" if ext == "jpeg" else ext,
+                    "source": "uploaded_media",
+                    "filename": label,
+                    "role": item.get("role") or "supporting_media",
+                    "endpoint": endpoint,
+                    "content_type": response_type or content_type,
+                    "byte_size": len(body),
+                    "width": width,
+                    "height": height,
+                }
+            )
+
+        if images:
+            log("media_images_ready", id=job.get("id"), status=f"embedded={len(images)} skipped={len(errors)}")
+        elif errors:
+            log("media_images_skipped", id=job.get("id"), status="; ".join(errors[:4]))
+        return images, errors
+
     def fetch_asset(self, endpoint: str):
         if not endpoint:
             return 204, {}, b""
@@ -194,24 +276,23 @@ class DopeClient:
 
     def complete(self, job: dict, docx_path: Path, manifest: dict) -> dict:
         encoded = base64.b64encode(docx_path.read_bytes()).decode("ascii")
-        form = urllib.parse.urlencode(
-            {
-                "file_base64": encoded,
-                "filename": docx_path.name,
-                "content_type": DOCX_CONTENT_TYPE,
-                "manifest": json.dumps(manifest, ensure_ascii=True),
-                "worker_id": self.worker_id,
-                "provider": manifest.get("provider", "template"),
-                "model": manifest.get("model", "none"),
-                "summary": manifest.get("summary", ""),
-            }
-        ).encode("utf-8")
+        payload = {
+            "file_base64": encoded,
+            "filename": docx_path.name,
+            "content_type": DOCX_CONTENT_TYPE,
+            "manifest": manifest,
+            "worker_id": self.worker_id,
+            "maza_address": manifest.get("maza_address") or node_maza_address(),
+            "provider": manifest.get("provider", "template"),
+            "model": manifest.get("model", "none"),
+            "summary": manifest.get("summary", ""),
+        }
         endpoint = job.get("output", {}).get("complete_endpoint") or f"/dope_worker/reports/{job['id']}/complete"
         code, _headers, body = self.request(
             "POST",
             endpoint,
-            body=form,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            body=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
             timeout=int(env("DOPE_REPORT_COMPLETE_TIMEOUT", "900")),
         )
         if code != 200:
@@ -340,8 +421,133 @@ def logo_missing_reason(job: dict, logo: tuple | None) -> str:
     return "no logo_url, logo_endpoint, or uploaded image media was provided"
 
 
+def embedded_media_observations(images: list[dict], vision_notes: list[dict] | None = None) -> list[dict]:
+    notes_by_filename = {}
+    ocr_by_filename = {}
+    for item in (vision_notes or []):
+        filename = str(item.get("filename") or "")
+        if not filename:
+            continue
+        if item.get("kind") == "ocr":
+            ocr_by_filename[filename] = item.get("summary")
+        else:
+            notes_by_filename[filename] = item.get("summary")
+    observations = []
+    for index, image in enumerate(images, 1):
+        filename = str(image.get("filename") or f"image_{index}")
+        observations.append(
+            {
+                "index": index,
+                "filename": filename,
+                "role": image.get("role"),
+                "content_type": image.get("content_type"),
+                "dimensions": f"{image.get('width')}x{image.get('height')}",
+                "byte_size": image.get("byte_size"),
+                "endpoint": image.get("endpoint"),
+                "vision_summary": notes_by_filename.get(filename),
+                "ocr_text": ocr_by_filename.get(filename),
+            }
+        )
+    return observations
+
+
+def vision_scan_images(job: dict, images: list[dict]) -> list[dict]:
+    if not images or not report_preflight_scan_enabled(job):
+        return []
+    model = report_preflight_vision_model(job)
+    if not model:
+        log("vision_scan_skipped", id=job.get("id"), status="DOPE_REPORT_VISION_MODEL not set")
+        return []
+
+    base_url = str(env("OLLAMA_URL", "http://127.0.0.1:11434") or "http://127.0.0.1:11434").rstrip("/")
+    results = []
+    for image in images[: bounded_int(env("DOPE_REPORT_VISION_IMAGE_LIMIT"), 3, 1, 6)]:
+        prompt = (
+            "Describe this uploaded client image for a marketing report in 2 short practical bullets. "
+            "Focus on visible brand, product/service clues, quality, colors, and how it could support a postcard or proposal. "
+            "Do not invent facts you cannot see."
+        )
+        body = {
+            "model": model,
+            "prompt": prompt,
+            "images": [base64.b64encode(image["bytes"]).decode("ascii")],
+            "stream": False,
+            "options": {
+                "temperature": 0.2,
+                "num_predict": 180,
+            },
+        }
+        req = urllib.request.Request(
+            f"{base_url}/api/generate",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "alice-dope-market-report-worker/vision"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=int(env("DOPE_REPORT_VISION_TIMEOUT", "120"))) as response:
+                parsed = json.loads(response.read().decode("utf-8"))
+            summary = ollama_visible_text(parsed)
+            if summary:
+                results.append({"kind": "vision", "filename": image.get("filename"), "model": parsed.get("model") or model, "summary": summary[:900]})
+        except Exception as error:
+            log("vision_scan_error", id=job.get("id"), model=model, status=f"{image.get('filename')}: {type(error).__name__}: {str(error)[:120]}")
+            continue
+    if results:
+        log("vision_scan_ready", id=job.get("id"), model=model, status=f"images={len(results)}")
+    return results
+
+
+def ocr_scan_images(job: dict, images: list[dict]) -> list[dict]:
+    if not images or not report_preflight_scan_enabled(job):
+        return []
+    model = report_preflight_ocr_model(job)
+    if not model:
+        return []
+
+    base_url = str(env("OLLAMA_URL", "http://127.0.0.1:11434") or "http://127.0.0.1:11434").rstrip("/")
+    results = []
+    for image in images[: bounded_int(env("DOPE_REPORT_OCR_IMAGE_LIMIT"), 3, 1, 6)]:
+        prompt = (
+            "Extract visible text from this uploaded client image for a marketing proposal. "
+            "Return concise OCR notes only. If there is no readable text, say no readable text. "
+            "Do not infer business facts that are not visible."
+        )
+        body = {
+            "model": model,
+            "prompt": prompt,
+            "images": [base64.b64encode(image["bytes"]).decode("ascii")],
+            "stream": False,
+            "options": {
+                "temperature": 0.1,
+                "num_predict": 220,
+            },
+        }
+        req = urllib.request.Request(
+            f"{base_url}/api/generate",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "alice-dope-market-report-worker/ocr"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=int(env("DOPE_REPORT_OCR_TIMEOUT", "180"))) as response:
+                parsed = json.loads(response.read().decode("utf-8"))
+            summary = ollama_visible_text(parsed)
+            if summary:
+                results.append({"kind": "ocr", "filename": image.get("filename"), "model": parsed.get("model") or model, "summary": summary[:1200]})
+        except Exception as error:
+            log("ocr_scan_error", id=job.get("id"), model=model, status=f"{image.get('filename')}: {type(error).__name__}: {str(error)[:120]}")
+            continue
+    if results:
+        log("ocr_scan_ready", id=job.get("id"), model=model, status=f"images={len(results)}")
+    return results
+
+
 def safe_text(value) -> str:
     return html.escape(str(value or "").strip(), quote=False)
+
+
+def safe_attr(value) -> str:
+    return html.escape(str(value or "").strip(), quote=True)
 
 
 def compact(value, default="Not provided") -> str:
@@ -430,6 +636,46 @@ def extract_sections(text: str) -> list[str]:
         seen.add(key)
         unique.append(section)
     return unique
+
+
+def clean_title_line(line: str) -> str:
+    cleaned = str(line or "").strip()
+    cleaned = re.sub(r"^#{1,6}\s*", "", cleaned)
+    cleaned = re.sub(r"</?[^>]+>", "", cleaned)
+    cleaned = cleaned.strip("*_`# \t")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def report_display_title(job: dict, document_text: str, sections: list[str], fallback: str) -> str:
+    skip_patterns = [
+        r"^dope marketing$",
+        r"^client strategy proposal$",
+        r"^prepared for\b",
+        r"^industry\b",
+        r"^service area\b",
+        r"^report date\b",
+        r"^prepared by\b",
+        r"^created using\b",
+        r"^executive summary$",
+        r"^header / cover$",
+    ]
+    for line in str(document_text or "").splitlines()[:30]:
+        title = clean_title_line(line)
+        if not title:
+            continue
+        if any(re.search(pattern, title, flags=re.I) for pattern in skip_patterns):
+            continue
+        if re.search(r"\b(market strategy|seasonality report|client proposal|marketing proposal|strategy proposal)\b", title, flags=re.I):
+            return title[:140]
+
+    company_name = compact(job.get("company", {}).get("name") or job.get("deal", {}).get("company_name"), "")
+    deal_name = compact(job.get("deal", {}).get("name"), "")
+    display_name = company_name or deal_name or fallback
+    display_name = re.sub(r"^New Signup\s*-\s*", "", display_name, flags=re.I).strip() or fallback
+    if display_name:
+        return f"Market Strategy & Seasonality Report: {display_name}"[:140]
+    return (sections[0] if sections else fallback)[:140]
 
 
 def normalize_section_text(value: str) -> str:
@@ -831,6 +1077,74 @@ def ensure_embedding_context(job: dict) -> tuple[str, dict]:
     return context, meta
 
 
+def ensure_repair_embedding_context(job: dict, retry_note: str | None = None) -> tuple[str, dict]:
+    previous_draft = str(job.get("_alice_previous_draft") or "").strip()
+    quality_errors = [str(item) for item in (job.get("_alice_quality_errors") or []) if str(item).strip()]
+    note = str(retry_note or "").strip()
+    if not previous_draft and not quality_errors and not note:
+        return "", {}
+
+    runtime = embedding_runtime(job)
+    base_chunks = source_context_chunks(job, runtime["chunk_chars"])[: runtime["max_chunks"]]
+    repair_chunks = [
+        {"label": "Failed draft copy", "text": previous_draft[:6000]},
+        {"label": "Validation errors", "text": "\n".join([note, *quality_errors]).strip()},
+    ]
+    chunks = [chunk for chunk in repair_chunks + base_chunks if str(chunk.get("text") or "").strip()]
+    contract = job.get("report_contract", {}) or {}
+    query = "\n".join(
+        item
+        for item in [
+            "Repair this DOPE market report using the source facts and validation errors.",
+            note,
+            "\n".join(quality_errors),
+            "Required sections: " + ", ".join(str(section) for section in contract.get("required_sections", []) or []),
+            previous_draft[:2000],
+        ]
+        if str(item or "").strip()
+    )
+
+    selected_model = runtime["model"]
+    fallback_used = None
+    error_messages = []
+    ranked_chunks: list[dict] = []
+    for candidate in [runtime["model"], runtime["fallback_model"]]:
+        if not candidate:
+            continue
+        if ranked_chunks:
+            break
+        try:
+            ranked_chunks = rank_source_chunks(candidate, query, chunks, runtime["top_k"])
+            selected_model = candidate
+            if candidate != runtime["model"]:
+                fallback_used = candidate
+        except Exception as error:
+            error_messages.append(f"{candidate}: {type(error).__name__}: {str(error)[:180]}")
+            log("repair_embedding_candidate_failed", id=job.get("id"), provider="ollama/local", model=candidate, status=str(error)[:160])
+
+    if not ranked_chunks:
+        ranked_chunks = lexical_rank_source_chunks(query, chunks, runtime["top_k"])
+        fallback_used = "lexical"
+
+    meta = {
+        "embedding_provider": "ollama/local",
+        "embedder_model": selected_model,
+        "embedding_chunks_count": len(chunks),
+        "embedding_top_k": min(runtime["top_k"], len(ranked_chunks)),
+        "embedder_model_fallback": fallback_used,
+        "embedding_errors": error_messages,
+    }
+    context = format_retrieval_context(ranked_chunks, meta)
+    log(
+        "repair_embedding_context_ready",
+        id=job.get("id"),
+        provider="ollama/local",
+        model=selected_model,
+        status=f"chunks={len(chunks)} top_k={meta['embedding_top_k']} fallback={fallback_used or 'none'}",
+    )
+    return context, meta
+
+
 def openai_model_candidates() -> list[str]:
     candidates = [
         env("DOPE_REPORT_OPENAI_MODEL"),
@@ -871,18 +1185,48 @@ def strategy_proposal_style_summary() -> str | None:
     return text[:12_000] if text else None
 
 
+def report_timing_context(job: dict) -> dict:
+    sun_timing = (job.get("timing_context") or job.get("report_contract", {}).get("timing_context") or {}) if isinstance(job, dict) else {}
+    now = dt.datetime.now(dt.timezone.utc).astimezone()
+    current_date = now.date()
+    configured_lead = env("DOPE_REPORT_PRODUCTION_LEAD_DAYS") or sun_timing.get("minimum_production_lead_days") or "14"
+    lead_days = bounded_int(configured_lead, 14, 1, 90)
+    earliest_date = current_date + dt.timedelta(days=lead_days)
+    authoritative_date = str(sun_timing.get("current_date") or current_date.isoformat())
+    authoritative_earliest = str(sun_timing.get("earliest_production_ready_date") or earliest_date.isoformat())
+
+    return {
+        "generated_at_local": now.isoformat(timespec="seconds"),
+        "current_date_local": current_date.isoformat(),
+        "current_time_zone_local": now.tzname(),
+        "authoritative_current_date": authoritative_date,
+        "minimum_production_lead_days": lead_days,
+        "earliest_production_ready_date": authoritative_earliest,
+        "source": "SUN timing_context preferred; Alice local clock included as fallback",
+        "timing_rule": f"Build all campaign timing from authoritative_current_date and allow at least {lead_days} calendar days for design, proofing, print setup, production, and mail/drop preparation.",
+        "recommendation_rule": "Do not recommend an immediate launch/mail/drop date earlier than earliest_production_ready_date. If the seasonal window is too close, recommend the next practical window.",
+        "sun_payload_timing_context": sun_timing,
+    }
+
+
 def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
     contract = job.get("report_contract", {}) or {}
     primary_prompt = job.get("generation_prompt") or contract.get("llm_prompt") or contract.get("requested_output")
     uploaded_media = job.get("assets", {}).get("uploaded_media", []) or []
     retrieval_context, embedding_meta = ensure_embedding_context(job)
+    repair_context, repair_embedding_meta = ensure_repair_embedding_context(job, retry_note) if retry_note else ("", {})
     prompt_package = {
         "primary_generation_prompt": primary_prompt,
         "retry_note": retry_note,
         "reference_style_summary": strategy_proposal_style_summary(),
         "local_retrieval_context": retrieval_context,
+        "repair_retrieval_context": repair_context,
         "embedding_runtime": job.get("embedding_runtime", {}) or {},
         "embedding_summary": embedding_meta,
+        "repair_embedding_summary": repair_embedding_meta,
+        "timing_context": report_timing_context(job),
+        "previous_draft_for_repair": job.get("_alice_previous_draft") if retry_note else None,
+        "quality_errors_to_fix": job.get("_alice_quality_errors") if retry_note else None,
         "report_contract": contract,
         "required_sections": contract.get("required_sections", []),
         "writing_rules": contract.get("writing_rules", []),
@@ -912,6 +1256,7 @@ def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
             }
             for item in uploaded_media
         ],
+        "embedded_media_observations": job.get("_alice_media_observations", []),
         "quality_gate": {
             "target_words": minimum_words(job),
             "hard_minimum_words": hard_minimum_words(job),
@@ -930,6 +1275,71 @@ def report_runtime(job: dict) -> dict:
     contract_runtime = job.get("report_contract", {}).get("runtime_rules", {}) or {}
     job_runtime = job.get("ai_runtime", {}) or {}
     return {**contract_runtime, **job_runtime}
+
+
+def runtime_or_metadata_value(job: dict, *keys: str):
+    runtime = report_runtime(job)
+    metadata = job.get("metadata", {}) or {}
+    for key in keys:
+        if key in runtime and runtime.get(key) not in (None, ""):
+            return runtime.get(key)
+        if key in metadata and metadata.get(key) not in (None, ""):
+            return metadata.get(key)
+    return None
+
+
+def report_preflight_scan_enabled(job: dict) -> bool:
+    value = runtime_or_metadata_value(job, "preflight_visual_scan_enabled", "report_preflight_scan_enabled")
+    if value is not None:
+        return truthy(value)
+    return truthy(env("DOPE_REPORT_PREFLIGHT_SCAN_ENABLED", env("DOPE_REPORT_VISION_ENABLED", "0")))
+
+
+def report_preflight_vision_model(job: dict) -> str:
+    return str(
+        runtime_or_metadata_value(job, "preflight_vision_model", "report_preflight_vision_model")
+        or env("DOPE_REPORT_VISION_MODEL")
+        or "qwen3-vl:8b"
+    ).strip()
+
+
+def report_preflight_ocr_model(job: dict) -> str:
+    return str(
+        runtime_or_metadata_value(job, "preflight_ocr_model", "report_preflight_ocr_model")
+        or env("DOPE_REPORT_OCR_MODEL")
+        or "glm-ocr:bf16"
+    ).strip()
+
+
+def report_post_review_enabled(job: dict) -> bool:
+    value = runtime_or_metadata_value(job, "post_generation_review_enabled", "report_post_review_enabled")
+    if value is not None:
+        return truthy(value)
+    return truthy(env("DOPE_REPORT_POST_REVIEW_ENABLED", "0"))
+
+
+def report_post_review_model(job: dict, fallback_model: str) -> str:
+    return str(
+        runtime_or_metadata_value(job, "post_generation_review_model", "report_post_review_model")
+        or env("DOPE_REPORT_POST_REVIEW_MODEL")
+        or fallback_model
+    ).strip()
+
+
+def report_page_visual_qa_enabled(job: dict) -> bool:
+    value = runtime_or_metadata_value(job, "page_visual_qa_enabled", "report_page_visual_qa_enabled")
+    if value is not None:
+        return truthy(value)
+    return truthy(env("DOPE_REPORT_PAGE_VISUAL_QA_ENABLED", "0"))
+
+
+def report_page_visual_qa_model(job: dict) -> str:
+    return str(
+        runtime_or_metadata_value(job, "page_visual_qa_model", "report_page_visual_qa_model")
+        or env("DOPE_REPORT_PAGE_VISUAL_QA_MODEL")
+        or report_preflight_vision_model(job)
+        or "qwen3-vl:8b"
+    ).strip()
 
 
 def local_report_required(job: dict) -> bool:
@@ -1037,7 +1447,7 @@ def local_fallback_models_enabled(job: dict) -> bool:
     runtime = report_runtime(job)
     if truthy(runtime.get("disable_local_model_fallbacks")):
         return False
-    return truthy(env("DOPE_REPORT_LOCAL_FALLBACKS_ENABLED", "1"))
+    return truthy(runtime.get("allow_local_model_fallbacks")) or truthy(env("DOPE_REPORT_LOCAL_FALLBACKS_ENABLED", "0"))
 
 
 def local_runtime_provider(model: str) -> str:
@@ -1060,6 +1470,8 @@ Use payload["generation_prompt"] or payload["report_contract"]["llm_prompt"] as 
 SUN's report contract controls the visible section order, required tables, length, and wording. Do not append legacy sections.
 {outline}
 Use HubSpot labeled properties, raw properties, missing core fields, deal/company/commerce data, and uploaded media filenames/endpoints as private source context only.
+When embedded_media_observations are present, use them to shape visual direction, proof points, brand handling, and Canva/print recommendations. Use ocr_text only as visible image text. Do not invent image details beyond filename, dimensions, role, vision_summary, or ocr_text.
+Use payload["timing_context"] for all timeline recommendations. Do not recommend a launch, mail, print, or drop date before timing_context.earliest_production_ready_date. Always allow the configured production lead time before first execution.
 Analyze the full account graph when present: associated companies, contacts, prior or related deals, statuses, stages, domains, amounts, and useful HubSpot properties. Use that data to sharpen audience, timing, offer, CRM follow-up, and sales-readiness recommendations.
 If associated data exists, synthesize it into practical recommendations; if it is missing, say only the customer-facing setup item when appropriate.
 Do not invent private facts. If a field is missing, call out only the customer-facing setup item when the contract asks for it.
@@ -1108,7 +1520,7 @@ def local_retry_note(job: dict, report_text: str, quality_errors: list[str], min
         table_rule = "Include the required campaign and investment Markdown tables. "
     return (
         f"The previous draft failed preflight: words={words}, minimum={minimum}, errors={errors}. "
-        f"Rewrite from scratch with {target}-{target + 250} words while staying concise and {visible_label}. "
+        f"Revise the previous draft with {target}-{target + 250} words while staying concise and {visible_label}. "
         f"Start exactly with DOPE MARKETING. Return only {visible_label}. "
         f"{section_rule}{table_rule}Do not include planning notes, "
         "payload summaries, missing-input labels, hidden thinking, or explanation of the task. "
@@ -1143,6 +1555,95 @@ def ollama_report_response(model: str, prompt: str) -> dict:
     timeout = int(env("DOPE_REPORT_LOCAL_TIMEOUT", "900"))
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def post_generation_review_prompt(job: dict, report_text: str) -> str:
+    previous_draft = job.get("_alice_previous_draft")
+    previous_errors = job.get("_alice_quality_errors")
+    job["_alice_previous_draft"] = report_text
+    job["_alice_quality_errors"] = [
+        "post-review requested: tighten copy, improve specificity, preserve headings and tables, and remove generic filler"
+    ]
+    try:
+        package = report_prompt_input(
+            job,
+            retry_note=(
+                "POST REVIEW PASS. Lightly revise the current draft into stronger client-ready copy. "
+                "Preserve the exact required section order and Markdown tables. Do not add unsupported percentages, "
+                "internal notes, AI/model names, filenames, endpoints, or planning commentary."
+            ),
+        )
+    finally:
+        if previous_draft is None:
+            job.pop("_alice_previous_draft", None)
+        else:
+            job["_alice_previous_draft"] = previous_draft
+        if previous_errors is None:
+            job.pop("_alice_quality_errors", None)
+        else:
+            job["_alice_quality_errors"] = previous_errors
+
+    return (
+        f"{report_generation_instructions(job)}\n\n"
+        "POST REVIEW CONTRACT:\n"
+        "- Return only the revised visible Markdown report.\n"
+        "- Start exactly with DOPE MARKETING.\n"
+        "- Preserve all required section headings and required Markdown tables.\n"
+        "- Improve clarity, rhythm, specificity, and sales-readiness without making the report longer than needed.\n"
+        "- Do not add unsupported exact percentages or statistics.\n"
+        "- Do not include filenames, endpoints, model names, worker names, prompt notes, or explanation of the task.\n\n"
+        f"PAYLOAD:\n{package}\n\nReturn the revised visible report copy now."
+    )
+
+
+def run_post_generation_review(job: dict, report_text: str, model: str) -> tuple[str, dict]:
+    if not report_post_review_enabled(job):
+        return report_text, {"enabled": False}
+    review_model = report_post_review_model(job, model)
+    if not review_model:
+        return report_text, {"enabled": False, "rejected_reason": "no post-review model configured"}
+
+    job_id = job.get("id")
+    provider = local_runtime_provider(review_model)
+    log("post_review_start", id=job_id, provider=provider, model=review_model, status=f"words={word_count(report_text)}")
+    try:
+        parsed = ollama_report_response(review_model, post_generation_review_prompt(job, report_text))
+        reviewed = sanitize_visible_report_text(str(parsed.get("response") or ""))
+        reviewed = sanitize_unsupported_exact_stats(reviewed, job)
+        document_preview = full_document_text(job, reviewed)
+        quality_errors = visible_text_quality_errors(document_preview, job)
+        words = word_count(reviewed)
+        if words < hard_minimum_words(job):
+            quality_errors.append(f"post-review copy too short: {words} words")
+        if quality_errors:
+            log("post_review_rejected", id=job_id, provider=provider, model=parsed.get("model") or review_model, status="; ".join(quality_errors)[:160])
+            return report_text, {
+                "enabled": True,
+                "accepted": False,
+                "model": parsed.get("model") or review_model,
+                "errors": quality_errors,
+            }
+        log("post_review_accepted", id=job_id, provider=provider, model=parsed.get("model") or review_model, status=f"words={words}")
+        return reviewed, {
+            "enabled": True,
+            "accepted": True,
+            "provider": provider,
+            "model": parsed.get("model") or review_model,
+            "usage": {
+                "prompt_eval_count": parsed.get("prompt_eval_count"),
+                "eval_count": parsed.get("eval_count"),
+                "total_duration": parsed.get("total_duration"),
+            },
+            "word_count": words,
+        }
+    except Exception as error:
+        log("post_review_error", id=job_id, provider=provider, model=review_model, status=f"{type(error).__name__}: {str(error)[:160]}")
+        return report_text, {
+            "enabled": True,
+            "accepted": False,
+            "model": review_model,
+            "errors": [f"{type(error).__name__}: {str(error)[:180]}"],
+        }
 
 
 def strip_model_thinking(text: str) -> str:
@@ -1208,7 +1709,8 @@ def markdown_table_count(text: str) -> int:
 
 
 def normalized_heading_title(line: str) -> str | None:
-    cleaned = re.sub(r"^\s*#{1,6}\s*", "", line or "")
+    raw = line or ""
+    cleaned = re.sub(r"^\s*#{1,6}\s*", "", raw)
     cleaned = re.sub(r"^\s*[-*_]{3,}\s*$", "", cleaned).strip()
     cleaned = re.sub(r"[:\s]+$", "", cleaned).strip()
     if not cleaned or len(cleaned) > 90:
@@ -1216,8 +1718,6 @@ def normalized_heading_title(line: str) -> str | None:
     if re.search(r"[.!?]\s+", cleaned):
         return None
     if re.match(r"^(DOPE MARKETING|Header / Cover|Executive Summary|Market Snapshot|Seasonality Timeline|Recommended Campaign|Campaign Recommendation|Channel Strategy|Neighborhood Targeting|Offer Strategy|Timeline / Launch Plan|Final Recommendation|Best Opportunity Callout|Big Stat Cards|Customer Mindset|Buying Triggers|Why Print/Direct Mail Fits|Offer Card \d+)$", cleaned, flags=re.I):
-        return cleaned.lower()
-    if re.match(r"^[A-Z][A-Za-z0-9 /&+-]{2,80}$", cleaned) and len(cleaned.split()) <= 7:
         return cleaned.lower()
     return None
 
@@ -1276,6 +1776,17 @@ def unsupported_exact_stats(text: str, job: dict) -> list[str]:
     return sorted(set(found))
 
 
+def sanitize_unsupported_exact_stats(text: str, job: dict) -> str:
+    cleaned = str(text or "")
+    for stat in unsupported_exact_stats(cleaned, job):
+        cleaned = re.sub(rf"(?<![\w.]){re.escape(stat)}(?![\w.])", "measurable", cleaned)
+        spaced = re.sub(r"(?<=\d)(?=%)", r"\\s*", re.escape(stat))
+        cleaned = re.sub(rf"(?<![\w.]){spaced}(?![\w.])", "measurable", cleaned)
+    cleaned = re.sub(r"\bmeasurable\s+(?:increase|lift|response|conversion|growth|improvement)\b", "measurable lift", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bmeasurable\s*-\s*measurable\b", "measurable", cleaned, flags=re.I)
+    return cleaned
+
+
 def visible_client_forbidden_terms(text: str) -> list[str]:
     terms = []
     patterns = {
@@ -1296,7 +1807,11 @@ def generic_report_markers(text: str, job: dict) -> list[str]:
     company_name = str((job.get("company") or {}).get("name") or (job.get("deal") or {}).get("company_name") or "").strip()
     business_name = str((job.get("report_contract") or {}).get("client", {}).get("business_name") or company_name).strip()
     visible_name = business_name or company_name
-    if visible_name and visible_name.lower() not in (text or "").lower():
+    visible_variants = [
+        visible_name,
+        re.sub(r"^\s*New Signup\s*-\s*", "", visible_name, flags=re.I),
+    ]
+    if visible_name and not any(variant and variant.lower() in (text or "").lower() for variant in visible_variants):
         markers.append("client name missing")
     industry = str((job.get("report_contract") or {}).get("client", {}).get("industry") or (job.get("company") or {}).get("industry") or "").strip()
     if industry and industry.lower() != "local service business" and industry.lower() not in (text or "").lower():
@@ -1315,7 +1830,7 @@ def visible_text_quality_errors(text: str, job: dict) -> list[str]:
     if not re.match(r"^\s*(#\s*)?(\*\*)?DOPE MARKETING\b", cleaned, flags=re.I):
         errors.append("visible copy does not start with DOPE MARKETING")
     required_tables = job.get("report_contract", {}).get("required_tables", []) or []
-    expected_table_count = min(len(required_tables), 4)
+    expected_table_count = min(len(required_tables), bounded_int(env("DOPE_REPORT_MAX_REQUIRED_TABLES"), 2, 1, 4))
     if audience != "am" and expected_table_count >= 2 and markdown_table_count(cleaned) < expected_table_count:
         errors.append(f"visible client report is missing required Markdown tables: expected at least {expected_table_count} table(s)")
     missing_sections = missing_required_section_titles(job, cleaned)
@@ -1363,7 +1878,7 @@ def structural_quality_errors(errors: list[str]) -> bool:
 def local_model_attempt_limit(job: dict, errors: list[str], default_attempts: int) -> int:
     if not errors or not structural_quality_errors(errors):
         return default_attempts
-    return bounded_int(env("DOPE_REPORT_STRUCTURAL_ATTEMPTS_PER_MODEL"), 2, 1, default_attempts)
+    return bounded_int(env("DOPE_REPORT_STRUCTURAL_ATTEMPTS_PER_MODEL"), 3, 1, default_attempts)
 
 
 def call_local_ollama(job: dict) -> tuple[str, dict]:
@@ -1396,6 +1911,7 @@ def call_local_ollama(job: dict) -> tuple[str, dict]:
                     local_report_prompt(job, retry_note=retry_note),
                 )
                 report_text = sanitize_visible_report_text(str(parsed.get("response") or ""))
+                report_text = sanitize_unsupported_exact_stats(report_text, job)
                 document_preview = full_document_text(job, report_text)
                 quality_errors = visible_text_quality_errors(document_preview, job)
                 words = word_count(report_text)
@@ -1421,6 +1937,8 @@ def call_local_ollama(job: dict) -> tuple[str, dict]:
                     )
                     break
 
+                job["_alice_previous_draft"] = report_text
+                job["_alice_quality_errors"] = quality_errors
                 retry_note = local_retry_note(job, report_text, quality_errors, target_minimum)
                 model_attempt_limit = local_model_attempt_limit(job, quality_errors, attempts)
                 abandon_model = quality_errors and attempt >= model_attempt_limit
@@ -1464,24 +1982,28 @@ def call_local_ollama(job: dict) -> tuple[str, dict]:
             if not report_text:
                 raise RuntimeError("local Ollama returned empty report text")
 
+            final_model = parsed.get("model") or model
+            report_text, post_review_meta = run_post_generation_review(job, report_text, final_model)
+
             log(
                 "local_response",
                 id=job_id,
                 provider=provider,
-                model=parsed.get("model") or model,
+                model=final_model,
                 status=f"words={word_count(report_text)}",
             )
             return report_text, {
                 "provider": provider,
-                "model": parsed.get("model") or model,
+                "model": final_model,
                 "local_runtime_provider": "ollama/local",
-                "local_model_family": local_model_family(parsed.get("model") or model),
+                "local_model_family": local_model_family(final_model),
                 "usage": {
                     "prompt_eval_count": parsed.get("prompt_eval_count"),
                     "eval_count": parsed.get("eval_count"),
                     "total_duration": parsed.get("total_duration"),
                     "load_duration": parsed.get("load_duration"),
                 },
+                "post_review": post_review_meta,
                 "reasoning_effort": "local",
             }
         except Exception as error:
@@ -1890,22 +2412,23 @@ def table(rows: list[list[str]]) -> str:
     )
 
 
-def image_run(width_px: int, height_px: int) -> str:
-    max_width = 3_900_000
+def image_run(width_px: int, height_px: int, rel_id: str = "rIdLogo", name: str = "Company logo", max_width: int = 3_900_000) -> str:
     emu_per_px = 9525
     cx = min(width_px * emu_per_px, max_width)
     ratio = height_px / max(width_px, 1)
     cy = int(cx * ratio)
+    rel = safe_attr(rel_id)
+    image_name = safe_attr(name or "Report image")
     return f"""
 <w:p><w:r><w:drawing>
 <wp:inline distT="0" distB="0" distL="0" distR="0">
 <wp:extent cx="{cx}" cy="{cy}"/>
-<wp:docPr id="1" name="Company logo"/>
+<wp:docPr id="1" name="{image_name}"/>
 <a:graphic>
 <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
 <pic:pic>
-<pic:nvPicPr><pic:cNvPr id="0" name="Company logo"/><pic:cNvPicPr/></pic:nvPicPr>
-<pic:blipFill><a:blip r:embed="rIdLogo"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
+<pic:nvPicPr><pic:cNvPr id="0" name="{image_name}"/><pic:cNvPicPr/></pic:nvPicPr>
+<pic:blipFill><a:blip r:embed="{rel}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
 <pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
 </pic:pic>
 </a:graphicData>
@@ -2289,6 +2812,7 @@ def canva_csv_text(rows: list[dict]) -> str:
 
 def canva_design_handoff_text(job: dict, report_text: str) -> str:
     media = job.get("assets", {}).get("uploaded_media", []) or []
+    embedded_media = job.get("_alice_media_observations", []) or []
     app_path = canva_app_path()
     rows = canva_rows(job, report_text)
     lines = [
@@ -2328,6 +2852,11 @@ def canva_design_handoff_text(job: dict, report_text: str) -> str:
             lines.append(f"- {item.get('filename')} ({item.get('content_type')}, role={item.get('role')}) endpoint: {item.get('endpoint')}")
     else:
         lines.append("- No uploaded media was included in the worker package.")
+    if embedded_media:
+        lines.extend(["", "### Embedded Images"])
+        for item in embedded_media:
+            summary = f" // vision: {item.get('vision_summary')}" if item.get("vision_summary") else ""
+            lines.append(f"- {item.get('filename')} ({item.get('role')}, {item.get('dimensions')}){summary}")
     return "\n".join(lines).strip()
 
 
@@ -2368,14 +2897,48 @@ def markdown_table(lines: list[str]) -> list[list[str]]:
     return rows
 
 
-def markdown_to_word_body(text: str, logo: tuple[bytes, str] | None) -> str:
+REPORT_IMAGE_SECTION_ANCHORS = [
+    "market snapshot",
+    "recommended campaign",
+    "channel strategy",
+    "neighborhood targeting",
+    "offer strategy",
+    "timeline / launch plan",
+    "final recommendation",
+]
+
+
+def normalized_section_anchor(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().rstrip(":").lower())
+
+
+def report_image_block(image: dict, index: int) -> str:
+    return image_run(
+        image["width"],
+        image["height"],
+        rel_id=f"rIdImage{index}",
+        name=f"Report visual {index}",
+        max_width=2_800_000,
+    )
+
+
+def markdown_to_word_body(text: str, logo: tuple[bytes, str] | None, report_images: list[dict] | None = None) -> str:
     body = [
         paragraph("DOPE MARKETING", style="Kicker", keep_next=True),
         paragraph("Client Strategy Proposal", style="Subtitle", keep_next=True),
     ]
     if logo:
         width, height = image_size(logo[0])
-        body.append(image_run(width, height))
+        body.append(image_run(width, height, rel_id="rIdLogo", name="Company logo"))
+
+    gallery = report_images or []
+    image_queue = list(enumerate(gallery, 1))
+
+    def append_section_image(heading: str) -> None:
+        anchor = normalized_section_anchor(heading)
+        if image_queue and any(anchor == target or anchor.startswith(f"{target} ") for target in REPORT_IMAGE_SECTION_ANCHORS):
+            index, image = image_queue.pop(0)
+            body.append(report_image_block(image, index))
 
     lines = text.splitlines()
     table_lines = []
@@ -2394,11 +2957,17 @@ def markdown_to_word_body(text: str, logo: tuple[bytes, str] | None) -> str:
         if not stripped:
             continue
         if stripped.startswith("### "):
-            body.append(paragraph(stripped[4:].strip(), style="Heading2", keep_next=True))
+            heading = stripped[4:].strip()
+            body.append(paragraph(heading, style="Heading2", keep_next=True))
+            append_section_image(heading)
         elif stripped.startswith("## "):
-            body.append(paragraph(stripped[3:].strip(), style="Heading1", keep_next=True))
+            heading = stripped[3:].strip()
+            body.append(paragraph(heading, style="Heading1", keep_next=True))
+            append_section_image(heading)
         elif stripped.startswith("# "):
-            body.append(paragraph(stripped[2:].strip(), style="Title", keep_next=True))
+            heading = stripped[2:].strip()
+            body.append(paragraph(heading, style="Title", keep_next=True))
+            append_section_image(heading)
         elif re.match(r"^(prepared for|prepared by|date|investment|total|timeline)\s*:", stripped, re.I):
             body.append(paragraph(stripped, style="Subtitle"))
         elif stripped.startswith(">"):
@@ -2408,7 +2977,9 @@ def markdown_to_word_body(text: str, logo: tuple[bytes, str] | None) -> str:
         elif re.match(r"^\d+\.\s+", stripped):
             body.append(bullet(re.sub(r"^\d+\.\s+", "", stripped).strip()))
         elif re.match(r"^[A-Z][A-Za-z0-9 &/().,'-]{8,80}:$", stripped):
-            body.append(paragraph(stripped.rstrip(":"), style="Heading2", keep_next=True))
+            heading = stripped.rstrip(":")
+            body.append(paragraph(heading, style="Heading2", keep_next=True))
+            append_section_image(heading)
         else:
             body.append(paragraph(stripped))
 
@@ -2416,6 +2987,10 @@ def markdown_to_word_body(text: str, logo: tuple[bytes, str] | None) -> str:
         rows = markdown_table(table_lines)
         if rows:
             body.append(table(rows))
+
+    while image_queue:
+        index, image = image_queue.pop(0)
+        body.append(report_image_block(image, index))
 
     section = """
 <w:sectPr>
@@ -2428,7 +3003,25 @@ def markdown_to_word_body(text: str, logo: tuple[bytes, str] | None) -> str:
     return "".join(part for part in body if part) + section
 
 
-def create_report_docx(job: dict, document_text: str, logo: tuple[bytes, str] | None, path: Path) -> None:
+def document_image_relationships(logo: tuple | None, report_images: list[dict] | None = None) -> str:
+    rels = []
+    if logo:
+        rels.append(
+            '<Relationship Id="rIdLogo" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/logo.{ext}"/>'.format(
+                ext=logo[1]
+            )
+        )
+    for index, image in enumerate(report_images or [], 1):
+        rels.append(
+            '<Relationship Id="rIdImage{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/report_image_{index}.{ext}"/>'.format(
+                index=index,
+                ext=image["ext"],
+            )
+        )
+    return "\n".join(rels)
+
+
+def create_report_docx(job: dict, document_text: str, logo: tuple[bytes, str] | None, path: Path, report_images: list[dict] | None = None) -> None:
     rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
@@ -2440,7 +3033,7 @@ def create_report_docx(job: dict, document_text: str, logo: tuple[bytes, str] | 
 <Relationship Id="rIdNumbering" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>
 {image_rel}
 </Relationships>""".format(
-        image_rel='<Relationship Id="rIdLogo" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/logo.{ext}"/>'.format(ext=logo[1]) if logo else ""
+        image_rel=document_image_relationships(logo, report_images)
     )
     content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -2463,7 +3056,7 @@ xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing
 xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
 xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
-<w:body>{markdown_to_word_body(document_text, logo)}</w:body>
+<w:body>{markdown_to_word_body(document_text, logo, report_images)}</w:body>
 </w:document>"""
     with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as docx:
         docx.writestr("[Content_Types].xml", content_types)
@@ -2476,6 +3069,8 @@ xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
         docx.writestr("word/_rels/document.xml.rels", document_rels)
         if logo:
             docx.writestr(f"word/media/logo.{logo[1]}", logo[0])
+        for index, image in enumerate(report_images or [], 1):
+            docx.writestr(f"word/media/report_image_{index}.{image['ext']}", image["bytes"])
 
 
 def validate_report_file(job: dict, docx_path: Path, document_text: str) -> list[str]:
@@ -2495,6 +3090,213 @@ def validate_report_file(job: dict, docx_path: Path, document_text: str) -> list
     return errors
 
 
+def executable_path(name: str, candidates: list[str] | None = None) -> str | None:
+    path = shutil.which(name)
+    if path:
+        return path
+    for candidate in candidates or []:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
+def render_report_pages(docx_path: Path) -> dict:
+    output_dir = docx_path.with_suffix(".pages")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for old_file in list(output_dir.glob("*")):
+        if old_file.is_file():
+            old_file.unlink()
+
+    soffice = executable_path(
+        "soffice",
+        [
+            "/opt/homebrew/bin/soffice",
+            "/usr/local/bin/soffice",
+            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        ],
+    )
+    pdftoppm = executable_path("pdftoppm", ["/opt/homebrew/bin/pdftoppm", "/usr/local/bin/pdftoppm"])
+    if not soffice:
+        raise RuntimeError("LibreOffice soffice not found")
+    if not pdftoppm:
+        raise RuntimeError("Poppler pdftoppm not found")
+
+    timeout = bounded_int(env("DOPE_REPORT_RENDER_TIMEOUT"), 180, 30, 900)
+    subprocess.run(
+        [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(output_dir), str(docx_path)],
+        check=True,
+        timeout=timeout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    pdf_candidates = sorted(output_dir.glob("*.pdf"), key=lambda item: item.stat().st_mtime, reverse=True)
+    if not pdf_candidates:
+        raise RuntimeError("LibreOffice did not create a PDF")
+    pdf_path = pdf_candidates[0]
+    prefix = output_dir / "page"
+    subprocess.run(
+        [pdftoppm, "-png", "-r", str(bounded_int(env("DOPE_REPORT_RENDER_DPI"), 120, 72, 180)), str(pdf_path), str(prefix)],
+        check=True,
+        timeout=timeout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    page_limit = bounded_int(env("DOPE_REPORT_PAGE_QA_LIMIT"), 6, 1, 10)
+    page_paths = sorted(output_dir.glob("page-*.png"))[:page_limit]
+    if not page_paths:
+        raise RuntimeError("Poppler did not render any page PNGs")
+    return {
+        "output_dir": str(output_dir),
+        "pdf_path": str(pdf_path),
+        "page_count": len(sorted(output_dir.glob("page-*.png"))),
+        "scanned_page_count": len(page_paths),
+        "page_paths": [str(path) for path in page_paths],
+    }
+
+
+def page_visual_qa_prompt(job: dict, document_text: str, render_meta: dict) -> str:
+    company = compact(job.get("company", {}).get("name") or job.get("deal", {}).get("company_name"), "client")
+    audience = str(job.get("metadata", {}).get("report_audience") or job.get("report_contract", {}).get("audience") or "client")
+    return (
+        "You are the final visual QA inspector for a DOPE Marketing report rendered from DOCX pages.\n"
+        "Inspect the attached rendered page images only. Judge the visible finished report, not hidden metadata.\n"
+        "Return strict JSON only with this shape: "
+        '{"pass":true,"score":90,"notes":["..."],"errors":[],"repair_instructions":"..."}.\n\n'
+        "Fail if any page is blank, visually broken, too crowded to read, has overlapping/cropped content, has unreadable tables, "
+        "shows filenames/endpoints/local paths, repeats the DOPE MARKETING header awkwardly, exposes AI/process notes, or does not feel client-facing.\n"
+        "Prefer practical design criticism: hierarchy, spacing, image placement, table readability, and whether it feels like a polished proposal.\n"
+        "Do not invent business facts. Do not ask for revisions unless the page visuals actually need them.\n\n"
+        f"CLIENT: {company}\n"
+        f"AUDIENCE: {audience}\n"
+        f"RENDERED PAGES: {render_meta.get('scanned_page_count')} of {render_meta.get('page_count')}\n"
+        f"VISIBLE TEXT SAMPLE:\n{clip(document_text, 1800)}"
+    )
+
+
+def parse_visual_qa_json(raw_text: str) -> dict:
+    text = (raw_text or "").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+    return {
+        "pass": True,
+        "score": None,
+        "notes": [clip(text, 500)] if text else ["visual QA returned no parseable JSON"],
+        "errors": [],
+        "parse_warning": "visual QA response was not strict JSON",
+    }
+
+
+def run_page_visual_qa(job: dict, docx_path: Path, document_text: str) -> dict:
+    if not report_page_visual_qa_enabled(job):
+        return {"enabled": False}
+
+    job_id = job.get("id")
+    model = report_page_visual_qa_model(job)
+    provider = local_runtime_provider(model)
+    try:
+        render_meta = render_report_pages(docx_path)
+    except Exception as error:
+        message = f"{type(error).__name__}: {str(error)[:180]}"
+        log("page_visual_qa_render_error", id=job_id, provider=provider, model=model, status=message)
+        return {
+            "enabled": True,
+            "accepted": False,
+            "provider": provider,
+            "model": model,
+            "errors": [f"page visual QA render failed: {message}"],
+            "warnings": [],
+        }
+
+    page_paths = [Path(path) for path in render_meta.get("page_paths", [])]
+    base_url = str(env("OLLAMA_URL", "http://127.0.0.1:11434") or "http://127.0.0.1:11434").rstrip("/")
+    prompt = page_visual_qa_prompt(job, document_text, render_meta)
+    body = {
+        "model": model,
+        "prompt": prompt,
+        "images": [base64.b64encode(path.read_bytes()).decode("ascii") for path in page_paths],
+        "stream": False,
+        "format": "json",
+        "options": {
+            "temperature": 0.15,
+            "num_predict": 700,
+        },
+    }
+    req = urllib.request.Request(
+        f"{base_url}/api/generate",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "alice-dope-market-report-worker/page-visual-qa"},
+        method="POST",
+    )
+    log("page_visual_qa_start", id=job_id, provider=provider, model=model, status=f"pages={len(page_paths)}")
+    try:
+        with urllib.request.urlopen(req, timeout=bounded_int(env("DOPE_REPORT_PAGE_QA_TIMEOUT"), 240, 60, 900)) as response:
+            parsed = json.loads(response.read().decode("utf-8"))
+        response_text = ollama_visible_text(parsed)
+        qa = parse_visual_qa_json(response_text)
+        score = qa.get("score")
+        try:
+            score_value = int(score) if score is not None else None
+        except (TypeError, ValueError):
+            score_value = None
+        min_score = bounded_int(env("DOPE_REPORT_PAGE_QA_MIN_SCORE"), 72, 0, 100)
+        errors = [str(item) for item in array_like(qa.get("errors")) if str(item).strip()]
+        warnings = [str(item) for item in array_like(qa.get("notes")) if str(item).strip()]
+        passed = qa.get("pass") is not False and not errors
+        if score_value is not None and score_value < min_score:
+            errors.append(f"page visual QA score too low: {score_value} < {min_score}")
+            passed = False
+        if qa.get("parse_warning"):
+            warnings.append(str(qa["parse_warning"]))
+        if passed:
+            log("page_visual_qa_passed", id=job_id, provider=provider, model=parsed.get("model") or model, status=f"score={score_value}")
+        else:
+            log("page_visual_qa_failed", id=job_id, provider=provider, model=parsed.get("model") or model, status="; ".join(errors)[:160])
+        return {
+            "enabled": True,
+            "accepted": passed,
+            "provider": provider,
+            "model": parsed.get("model") or model,
+            "score": score_value,
+            "minimum_score": min_score,
+            "errors": errors,
+            "warnings": warnings[:8],
+            "repair_instructions": clip(str(qa.get("repair_instructions") or ""), 700),
+            "render": render_meta,
+            "usage": {
+                "prompt_eval_count": parsed.get("prompt_eval_count"),
+                "eval_count": parsed.get("eval_count"),
+                "total_duration": parsed.get("total_duration"),
+            },
+        }
+    except Exception as error:
+        message = f"{type(error).__name__}: {str(error)[:180]}"
+        log("page_visual_qa_error", id=job_id, provider=provider, model=model, status=message)
+        return {
+            "enabled": True,
+            "accepted": False,
+            "provider": provider,
+            "model": model,
+            "render": render_meta,
+            "errors": [f"page visual QA failed: {message}"],
+            "warnings": [],
+        }
+
+
+def array_like(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
 def write_local_report_record(job: dict, docx_path: Path, manifest: dict, complete_result: dict | None = None) -> None:
     complete_result = complete_result or {}
     record = {
@@ -2506,6 +3308,8 @@ def write_local_report_record(job: dict, docx_path: Path, manifest: dict, comple
         "file_url": complete_result.get("file_url"),
         "storage_key": complete_result.get("storage_key"),
         "byte_size": manifest.get("byte_size"),
+        "maza_address": manifest.get("maza_address"),
+        "bake": manifest.get("bake"),
         "model": manifest.get("model"),
         "provider": manifest.get("provider"),
         "embedder_model": manifest.get("embedder_model"),
@@ -2602,6 +3406,13 @@ def retryable_report_error(message: str) -> bool:
         "scratchpad",
         "too short",
         "too small",
+        "page visual qa",
+        "visual qa",
+        "render failed",
+        "overlapping",
+        "cropped",
+        "blank page",
+        "unreadable",
         "visible client proposal",
         "visible client copy",
         "visible client report",
@@ -2615,7 +3426,8 @@ def retry_note_from_error(message: str) -> str:
         "The previous draft failed DOPE/SUN validation. Rewrite from scratch and fix this exact issue: "
         f"{cleaned[:600]}. "
         "Return only the client-visible report. Start with DOPE MARKETING. Include every required section title "
-        "from the contract in order, and include every required Markdown table named by the report contract."
+        "from the contract in order, and include every required Markdown table named by the report contract. "
+        "If the failure mentions page visual QA, make the report cleaner, shorter, less crowded, with clearer headings, fewer dense paragraphs, and easier tables."
     )
 
 
@@ -2631,6 +3443,12 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
     try:
         with ReportHeartbeat(client, job):
             logo = client.fetch_logo(job)
+            report_images, media_fetch_errors = client.fetch_report_images(job, logo=logo)
+            vision_notes = vision_scan_images(job, report_images)
+            ocr_notes = ocr_scan_images(job, report_images)
+            media_observations = embedded_media_observations(report_images, vision_notes + ocr_notes)
+            job["_alice_media_observations"] = media_observations
+            job["_alice_media_fetch_errors"] = media_fetch_errors
             max_attempts = report_job_attempt_count()
             last_error = None
             for job_attempt in range(1, max_attempts + 1):
@@ -2643,15 +3461,20 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
                 filename = f"{timestamp}-{slug(company_name)}-market-report.docx"
                 REPORT_DIR.mkdir(parents=True, exist_ok=True)
                 docx_path = REPORT_DIR / filename
-                create_report_docx(job, document_text, logo, docx_path)
+                create_report_docx(job, document_text, logo, docx_path, report_images=report_images)
                 canva_packet = write_canva_packet(job, document_text, docx_path)
                 log("canva_packet", id=job_id, status=f"{canva_packet['format']} csv={canva_packet['csv_path']}")
+                page_visual_qa = run_page_visual_qa(job, docx_path, document_text)
                 sections = report_section_titles(job, document_text)
+                report_title = report_display_title(job, document_text, sections, company_name)
                 words = word_count(document_text)
                 quality_errors = validate_report_file(job, docx_path, document_text)
+                quality_errors.extend(page_visual_qa.get("errors", []))
                 logo_reason = logo_missing_reason(job, logo)
                 manifest = {
                     "worker_id": client.worker_id,
+                    "node_id": node_id(client.worker_id),
+                    "maza_address": node_maza_address(),
                     "generated_at": now_iso(),
                     "provider": ai_meta["provider"],
                     "model": ai_meta["model"],
@@ -2673,7 +3496,7 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
                     "minimum_docx_bytes": minimum_docx_bytes(job),
                     "byte_size": docx_path.stat().st_size,
                     "docx_signature": docx_path.read_bytes()[:2].decode("ascii", errors="replace"),
-                    "report_title": sections[0] if sections else company_name,
+                    "report_title": report_title,
                     "summary": report_text[:500],
                     "logo_embedded": bool(logo),
                     "logo_reason": logo_reason,
@@ -2682,17 +3505,46 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
                         "logo_source": logo[2] if logo and len(logo) > 2 else None,
                         "logo_reason": logo_reason,
                         "uploaded_media_count": len(job.get("assets", {}).get("uploaded_media", []) or []),
-                        "embedded_image_count": 1 if logo else 0,
-                        "fetch_errors": [] if logo else [logo_reason],
+                        "embedded_image_count": (1 if logo else 0) + len(report_images),
+                        "embedded_supporting_image_count": len(report_images),
+                        "embedded_images": media_observations,
+                        "preflight_scan_enabled": report_preflight_scan_enabled(job),
+                        "vision_enabled": report_preflight_scan_enabled(job),
+                        "vision_model": report_preflight_vision_model(job),
+                        "vision_notes": vision_notes,
+                        "ocr_model": report_preflight_ocr_model(job),
+                        "ocr_notes": ocr_notes,
+                        "fetch_errors": media_fetch_errors + ([] if logo else [logo_reason]),
                     },
                     "canva": canva_packet,
                     "local_path": str(docx_path),
                     "source_artifact_id": job_id,
                     "source_deal_id": job.get("deal", {}).get("id"),
+                    "bake": {
+                        "eligible": bool(node_maza_address()),
+                        "unit": "completed_report",
+                        "source": "dope.report",
+                        "source_artifact_id": job_id,
+                        "worker_id": client.worker_id,
+                        "node_id": node_id(client.worker_id),
+                        "maza_address": node_maza_address(),
+                        "completed_at": now_iso(),
+                        "file_sha256": hashlib.sha256(docx_path.read_bytes()).hexdigest(),
+                    },
                     "sections": sections,
                     "required_sections": job.get("report_contract", {}).get("required_sections", []),
                     "quality_errors": quality_errors,
-                    "quality_warnings": [],
+                    "quality_warnings": page_visual_qa.get("warnings", []),
+                    "pipeline": {
+                        "preflight_visual_scan_enabled": report_preflight_scan_enabled(job),
+                        "preflight_vision_model": report_preflight_vision_model(job),
+                        "preflight_ocr_model": report_preflight_ocr_model(job),
+                        "post_generation_review_enabled": report_post_review_enabled(job),
+                        "post_generation_review": ai_meta.get("post_review", {}),
+                        "page_visual_qa_enabled": report_page_visual_qa_enabled(job),
+                        "page_visual_qa_model": report_page_visual_qa_model(job),
+                        "page_visual_qa": page_visual_qa,
+                    },
                     "job_attempt": job_attempt,
                     "max_job_attempts": max_attempts,
                 }
