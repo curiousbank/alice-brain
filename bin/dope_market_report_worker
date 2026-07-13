@@ -64,6 +64,7 @@ def load_env_files() -> None:
         Path.home() / "Desktop" / "alice-brain" / ".env",
         Path.home() / ".config" / "alice-brain" / "node.env",
         Path.home() / ".config" / "autos" / "alice.env",
+        Path.home() / ".config" / "autos" / "dope.env",
         Path.home() / "Desktop" / "PB" / ".env.alice",
     ]:
         if not path.exists():
@@ -79,7 +80,7 @@ def load_env_files() -> None:
             key, value = line.split("=", 1)
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
+            if key and not os.environ.get(key):
                 os.environ[key] = value
 
 
@@ -127,9 +128,9 @@ def node_id(default: str = DEFAULT_WORKER_ID) -> str:
 
 
 class DopeClient:
-    def __init__(self) -> None:
+    def __init__(self, worker_id: str | None = None) -> None:
         self.base_url = (env("DOPE_REPORT_WORKER_BASE_URL") or env("DOPE_WORKER_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
-        self.worker_id = env("DOPE_REPORT_WORKER_ID", node_id(DEFAULT_WORKER_ID))
+        self.worker_id = worker_id or env("DOPE_REPORT_WORKER_ID", node_id(DEFAULT_WORKER_ID))
         self.token = require_token()
 
     def request(self, method: str, path: str, body: bytes | None = None, headers: dict[str, str] | None = None, timeout: int | None = None):
@@ -287,6 +288,8 @@ class DopeClient:
             "model": manifest.get("model", "none"),
             "summary": manifest.get("summary", ""),
         }
+        if job.get("claim_token") or job.get("output", {}).get("claim_token"):
+            payload["claim_token"] = job.get("claim_token") or job.get("output", {}).get("claim_token")
         endpoint = job.get("output", {}).get("complete_endpoint") or f"/dope_worker/reports/{job['id']}/complete"
         code, _headers, body = self.request(
             "POST",
@@ -301,12 +304,23 @@ class DopeClient:
 
     def fail(self, job: dict, message: str) -> None:
         endpoint = job.get("output", {}).get("fail_endpoint") or f"/dope_worker/reports/{job['id']}/fail"
-        form = urllib.parse.urlencode({"error": message[:1800], "worker_id": self.worker_id}).encode("utf-8")
+        form_payload = {"error": message[:1800], "worker_id": self.worker_id}
+        if job.get("claim_token") or job.get("output", {}).get("claim_token"):
+            form_payload["claim_token"] = job.get("claim_token") or job.get("output", {}).get("claim_token")
+        form = urllib.parse.urlencode(form_payload).encode("utf-8")
         self.request("POST", endpoint, body=form, headers={"Content-Type": "application/x-www-form-urlencoded"})
 
     def heartbeat(self, job: dict) -> None:
         endpoint = job.get("output", {}).get("heartbeat_endpoint") or f"/dope_worker/reports/{job['id']}/heartbeat"
-        code, _headers, body = self.request("POST", endpoint, body=b"")
+        form_payload = {"worker_id": self.worker_id}
+        if job.get("claim_token") or job.get("output", {}).get("claim_token"):
+            form_payload["claim_token"] = job.get("claim_token") or job.get("output", {}).get("claim_token")
+        code, _headers, body = self.request(
+            "POST",
+            endpoint,
+            body=urllib.parse.urlencode(form_payload).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
         if code not in (200, 204):
             log("heartbeat_rejected", id=job.get("id"), status=f"HTTP {code}: {body.decode(errors='replace')[:160]}")
 
@@ -341,6 +355,50 @@ class ReportHeartbeat:
             self.client.heartbeat(self.job)
         except Exception as error:
             log("heartbeat_error", id=self.job.get("id"), status=f"{type(error).__name__}: {str(error)[:160]}")
+
+
+class ReportResourceGate:
+    def __init__(self, max_parallel: int) -> None:
+        self.max_parallel = max(1, min(int(max_parallel or 1), 2))
+        self.active = 0
+        self.heavy_active = False
+        self.condition = threading.Condition()
+
+    def acquire(self, job: dict) -> bool:
+        heavy = report_job_requires_exclusive_slot(job)
+        job_id = job.get("id")
+        wait_logged = False
+        with self.condition:
+            while True:
+                if self._can_start(heavy):
+                    self.active += 1
+                    self.heavy_active = self.heavy_active or heavy
+                    log(
+                        "concurrency_slot_acquired",
+                        id=job_id,
+                        status=f"{'exclusive' if heavy else 'parallel'} active={self.active}/{self.max_parallel}",
+                    )
+                    return heavy
+                if not wait_logged:
+                    log(
+                        "concurrency_wait",
+                        id=job_id,
+                        status=f"{'exclusive' if heavy else 'parallel'} active={self.active}/{self.max_parallel} heavy_active={self.heavy_active}",
+                    )
+                    wait_logged = True
+                self.condition.wait(timeout=5)
+
+    def release(self, heavy: bool) -> None:
+        with self.condition:
+            self.active = max(0, self.active - 1)
+            if heavy:
+                self.heavy_active = False
+            self.condition.notify_all()
+
+    def _can_start(self, heavy: bool) -> bool:
+        if heavy:
+            return self.active == 0
+        return not self.heavy_active and self.active < self.max_parallel
 
 
 def image_extension(data: bytes, content_type: str) -> str | None:
@@ -583,7 +641,46 @@ def contract_length(job: dict) -> dict:
     return job.get("report_contract", {}).get("length", {}) or {}
 
 
+def copy_maker_word_limits(job: dict) -> tuple[int, int, str]:
+    prompt = copy_maker_user_prompt(job).lower()
+    short_markers = [
+        "billboard",
+        "sms",
+        "text message",
+        "text messages",
+        "headline",
+        "tagline",
+        "slogan",
+        "yard sign",
+        "subject line",
+        "cta",
+        "one-liner",
+        "one liner",
+        "short copy",
+    ]
+    medium_markers = [
+        "postcard",
+        "door hanger",
+        "flyer",
+        "email",
+        "ad copy",
+        "facebook ad",
+        "google ad",
+        "meta ad",
+        "caption",
+    ]
+    if any(marker in prompt for marker in short_markers):
+        return 40, 15, "short_copy_asset"
+    if any(marker in prompt for marker in medium_markers):
+        return 120, 50, "copy_asset"
+    return 180, 80, "copy_package"
+
+
 def minimum_words(job: dict) -> int:
+    if report_audience(job) == "copy_maker":
+        minimum, _hard_minimum, _kind = copy_maker_word_limits(job)
+        return minimum
+
     value = (
         job.get("output", {}).get("minimum_words")
         or contract_quality_gate(job).get("minimum_words")
@@ -597,6 +694,10 @@ def minimum_words(job: dict) -> int:
 
 
 def hard_minimum_words(job: dict) -> int:
+    if report_audience(job) == "copy_maker":
+        _minimum, hard_minimum, _kind = copy_maker_word_limits(job)
+        return hard_minimum
+
     value = (
         job.get("output", {}).get("hard_minimum_words")
         or contract_quality_gate(job).get("hard_minimum_words")
@@ -718,6 +819,8 @@ def section_aliases(title: str) -> set[str]:
         "offer_strategy": {"offer strategy", "offer ideas", "offer stack"},
         "launch_plan": {"launch plan", "timeline launch plan", "suggested timeline", "campaign timeline", "timeline"},
         "final_recommendation": {"final recommendation", "final recommendation summary", "next steps", "recommendation summary"},
+        "comm_kit_text_messages": {"comm kit text messages", "comm kit sms", "text messages", "sms messages"},
+        "comm_kit_sales_emails": {"comm kit sales emails", "sales emails", "email templates", "friendly sales emails"},
     }
     aliases.update(alias_map.get(compact, set()))
     aliases.update(alias_map.get(normalized.replace(" ", "_"), set()))
@@ -891,6 +994,7 @@ def source_context_chunks(job: dict, chunk_chars: int) -> list[dict]:
     assets = job.get("assets", {}) or {}
     account_graph = job.get("account_graph", {}) or {}
 
+    add("Client fact sheet", source_fact_sheet(job))
     add("Primary generation prompt", job.get("generation_prompt") or contract.get("llm_prompt") or contract.get("requested_output"))
     add("Reference style summary", strategy_proposal_style_summary())
     add("Report contract", contract)
@@ -920,12 +1024,146 @@ def source_context_chunks(job: dict, chunk_chars: int) -> list[dict]:
     return clean
 
 
+INDUSTRY_HINTS = [
+    ("plumbing / HVAC", ["plumb", "drain", "pipe", "water heater", "hvac", "heating", "cooling", "furnace", "air conditioning"]),
+    ("roofing", ["roof", "gutter", "siding", "exterior"]),
+    ("pool service", ["pool", "spa"]),
+    ("landscaping", ["lawn", "landscap", "mowing", "tree service"]),
+    ("pest control", ["pest", "termite", "extermin"]),
+    ("home remodeling", ["remodel", "renovation", "kitchen", "bath"]),
+    ("dental", ["dental", "dentist", "orthodont"]),
+    ("medical", ["medical", "clinic", "healthcare", "therapy"]),
+    ("automotive", ["auto", "car", "truck", "collision", "tire"]),
+]
+
+
+def deep_string_values(value, key_hint: str | None = None, limit: int = 240) -> list[str]:
+    values: list[str] = []
+    stack = [(value, key_hint)]
+    while stack and len(values) < limit:
+        current, current_key = stack.pop()
+        if current in (None, "", [], {}):
+            continue
+        if isinstance(current, dict):
+            for key, child in current.items():
+                stack.append((child, str(key)))
+        elif isinstance(current, list):
+            for child in current:
+                stack.append((child, current_key))
+        else:
+            text = str(current).strip()
+            if text:
+                values.append(text[:400])
+    return values
+
+
+def keyed_source_values(value, key_patterns: list[str], limit: int = 18) -> list[str]:
+    values: list[str] = []
+    patterns = [re.compile(pattern, re.I) for pattern in key_patterns]
+
+    def walk(current) -> None:
+        if len(values) >= limit:
+            return
+        if isinstance(current, dict):
+            for key, child in current.items():
+                key_text = str(key)
+                if any(pattern.search(key_text) for pattern in patterns) and child not in (None, "", [], {}):
+                    if isinstance(child, (dict, list)):
+                        for item in deep_string_values(child, limit=6):
+                            if item not in values:
+                                values.append(item)
+                    else:
+                        item = str(child).strip()
+                        if item and item not in values:
+                            values.append(item[:220])
+                walk(child)
+        elif isinstance(current, list):
+            for child in current:
+                walk(child)
+
+    walk(value)
+    return values[:limit]
+
+
+def inferred_industry(job: dict) -> str:
+    explicit = compact(
+        (job.get("report_contract", {}) or {}).get("client", {}).get("industry")
+        or (job.get("company", {}) or {}).get("industry"),
+        "",
+    )
+    if explicit and explicit.lower() != "local service business":
+        return explicit
+    haystack = " ".join(
+        deep_string_values(
+            {
+                "deal": job.get("deal", {}),
+                "company": job.get("company", {}),
+                "campaign_context": job.get("campaign_context", {}),
+                "hubspot_context": job.get("hubspot_context", {}),
+                "account_graph": job.get("account_graph", {}),
+            },
+            limit=180,
+        )
+    ).lower()
+    for label, needles in INDUSTRY_HINTS:
+        if any(needle in haystack for needle in needles):
+            return label
+    return explicit or "local service business"
+
+
+def source_fact_sheet(job: dict) -> dict:
+    contract = job.get("report_contract", {}) or {}
+    client = contract.get("client", {}) or {}
+    company = job.get("company", {}) or {}
+    deal = job.get("deal", {}) or {}
+    graph = job.get("account_graph", {}) or {}
+    hubspot = job.get("hubspot_context", {}) or {}
+    contact_intelligence = job.get("contact_intelligence", {}) or job.get("ai_runtime", {}).get("contact_intelligence", {}) or {}
+    source_scope = {
+        "deal": deal,
+        "company": company,
+        "campaign_context": job.get("campaign_context", {}),
+        "hubspot_context": hubspot,
+        "account_graph": graph,
+    }
+    business_name = compact(client.get("business_name") or company.get("name") or deal.get("company_name") or deal.get("name"), "")
+    clean_business_name = re.sub(r"^\s*New Signup\s*-\s*", "", business_name, flags=re.I).strip() or business_name
+    timing = report_timing_context(job)
+    return {
+        "business_name": business_name,
+        "client_visible_name": clean_business_name,
+        "inferred_industry": inferred_industry(job),
+        "service_area_candidates": keyed_source_values(
+            source_scope,
+            ["service.*area", "market", "city", "state", "zip", "postal", "address", "location", "territory"],
+            limit=18,
+        ),
+        "contact_candidates": keyed_source_values(source_scope, ["email", "phone", "mobile", "contact", "owner"], limit=18),
+        "ranked_contact_candidates": contact_intelligence.get("ranked_contacts", []),
+        "ranked_phone_options": contact_intelligence.get("phone_options", []),
+        "ranked_email_options": contact_intelligence.get("email_options", []),
+        "domain_candidates": keyed_source_values(source_scope, ["domain", "website", "url"], limit=8),
+        "current_date": timing.get("authoritative_current_date"),
+        "earliest_production_ready_date": timing.get("earliest_production_ready_date"),
+        "minimum_production_lead_days": timing.get("minimum_production_lead_days"),
+        "visibility_rules": [
+            "Do not show placeholders like Your Local Service Area.",
+            "Do not write Client Strategy Proposal unless the report contract title explicitly asks for it.",
+            "Do not use measurable as a replacement for a missing statistic or discount.",
+            "If exact stats are not sourced, use directional language and trackable CRM outcomes.",
+            "Recommendations must use dates on or after earliest_production_ready_date.",
+        ],
+    }
+
+
 def retrieval_query(job: dict) -> str:
     contract = job.get("report_contract", {}) or {}
     deal = job.get("deal", {}) or {}
     company = job.get("company", {}) or {}
     campaign = job.get("campaign_context", {}) or {}
+    facts = source_fact_sheet(job)
     parts = [
+        json.dumps(facts, ensure_ascii=True),
         job.get("generation_prompt"),
         contract.get("llm_prompt"),
         contract.get("requested_output"),
@@ -1216,6 +1454,7 @@ def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
     retrieval_context, embedding_meta = ensure_embedding_context(job)
     repair_context, repair_embedding_meta = ensure_repair_embedding_context(job, retry_note) if retry_note else ("", {})
     prompt_package = {
+        "client_fact_sheet": source_fact_sheet(job),
         "primary_generation_prompt": primary_prompt,
         "retry_note": retry_note,
         "reference_style_summary": strategy_proposal_style_summary(),
@@ -1235,6 +1474,7 @@ def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
         "commerce": job.get("commerce", {}),
         "campaign_context": job.get("campaign_context", {}),
         "account_graph": job.get("account_graph", {}),
+        "contact_intelligence": job.get("contact_intelligence", {}) or job.get("ai_runtime", {}).get("contact_intelligence", {}),
         "associated_data_summary": {
             "associated_company_count": len((job.get("account_graph", {}) or {}).get("companies", []) or []),
             "associated_contact_count": len((job.get("account_graph", {}) or {}).get("contacts", []) or []),
@@ -1318,7 +1558,7 @@ def report_post_review_enabled(job: dict) -> bool:
     return truthy(env("DOPE_REPORT_POST_REVIEW_ENABLED", "0"))
 
 
-def report_post_review_model(job: dict, fallback_model: str) -> str:
+def report_post_review_model(job: dict, fallback_model: str = "") -> str:
     return str(
         runtime_or_metadata_value(job, "post_generation_review_model", "report_post_review_model")
         or env("DOPE_REPORT_POST_REVIEW_MODEL")
@@ -1340,6 +1580,167 @@ def report_page_visual_qa_model(job: dict) -> str:
         or report_preflight_vision_model(job)
         or "qwen3-vl:8b"
     ).strip()
+
+
+def report_design_press_runtime(job: dict) -> dict:
+    press = job.get("design_press_runtime", {}) or {}
+    if not isinstance(press, dict):
+        press = {}
+    metadata = job.get("metadata", {}) or {}
+    enabled_value = press.get("enabled")
+    if enabled_value is None:
+        enabled_value = runtime_or_metadata_value(job, "design_press_enabled", "report_design_press_enabled")
+    enabled = truthy(enabled_value)
+    return {
+        "enabled": enabled,
+        "stage": str(press.get("stage") or metadata.get("report_design_press_stage") or ("queued" if enabled else "off")).strip(),
+        "template": str(press.get("template") or metadata.get("report_design_press_template") or "market_one_sheet").strip(),
+        "style": str(press.get("style") or metadata.get("report_design_press_style") or "dope_clean").strip(),
+        "output": str(press.get("output") or metadata.get("report_design_press_output") or "print_png_pdf").strip(),
+        "renderer": str(press.get("renderer") or metadata.get("report_design_press_renderer") or "alice-design-press").strip(),
+        "notes": str(press.get("notes") or metadata.get("report_design_press_notes") or "").strip(),
+        "canvas": str(press.get("canvas") or "8.5x11 portrait").strip(),
+        "purpose": str(press.get("purpose") or "Create a press-ready visual report output after the strategy copy is validated.").strip(),
+    }
+
+
+def report_design_press_openai_enabled(job: dict) -> bool:
+    press = report_design_press_runtime(job)
+    if not press.get("enabled"):
+        return False
+    value = env("DOPE_REPORT_DESIGN_PRESS_OPENAI_ENABLED", "1")
+    return truthy(value)
+
+
+def report_design_press_openai_models() -> list[str]:
+    configured = env_list("DOPE_REPORT_DESIGN_PRESS_OPENAI_MODELS")
+    if configured:
+        return configured
+    preferred = env("DOPE_REPORT_DESIGN_PRESS_OPENAI_MODEL", "gpt-image-1.5")
+    fallback = env("DOPE_REPORT_DESIGN_PRESS_OPENAI_FALLBACK_MODEL", "gpt-image-1")
+    return [item for item in [preferred, fallback] if item]
+
+
+def design_press_openai_prompt(job: dict, document_text: str, report_title: str) -> str:
+    metadata = job.get("metadata", {}) or {}
+    deal = job.get("deal", {}) or {}
+    company = job.get("company", {}) or {}
+    contract_client = (job.get("report_contract", {}) or {}).get("client", {}) or {}
+    press = report_design_press_runtime(job)
+    company_name = (
+        contract_client.get("business_name")
+        or metadata.get("company_name")
+        or company.get("name")
+        or deal.get("name")
+        or report_title
+        or "Client"
+    )
+    service_area = (
+        contract_client.get("service_area")
+        or company.get("service_area")
+        or company.get("city")
+        or metadata.get("service_area")
+        or "local market"
+    )
+    industry = (
+        contract_client.get("industry")
+        or company.get("industry")
+        or metadata.get("industry")
+        or "local service business"
+    )
+    teaser = plain_text(document_text)[:520]
+    note = press.get("notes") or "Make this feel ready for boss review as a no-Canva proof."
+    return f"""Create a polished 8.5x11 vertical client-facing marketing report cover/poster.
+
+Keep these exact visible words only:
+DOPE MARKETING
+Market Strategy Report
+{plain_text(str(company_name))[:80]}
+{plain_text(str(service_area))[:80]}
+Design Press Proof
+
+Use this report context for visual direction, not as copy to paste:
+Title: {plain_text(report_title)[:140]}
+Industry: {plain_text(str(industry))[:80]}
+Summary: {teaser}
+Design note: {plain_text(str(note))[:220]}
+
+Visual direction:
+- Premium marketing proposal cover, not a spreadsheet, not a wireframe.
+- Strong black, white, charcoal, and DOPE red palette.
+- Crisp editorial typography, glossy print finish, sharp grid, professional agency style.
+- Include abstract neighborhood-map lines, direct-mail/postcard shapes, local-market intelligence visuals, and subtle service-category cues.
+- Template: {press.get("template")}; style: {press.get("style")}; output: {press.get("output")}.
+
+Avoid:
+- Do not invent fake percentages, charts, statistics, phone numbers, prices, QR codes, URLs, or addresses.
+- Do not include tiny unreadable body copy.
+- Do not include random or distorted text.
+- Do not mention Canva, OpenAI, AI, model names, private worker metadata, worker IDs, or artifact IDs.
+- Do not make it look like a generic corporate blue template."""
+
+
+def generate_openai_design_press_preview(job: dict, document_text: str, report_title: str) -> dict:
+    press = report_design_press_runtime(job)
+    if not press.get("enabled"):
+        return {"enabled": False, "status": "off"}
+    if not report_design_press_openai_enabled(job):
+        return {"enabled": False, "status": "disabled"}
+
+    api_key = env("OPENAI_API_KEY")
+    if not api_key:
+        return {"enabled": True, "status": "skipped", "error": "OPENAI_API_KEY not available to Alice worker"}
+
+    prompt = design_press_openai_prompt(job, document_text, report_title)
+    last_error = ""
+    job_id = job.get("id")
+    for model in report_design_press_openai_models():
+        model = str(model or "").strip()
+        if not model:
+            continue
+        try:
+            log("design_press_openai_start", id=job_id, provider="openai/image", model=model, status=f"template={press.get('template')} style={press.get('style')}")
+            parsed = openai_image_generation(
+                api_key=api_key,
+                model=model,
+                prompt=prompt,
+                size=env("DOPE_REPORT_DESIGN_PRESS_IMAGE_SIZE", "1024x1536") or "1024x1536",
+                quality=env("DOPE_REPORT_DESIGN_PRESS_IMAGE_QUALITY", "high") or "high",
+                output_format="jpeg",
+            )
+            data = parsed.get("data") or []
+            image_b64 = data[0].get("b64_json") if data and isinstance(data[0], dict) else None
+            if not image_b64:
+                raise RuntimeError("OpenAI image response did not include b64_json")
+            byte_size = len(base64.b64decode(image_b64))
+            log("design_press_openai_done", id=job_id, provider="openai/image", model=model, status=f"bytes={byte_size}")
+            return {
+                "enabled": True,
+                "status": "generated",
+                "path": "design_press/openai-press-sheet.jpg",
+                "content_type": "image/jpeg",
+                "byte_size": byte_size,
+                "model": model,
+                "source": "OpenAI Images API generation from validated report context",
+                "prompt_path": "design_press/openai-prompt.txt",
+                "prompt": prompt,
+                "image_base64": image_b64,
+                "created_at": now_iso(),
+            }
+        except OpenAIRequestError as error:
+            last_error = f"{error.http_code}: {error.message[:260]}"
+            log("design_press_openai_candidate_failed", id=job_id, provider="openai/image", model=model, status=last_error)
+        except Exception as error:
+            last_error = f"{type(error).__name__}: {str(error)[:260]}"
+            log("design_press_openai_candidate_failed", id=job_id, provider="openai/image", model=model, status=last_error)
+
+    return {
+        "enabled": True,
+        "status": "failed",
+        "error": last_error or "OpenAI image generation failed",
+        "models": report_design_press_openai_models(),
+        "created_at": now_iso(),
+    }
 
 
 def local_report_required(job: dict) -> bool:
@@ -1462,6 +1863,25 @@ def local_model_family(model: str) -> str:
     return "ollama"
 
 
+def report_job_requires_exclusive_slot(job: dict) -> bool:
+    if not truthy(env("DOPE_REPORT_HEAVY_MODELS_EXCLUSIVE", "1")):
+        return False
+
+    heavy_patterns = tuple(
+        item.lower()
+        for item in env_list("DOPE_REPORT_HEAVY_MODEL_PATTERNS")
+        or ["30b", "27b", "35b", "24b", "70b", "72b", "mixtral", "devstral"]
+    )
+    candidates = local_model_candidates(job)
+    candidates.extend(
+        [
+            report_post_review_model(job),
+            report_page_visual_qa_model(job) if truthy(env("DOPE_REPORT_PAGE_QA_EXCLUSIVE", "0")) else "",
+        ]
+    )
+    return any(any(pattern in str(model).lower() for pattern in heavy_patterns) for model in candidates)
+
+
 def report_generation_instructions(job: dict | None = None) -> str:
     outline = required_report_outline(job or {})
     return f"""You are the DOPEIPEDIA market analyzer for DOPE Marketing.
@@ -1470,8 +1890,11 @@ Use payload["generation_prompt"] or payload["report_contract"]["llm_prompt"] as 
 SUN's report contract controls the visible section order, required tables, length, and wording. Do not append legacy sections.
 {outline}
 Use HubSpot labeled properties, raw properties, missing core fields, deal/company/commerce data, and uploaded media filenames/endpoints as private source context only.
+Treat payload["client_fact_sheet"] as the highest-priority source for business name, inferred industry, service-area candidates, contact/domain clues, and production timing guardrails.
+Never write generic placeholders such as "Your Local Service Area", "local service business" when a specific inferred industry is available, or "measurable" as a stand-in for an unsourced statistic or discount.
 When embedded_media_observations are present, use them to shape visual direction, proof points, brand handling, and Canva/print recommendations. Use ocr_text only as visible image text. Do not invent image details beyond filename, dimensions, role, vision_summary, or ocr_text.
 Use payload["timing_context"] for all timeline recommendations. Do not recommend a launch, mail, print, or drop date before timing_context.earliest_production_ready_date. Always allow the configured production lead time before first execution.
+If the current date has already passed a seasonal setup window, recommend the next practical production window rather than naming a past month.
 Analyze the full account graph when present: associated companies, contacts, prior or related deals, statuses, stages, domains, amounts, and useful HubSpot properties. Use that data to sharpen audience, timing, offer, CRM follow-up, and sales-readiness recommendations.
 If associated data exists, synthesize it into practical recommendations; if it is missing, say only the customer-facing setup item when appropriate.
 Do not invent private facts. If a field is missing, call out only the customer-facing setup item when the contract asks for it.
@@ -1479,6 +1902,7 @@ Never mention private worker names, AI vendors, model names, tokens, HubSpot IDs
 No caveman voice. No generic marketing filler. No JSON. No markdown fences. No hidden thinking tags.
 Return only the visible client report Markdown.
 Make the report feel designed, not like a memo: use large useful headings, short confident paragraphs, scannable bullets, concrete campaign names, red/black callout language, and required Markdown tables.
+Use directional proof points unless exact numbers are present in source context. Prefer "track response by QR/phone/CRM source" over invented percentages.
 The visible client report must stop after the Final Recommendation section when that section exists in the contract.
 Allowed internal AM sections are only the sections named in the AM report contract.
 Do not include AM-Facing Actions in client reports, Designer Notes, Print Production Notes, Canva Data Postcard Handoff, Source Data Appendix, HubSpot Properties, Asset List, Human Approval Gates, assumptions tables, prompt notes, payload notes, or technical metadata.
@@ -1505,12 +1929,45 @@ def local_attempt_count() -> int:
     return bounded_int(env("DOPE_REPORT_LOCAL_ATTEMPTS"), 5, 1, 8)
 
 
+def report_audience(job: dict) -> str:
+    contract = job.get("report_contract") or {}
+    metadata = job.get("metadata") or {}
+    runtime = job.get("copy_maker") or {}
+    metadata_audience = str(metadata.get("report_audience") or metadata.get("report_mode") or "").strip().lower()
+    contract_audience = str(contract.get("audience") or "").strip().lower()
+    audience = metadata_audience or contract_audience
+    if audience:
+        if "copy_maker" in audience or "copy maker" in audience:
+            return "copy_maker"
+        if audience == "am" or "internal am" in audience:
+            return "am"
+        if audience == "client" or "client" in audience:
+            return "client"
+        return audience
+    if truthy(metadata.get("copy_maker_enabled")) or truthy(runtime.get("enabled")):
+        return "copy_maker"
+    return "client"
+
+
+def report_document_kind(job: dict) -> str:
+    audience = report_audience(job)
+    if audience == "copy_maker":
+        return "copy-maker"
+    if audience == "am":
+        return "am-brief"
+    return "market-report"
+
+
 def local_retry_note(job: dict, report_text: str, quality_errors: list[str], minimum: int) -> str:
     words = word_count(report_text)
     target = max(minimum + 150, 650)
     errors = "; ".join(quality_errors) or "too short"
-    audience = str(job.get("report_contract", {}).get("audience") or job.get("metadata", {}).get("report_audience") or "client").lower()
-    if audience == "am":
+    audience = report_audience(job)
+    if audience == "copy_maker":
+        visible_label = "copy-focused visible output"
+        section_rule = "Include Header, Source-Aware Copy Direction, Generated Copy, and Usage Notes unless the contract changes them. "
+        table_rule = "Do not add tables unless the custom prompt asks for them. "
+    elif audience == "am":
         visible_label = "internal AM-facing copy"
         section_rule = "Include all required internal sections, especially Internal Next Moves. "
         table_rule = "Use tables only when they help the AM act faster. "
@@ -1527,6 +1984,857 @@ def local_retry_note(job: dict, report_text: str, quality_errors: list[str], min
         "Do not use unsupported exact percentages or statistics. Do not use internal ticket/status words like abandoned, SAM, HubSpot ID, or workflow stage names in client copy. "
         "Do not leave any section heading empty or duplicate section headings."
     )
+
+
+def copy_maker_enabled(job: dict) -> bool:
+    return report_audience(job) == "copy_maker"
+
+
+def copy_maker_local_prep_required(job: dict) -> bool:
+    runtime = job.get("copy_maker", {}) or {}
+    metadata = job.get("metadata", {}) or {}
+    if "local_prep_required" in runtime:
+        return truthy(runtime.get("local_prep_required"))
+    if "copy_maker_local_prep_enabled" in metadata:
+        return truthy(metadata.get("copy_maker_local_prep_enabled"))
+    return True
+
+
+def copy_maker_comm_kit_enabled(job: dict) -> bool:
+    runtime = job.get("copy_maker", {}) or {}
+    metadata = job.get("metadata", {}) or {}
+    return copy_maker_enabled(job) and (
+        truthy(runtime.get("comm_kit_enabled"))
+        or truthy(metadata.get("copy_maker_comm_kit_enabled"))
+    )
+
+
+def copy_maker_comm_kit_direction(job: dict) -> str:
+    runtime = job.get("copy_maker", {}) or {}
+    metadata = job.get("metadata", {}) or {}
+    contract = runtime.get("comm_kit_contract") or metadata.get("copy_maker_comm_kit_contract") or {}
+    if isinstance(contract, str):
+        try:
+            contract = json.loads(contract)
+        except json.JSONDecodeError:
+            contract = {}
+    value = str(
+        runtime.get("comm_kit_direction")
+        or metadata.get("copy_maker_comm_kit_direction")
+        or (contract or {}).get("direction")
+        or "dope_out"
+    ).strip().lower()
+    return "client_out" if value == "client_out" else "dope_out"
+
+
+def copy_maker_comm_kit_direction_label(job: dict) -> str:
+    return "CLIENT OUT" if copy_maker_comm_kit_direction(job) == "client_out" else "DOPE OUT"
+
+
+def copy_maker_comm_kit_direction_rules(job: dict) -> str:
+    if copy_maker_comm_kit_direction(job) == "client_out":
+        return (
+            "DIRECTION: CLIENT OUT.\n"
+            "- Write as the client business, not as DOPE Marketing.\n"
+            "- The recipient is the client's customer or prospect in the client's CRM.\n"
+            "- Help the client promote its own service, estimate, appointment, offer, follow-up, or seasonal campaign.\n"
+            "- Do not pitch DOPE, direct-mail setup, or DOPE pricing in CLIENT OUT mode unless the user's prompt explicitly asks for it.\n"
+        )
+    return (
+        "DIRECTION: DOPE OUT.\n"
+        "- Write as DOPE Marketing to the business owner or decision maker.\n"
+        "- The product is direct-mail marketing: postcards, neighborhood campaigns, print follow-up, and CRM-friendly campaign setup.\n"
+        "- The current campaign angle is July 4 / Happy 250th America specials, with enough lead time for setup and approvals.\n"
+        "- Keep it helpful and sales-ready without fake urgency, fake discounts, or unsupported claims.\n"
+    )
+
+
+def copy_maker_user_prompt(job: dict) -> str:
+    runtime = job.get("copy_maker", {}) or {}
+    metadata = job.get("metadata", {}) or {}
+    contract = job.get("report_contract", {}) or {}
+    prompt = (
+        runtime.get("prompt")
+        or metadata.get("copy_maker_prompt")
+        or contract.get("copy_maker_prompt")
+        or "Create useful client-ready marketing copy from the related CRM data."
+    )
+    return str(prompt).strip()
+
+
+def comm_kit_clean_line(value: str) -> str:
+    cleaned = re.sub(r"^[-*#>\s]+", "", str(value or "").strip())
+    cleaned = cleaned.replace("**", "")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def comm_kit_section(text: str, start_pattern: str, end_pattern: str) -> str:
+    match = re.search(start_pattern, text or "", flags=re.I)
+    if not match:
+        return ""
+    rest = (text or "")[match.end() :]
+    ending = re.search(end_pattern, rest, flags=re.I)
+    return rest[: ending.start()] if ending else rest
+
+
+def comm_kit_sms_options(report_text: str) -> list[dict]:
+    section = comm_kit_section(
+        report_text,
+        r"comm\s+kit\s+text\s+messages|text\s+messages|sms\s+messages",
+        r"comm\s+kit\s+sales\s+emails|sales\s+emails|email\s+templates|usage\s+notes",
+    ) or report_text
+    labels = [
+        ("sms_warm", "Warm Check-In", "warm check-in", "low"),
+        ("sms_helpful", "Helpful Reminder", "helpful reminder", "medium"),
+        ("sms_clear_next_step", "Clear Next-Step", "clear next-step", "high without pressure"),
+    ]
+    candidates = []
+    for line in section.splitlines():
+        cleaned = comm_kit_clean_line(line)
+        if not cleaned or re.match(r"^(comm kit|text messages|sms messages|usage notes)\b", cleaned, flags=re.I):
+            continue
+        match = re.match(
+            r"^(?:\d+[.)]\s*)?(?:text|sms)?\s*(?:message)?\s*(?:\d+)?\s*(?:[-:])?\s*(warm check-in|warm|helpful reminder|helpful|clear next-step|clear next step|urgent|direct)?\s*[:\-–]\s*(.+)$",
+            cleaned,
+            flags=re.I,
+        )
+        if match:
+            candidates.append(comm_kit_clean_line(match.group(2)))
+        elif re.match(r"^\d+[.)]\s+", cleaned):
+            candidates.append(comm_kit_clean_line(re.sub(r"^\d+[.)]\s+", "", cleaned)))
+    candidates = [body for body in candidates if 12 <= len(body) <= 520]
+    options = []
+    for index, (option_id, label, tone, urgency) in enumerate(labels):
+        body = candidates[index] if index < len(candidates) else ""
+        options.append({
+            "id": option_id,
+            "label": label,
+            "tone": tone,
+            "urgency": urgency,
+            "body": body[:520],
+        })
+    return options
+
+
+def comm_kit_email_options(report_text: str) -> list[dict]:
+    section = comm_kit_section(
+        report_text,
+        r"comm\s+kit\s+sales\s+emails|sales\s+emails|email\s+templates",
+        r"usage\s+notes|source-aware|generated copy",
+    ) or report_text
+    chunks = re.split(r"(?=^\s*(?:[-*]\s*)?(?:email|sales email)\s*(?:\d+|one|two)?\s*[:\-–])", section, flags=re.I | re.M)
+    emails = []
+    for chunk in chunks:
+        if not re.search(r"\bsubject\s*:", chunk, flags=re.I):
+            continue
+        subject = re.search(r"\bsubject\s*:\s*(.+)", chunk, flags=re.I)
+        body = re.search(r"\bbody\s*:\s*(.+)", chunk, flags=re.I | re.S)
+        subject_text = comm_kit_clean_line(subject.group(1) if subject else "")
+        body_text = comm_kit_clean_line(body.group(1) if body else "")
+        if subject_text or body_text:
+            emails.append((subject_text, body_text))
+    labels = [
+        ("email_intro", "Friendly sales email"),
+        ("email_follow_up", "Friendly follow-up email"),
+    ]
+    options = []
+    for index, (option_id, label) in enumerate(labels):
+        subject, body = emails[index] if index < len(emails) else ("", "")
+        options.append({
+            "id": option_id,
+            "label": label,
+            "subject": subject[:180],
+            "body": body[:2400],
+        })
+    return options
+
+
+def comm_kit_selection_prompt(job: dict, sms_options: list[dict], email_options: list[dict]) -> str:
+    company = compact(job.get("company", {}).get("name") or job.get("deal", {}).get("company_name"), "client")
+    contact_intelligence = job.get("contact_intelligence", {}) or job.get("ai_runtime", {}).get("contact_intelligence", {}) or {}
+    return (
+        "Pick the strongest Aircall-ready COMM KIT pair.\n"
+        "Choose one SMS and one email from the provided JSON.\n"
+        "Favor specific, friendly, useful copy with clear next steps. Avoid fake urgency or unsupported claims.\n"
+        "Return strict JSON only: {\"selected_sms_id\":\"...\",\"selected_email_id\":\"...\",\"reason\":\"...\"}.\n\n"
+        f"Company: {company}\n"
+        f"Direction: {copy_maker_comm_kit_direction_label(job)}\n"
+        f"Direction rules: {copy_maker_comm_kit_direction_rules(job)}\n"
+        f"Ranked contact intelligence: {json.dumps(contact_intelligence, ensure_ascii=True)[:6000]}\n"
+        f"SMS options: {json.dumps(sms_options, ensure_ascii=True)}\n"
+        f"Email options: {json.dumps(email_options, ensure_ascii=True)}"
+    )
+
+
+def parse_comm_kit_selector_response(raw_text: str) -> dict:
+    text = str(raw_text or "").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+    return {}
+
+
+def parse_json_object_response(raw_text: str) -> dict:
+    text = str(raw_text or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if not match:
+            return {}
+        try:
+            parsed = json.loads(match.group(0))
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+
+COMM_KIT_SMS_BLUEPRINT = [
+    ("sms_warm", "Warm Check-In", "warm check-in", "low"),
+    ("sms_helpful", "Helpful Reminder", "helpful reminder", "medium"),
+    ("sms_clear_next_step", "Clear Next-Step", "clear next-step", "high without pressure"),
+]
+
+COMM_KIT_EMAIL_BLUEPRINT = [
+    ("email_intro", "Friendly sales email"),
+    ("email_follow_up", "Friendly follow-up email"),
+]
+
+
+def comm_kit_contact_intelligence(job: dict) -> dict:
+    return job.get("contact_intelligence", {}) or job.get("ai_runtime", {}).get("contact_intelligence", {}) or {}
+
+
+def comm_kit_payload_prompt(job: dict, local_prep: str, report_text: str = "") -> str:
+    facts = source_fact_sheet(job)
+    contact_intelligence = comm_kit_contact_intelligence(job)
+    runtime = job.get("copy_maker", {}) or {}
+    contract = runtime.get("comm_kit_contract") or job.get("metadata", {}).get("copy_maker_comm_kit_contract") or {}
+    return (
+        "Build the DOPE COMM KIT as structured JSON from source data.\n"
+        "Do not return Markdown. Do not describe the task. Do not expose raw IDs, model names, prompt text, or private metadata.\n"
+        "Use the CRM facts, ranked contact intelligence, associated address context, and local source-aware prep.\n"
+        "The JSON will drive both the visible DOCX and the Comms Lab UI, so every field must be usable without scraping a DOCX.\n\n"
+        "Return strict JSON with this exact shape:\n"
+        "{\n"
+        "  \"recipient_review\": \"short human review summary\",\n"
+        "  \"source_direction\": \"short source-aware copy direction\",\n"
+        "  \"sms_options\": [\n"
+        "    {\"id\":\"sms_warm\",\"label\":\"Warm Check-In\",\"tone\":\"warm check-in\",\"urgency\":\"low\",\"body\":\"...\",\"source_signals\":[\"...\"]},\n"
+        "    {\"id\":\"sms_helpful\",\"label\":\"Helpful Reminder\",\"tone\":\"helpful reminder\",\"urgency\":\"medium\",\"body\":\"...\",\"source_signals\":[\"...\"]},\n"
+        "    {\"id\":\"sms_clear_next_step\",\"label\":\"Clear Next-Step\",\"tone\":\"clear next-step\",\"urgency\":\"high without pressure\",\"body\":\"...\",\"source_signals\":[\"...\"]}\n"
+        "  ],\n"
+        "  \"email_options\": [\n"
+        "    {\"id\":\"email_intro\",\"label\":\"Friendly sales email\",\"subject\":\"...\",\"body\":\"...\",\"source_signals\":[\"...\"]},\n"
+        "    {\"id\":\"email_follow_up\",\"label\":\"Friendly follow-up email\",\"subject\":\"...\",\"body\":\"...\",\"source_signals\":[\"...\"]}\n"
+        "  ],\n"
+        "  \"selected_sms_id\":\"sms_helpful\",\n"
+        "  \"selected_email_id\":\"email_follow_up\",\n"
+        "  \"selector\":{\"reason\":\"why this pair is best\"}\n"
+        "}\n\n"
+        "Rules:\n"
+        "- Exactly 3 SMS options and exactly 2 email options.\n"
+        "- SMS bodies must be under 320 characters, paste-ready, and varied by tone.\n"
+        "- Emails must be content-rich, friendly, and grounded in source-backed CRM context.\n"
+        "- For DOPE OUT, sell direct-mail marketing setup, postcards, neighborhood campaigns, and July 4 Happy 250th America specials.\n"
+        "- For CLIENT OUT, write as the client business to its customers and do not sell DOPE services.\n"
+        "- If prior success, recent engagement, playbook/fathom notes, or campaign history are present, reference them naturally.\n"
+        "- Never invent percentages, discounts, guarantees, or unsupported campaign results.\n\n"
+        f"Direction: {copy_maker_comm_kit_direction_label(job)}\n"
+        f"Direction rules: {copy_maker_comm_kit_direction_rules(job)}\n"
+        f"Custom Copy Maker prompt: {copy_maker_user_prompt(job)[:2000]}\n"
+        f"COMM KIT contract: {json.dumps(contract, ensure_ascii=True)[:6000]}\n"
+        f"Source fact sheet: {json.dumps(facts, ensure_ascii=True)[:12000]}\n"
+        f"Ranked contact intelligence: {json.dumps(contact_intelligence, ensure_ascii=True)[:12000]}\n"
+        f"Local source-aware prep: {local_prep[:8000]}\n"
+        f"Visible draft to align with, if useful: {report_text[:8000]}"
+    )
+
+
+def normalize_source_signals(value) -> list[str]:
+    signals = []
+    for item in value or []:
+        text = comm_kit_clean_line(item)
+        if text:
+            signals.append(text[:180])
+    return signals[:4]
+
+
+def option_payload_by_id(options, option_id: str, index: int) -> dict:
+    for option in options:
+        if isinstance(option, dict) and str(option.get("id") or "").strip() == option_id:
+            return option
+    if index < len(options) and isinstance(options[index], dict):
+        return options[index]
+    return {}
+
+
+def normalize_structured_sms_options(payload: dict) -> list[dict]:
+    raw_options = payload.get("sms_options") or payload.get("texts") or payload.get("sms") or []
+    raw_options = raw_options if isinstance(raw_options, list) else []
+    options = []
+    for index, (option_id, label, tone, urgency) in enumerate(COMM_KIT_SMS_BLUEPRINT):
+        raw = option_payload_by_id(raw_options, option_id, index)
+        body = comm_kit_clean_line(raw.get("body") or raw.get("message") or raw.get("text") or "")
+        options.append({
+            "id": option_id,
+            "label": comm_kit_clean_line(raw.get("label") or label)[:80],
+            "tone": comm_kit_clean_line(raw.get("tone") or tone)[:80],
+            "urgency": comm_kit_clean_line(raw.get("urgency") or urgency)[:80],
+            "body": body[:520],
+            "source_signals": normalize_source_signals(raw.get("source_signals") or raw.get("signals")),
+        })
+    return options
+
+
+def normalize_structured_email_options(payload: dict) -> list[dict]:
+    raw_options = payload.get("email_options") or payload.get("emails") or []
+    raw_options = raw_options if isinstance(raw_options, list) else []
+    options = []
+    for index, (option_id, label) in enumerate(COMM_KIT_EMAIL_BLUEPRINT):
+        raw = option_payload_by_id(raw_options, option_id, index)
+        subject = comm_kit_clean_line(raw.get("subject") or "")
+        body = comm_kit_clean_line(raw.get("body") or raw.get("email_body") or raw.get("copy") or "")
+        options.append({
+            "id": option_id,
+            "label": comm_kit_clean_line(raw.get("label") or label)[:80],
+            "subject": subject[:180],
+            "body": body[:2400],
+            "source_signals": normalize_source_signals(raw.get("source_signals") or raw.get("signals")),
+        })
+    return options
+
+
+def comm_kit_options_valid(sms_options: list[dict], email_options: list[dict]) -> bool:
+    sms_valid = len(sms_options) == 3 and all(option.get("id") and option.get("body") for option in sms_options)
+    email_valid = len(email_options) == 2 and all(option.get("id") and option.get("subject") and option.get("body") for option in email_options)
+    return sms_valid and email_valid
+
+
+def select_comm_kit_pair(job: dict, sms_options: list[dict], email_options: list[dict], local_model: str, default_reason: str) -> dict:
+    selected_sms_id = next((option["id"] for option in sms_options if option.get("body") and option["id"] == "sms_helpful"), sms_options[0]["id"] if sms_options else None)
+    selected_email_id = next((option["id"] for option in email_options if option.get("body") and option["id"] == "email_follow_up"), email_options[0]["id"] if email_options else None)
+    selector = {
+        "provider": "alice/fallback",
+        "model": "heuristic",
+        "reason": default_reason,
+        "error": None,
+    }
+    try:
+        parsed = ollama_report_response(local_model, comm_kit_selection_prompt(job, sms_options, email_options))
+        choice = parse_comm_kit_selector_response(parsed.get("response"))
+        candidate_sms = str(choice.get("selected_sms_id") or choice.get("sms_id") or "")
+        candidate_email = str(choice.get("selected_email_id") or choice.get("email_id") or "")
+        valid_sms_ids = {option["id"] for option in sms_options}
+        valid_email_ids = {option["id"] for option in email_options}
+        if candidate_sms in valid_sms_ids and candidate_email in valid_email_ids:
+            selected_sms_id = candidate_sms
+            selected_email_id = candidate_email
+            selector = {
+                "provider": "ollama/local",
+                "model": parsed.get("model") or local_model,
+                "reason": comm_kit_clean_line(choice.get("reason") or "Local Qwen selected the most useful COMM KIT pair."),
+                "error": None,
+            }
+    except Exception as error:
+        selector["error"] = f"{type(error).__name__}: {str(error)[:240]}"
+
+    return {
+        "selected_sms_id": selected_sms_id,
+        "selected_email_id": selected_email_id,
+        "selector": selector,
+    }
+
+
+def build_structured_comm_kit_from_source(job: dict, local_prep: str, local_model: str, report_text: str = "") -> dict | None:
+    if not truthy(env("DOPE_COMM_KIT_STRUCTURED_ENABLED", "1")):
+        return None
+    parsed = ollama_report_response(local_model, comm_kit_payload_prompt(job, local_prep, report_text))
+    payload = parse_json_object_response(parsed.get("response"))
+    if not payload:
+        raise RuntimeError("structured COMM KIT JSON response was empty or invalid")
+
+    sms_options = normalize_structured_sms_options(payload)
+    email_options = normalize_structured_email_options(payload)
+    if not comm_kit_options_valid(sms_options, email_options):
+        raise RuntimeError("structured COMM KIT JSON missing required SMS/email fields")
+
+    selected = select_comm_kit_pair(
+        job,
+        sms_options,
+        email_options,
+        local_model,
+        comm_kit_clean_line(payload.get("selector", {}).get("reason") if isinstance(payload.get("selector"), dict) else "")
+        or "Structured source JSON selected the most balanced COMM KIT pair for review.",
+    )
+    selector = selected["selector"]
+    raw_selector = payload.get("selector") if isinstance(payload.get("selector"), dict) else {}
+    if raw_selector.get("reason") and selector["provider"] == "alice/fallback":
+        selector["reason"] = comm_kit_clean_line(raw_selector.get("reason"))[:320]
+
+    return {
+        "enabled": True,
+        "source": "structured_source_json",
+        "source_model": parsed.get("model") or local_model,
+        "direction": copy_maker_comm_kit_direction(job),
+        "direction_label": copy_maker_comm_kit_direction_label(job),
+        "recipient_review": comm_kit_clean_line(payload.get("recipient_review") or "")[:1200],
+        "source_direction": comm_kit_clean_line(payload.get("source_direction") or "")[:1000],
+        "contact_intelligence": comm_kit_contact_intelligence(job),
+        "sms_options": sms_options,
+        "email_options": email_options,
+        "selected_sms_id": selected["selected_sms_id"],
+        "selected_email_id": selected["selected_email_id"],
+        "selector": selector,
+    }
+
+
+def build_comm_kit_manifest(job: dict, report_text: str, local_model: str, local_prep: str = "") -> dict:
+    if not copy_maker_comm_kit_enabled(job):
+        return {"enabled": False}
+    structured_error = None
+    try:
+        structured = build_structured_comm_kit_from_source(job, local_prep, local_model, report_text)
+        if structured:
+            return structured
+        structured_error = "structured COMM KIT JSON disabled"
+    except Exception as error:
+        structured_error = f"{type(error).__name__}: {str(error)[:240]}"
+
+    sms_options = comm_kit_sms_options(report_text)
+    email_options = comm_kit_email_options(report_text)
+    selected = select_comm_kit_pair(
+        job,
+        sms_options,
+        email_options,
+        local_model,
+        "Fallback parsed the visible copy because structured COMM KIT JSON was unavailable.",
+    )
+    selector = selected["selector"]
+    selector["structured_error"] = structured_error
+
+    return {
+        "enabled": True,
+        "source": "visible_text_fallback",
+        "source_model": local_model,
+        "direction": copy_maker_comm_kit_direction(job),
+        "direction_label": copy_maker_comm_kit_direction_label(job),
+        "recipient_review": "",
+        "source_direction": "",
+        "contact_intelligence": comm_kit_contact_intelligence(job),
+        "sms_options": sms_options,
+        "email_options": email_options,
+        "selected_sms_id": selected["selected_sms_id"],
+        "selected_email_id": selected["selected_email_id"],
+        "selector": selector,
+    }
+
+
+def selected_contact_review_lines(job: dict, comm_kit: dict) -> list[str]:
+    intelligence = comm_kit.get("contact_intelligence") or comm_kit_contact_intelligence(job)
+    lines = []
+    summary = comm_kit_clean_line(intelligence.get("selected_summary") or comm_kit.get("recipient_review") or "")
+    if summary:
+        lines.append(f"- Recommended path: {summary}")
+    for contact in (intelligence.get("ranked_contacts") or [])[:4]:
+        if not isinstance(contact, dict):
+            continue
+        name = comm_kit_clean_line(contact.get("name") or "Unknown contact")
+        parts = [name]
+        for key in ("title", "record_type", "association_type"):
+            value = comm_kit_clean_line(contact.get(key) or "")
+            if value:
+                parts.append(value)
+        reason = comm_kit_clean_line(contact.get("reason") or "")
+        line = f"- {' // '.join(parts)}"
+        if reason:
+            line += f": {reason}"
+        lines.append(line)
+    for address in (intelligence.get("address_options") or [])[:4]:
+        if not isinstance(address, dict):
+            continue
+        name = comm_kit_clean_line(address.get("name") or "Address")
+        value = comm_kit_clean_line(address.get("value") or "")
+        reason = comm_kit_clean_line(address.get("reason") or "")
+        if value:
+            line = f"- {name}: {value}"
+            if reason:
+                line += f" ({reason})"
+            lines.append(line)
+    return lines[:9] or ["- Review the associated CRM contacts, phone numbers, emails, and addresses before outreach."]
+
+
+def render_structured_comm_kit_document(job: dict, comm_kit: dict, local_prep: str) -> str:
+    facts = source_fact_sheet(job)
+    business_name = facts.get("client_visible_name") or facts.get("business_name") or "Client"
+    current_date = facts.get("current_date") or now_iso()[:10]
+    source_direction = comm_kit_clean_line(comm_kit.get("source_direction") or "")
+    if not source_direction:
+        source_direction = (
+            "Use the associated CRM context, ranked recipient data, and campaign direction to make outreach useful, specific, and easy to review."
+        )
+    recipient_review = comm_kit_clean_line(comm_kit.get("recipient_review") or "")
+    contact_lines = selected_contact_review_lines(job, comm_kit)
+    sms_lines = []
+    for option in comm_kit.get("sms_options", []) or []:
+        sms_lines.append(f"{option.get('label') or option.get('id')}: {option.get('body')}")
+    email_lines = []
+    for option in comm_kit.get("email_options", []) or []:
+        email_lines.append(f"{option.get('label') or option.get('id')}")
+        email_lines.append(f"Subject: {option.get('subject')}")
+        email_lines.append(f"Body: {option.get('body')}")
+
+    return "\n\n".join([
+        "DOPE MARKETING",
+        f"Copy Maker COMM KIT: {business_name}",
+        f"{copy_maker_comm_kit_direction_label(job)} // {current_date}",
+        "Source-Aware Copy Direction",
+        source_direction,
+        "Recipient & Address Review",
+        recipient_review or "DVE ranked associated CRM contacts, phone numbers, emails, and addresses for human review before outreach.",
+        "\n".join(contact_lines),
+        "COMM KIT // Text Messages",
+        "\n".join(sms_lines),
+        "COMM KIT // Sales Emails",
+        "\n\n".join(email_lines),
+        "Usage Notes",
+        "Review the recipient, phone, email, and address in COMMS LAB before pressing RUN COMMS. Aircall sending is staged separately and no message is sent from this document.",
+    ]).strip()
+
+
+def copy_maker_cloud_provider(job: dict) -> str:
+    runtime = job.get("copy_maker", {}) or {}
+    metadata = job.get("metadata", {}) or {}
+    value = str(
+        runtime.get("cloud_provider")
+        or metadata.get("copy_maker_cloud_provider")
+        or env("DOPE_COPY_MAKER_CLOUD_PROVIDER")
+        or "nvidia"
+    ).strip().lower()
+    if value.startswith("qwen") or value in {"local", "local_qwen"}:
+        return "qwen"
+    return "openai" if value == "openai" else "nvidia"
+
+
+def copy_maker_cloud_model(job: dict, provider: str | None = None) -> str:
+    runtime = job.get("copy_maker", {}) or {}
+    metadata = job.get("metadata", {}) or {}
+    selected_provider = provider or copy_maker_cloud_provider(job)
+    if selected_provider == "qwen":
+        return str(
+            env("DOPE_COPY_MAKER_QWEN_MODEL")
+            or runtime.get("cloud_model")
+            or metadata.get("copy_maker_cloud_model")
+            or runtime.get("local_llm_model")
+            or metadata.get("report_local_model")
+            or env("DOPE_REPORT_LOCAL_MODEL")
+            or "qwen3:8b"
+        ).strip()
+
+    if selected_provider == "openai":
+        return str(
+            env("DOPE_COPY_MAKER_OPENAI_MODEL")
+            or runtime.get("cloud_model")
+            or metadata.get("copy_maker_cloud_model")
+            or env("OPENAI_MODEL")
+            or "gpt-5.4"
+        ).strip()
+
+    return str(
+        env("DOPE_COPY_MAKER_NVIDIA_MODEL")
+        or runtime.get("cloud_model")
+        or metadata.get("copy_maker_cloud_model")
+        or "nvidia/nemotron-3-ultra-550b-a55b"
+    ).strip()
+
+
+def copy_maker_cloud_base_url(job: dict, provider: str | None = None) -> str:
+    runtime = job.get("copy_maker", {}) or {}
+    metadata = job.get("metadata", {}) or {}
+    selected_provider = provider or copy_maker_cloud_provider(job)
+    if selected_provider == "qwen":
+        return str(env("OLLAMA_URL", "http://127.0.0.1:11434") or "http://127.0.0.1:11434").rstrip("/")
+
+    if selected_provider == "openai":
+        return str(
+            env("DOPE_COPY_MAKER_OPENAI_BASE_URL")
+            or runtime.get("cloud_base_url")
+            or metadata.get("copy_maker_cloud_base_url")
+            or "https://api.openai.com/v1"
+        ).rstrip("/")
+
+    return str(
+        env("DOPE_COPY_MAKER_NVIDIA_BASE_URL")
+        or runtime.get("cloud_base_url")
+        or metadata.get("copy_maker_cloud_base_url")
+        or "https://integrate.api.nvidia.com/v1"
+    ).rstrip("/")
+
+
+def ensure_copy_maker_usage_notes(job: dict, text: str) -> str:
+    if not copy_maker_enabled(job):
+        return text
+    missing = {normalize_section_text(title) for title in missing_required_section_titles(job, text)}
+    if "usage notes" not in missing:
+        return text
+    notes = (
+        "\n\nUsage Notes\n\n"
+        "- Review the selected contact, phone number, email address, and company details in COMMS LAB before sending.\n"
+        "- Treat this as staged sales copy: edit for relationship context, timing, and current offer details.\n"
+        "- No SMS, email, or Aircall action is sent from this document until a human approves the staged communication."
+    )
+    return sanitize_visible_report_text(f"{text.rstrip()}{notes}")
+
+
+def copy_maker_api_key(job: dict, provider: str) -> tuple[str | None, str]:
+    if provider == "qwen":
+        return None, ""
+
+    runtime = job.get("copy_maker", {}) or {}
+    metadata = job.get("metadata", {}) or {}
+    configured_env = str(runtime.get("api_key_env") or metadata.get("copy_maker_cloud_api_key_env") or "").strip()
+    if configured_env:
+        key = env(configured_env)
+        if key:
+            return key, configured_env
+
+    if provider == "openai":
+        return env("OPENAI_API_KEY"), "OPENAI_API_KEY"
+
+    return env("NVIDIA_API_KEY") or env("NVIDIA_NIM_API_KEY"), "NVIDIA_API_KEY"
+
+
+def copy_maker_local_prep_prompt(job: dict) -> str:
+    retry_note = str(job.get("_alice_retry_note") or "").strip()
+    package = report_prompt_input(job, retry_note=retry_note or None)
+    return (
+        "You are Alice local prep for DOPE Copy Maker.\n"
+        "Use the selected local embedder context and CRM/account payload to prepare a compact source-aware brief for a cloud copywriter.\n"
+        "This is NOT the final customer document. Do not write hidden thinking, raw JSON, or generic filler.\n\n"
+        "Return these sections only:\n"
+        "## CRM Facts To Use\n"
+        "## Audience And Offer Angle\n"
+        "## Copy Requirements\n"
+        "## Guardrails\n\n"
+        "Guardrail: do not carry internal stage/status words like abandoned, SAM, HubSpot ID, workflow stage, or ticket status into final visible copy.\n\n"
+        f"CUSTOM COPY MAKER PROMPT:\n{copy_maker_user_prompt(job)}\n\n"
+        f"PAYLOAD:\n{package}"
+    )
+
+
+def copy_maker_final_prompt(job: dict, local_prep: str) -> str:
+    contract = job.get("report_contract", {}) or {}
+    required_sections = [section_title_value(section) for section in contract.get("required_sections", []) or []]
+    retry_note = str(job.get("_alice_retry_note") or "").strip()
+    comm_kit_rules = ""
+    if copy_maker_comm_kit_enabled(job):
+        comm_kit_rules = (
+            "\nCOMM KIT FORMAT RULES:\n"
+            f"{copy_maker_comm_kit_direction_rules(job)}"
+            "- Include exactly these headings when COMM KIT is enabled: COMM KIT Text Messages, COMM KIT Sales Emails, Usage Notes.\n"
+            "- Under COMM KIT Text Messages, write exactly 3 labeled text messages: Warm Check-In, Helpful Reminder, Clear Next-Step.\n"
+            "- Keep each text message under 320 characters and make it ready to paste into Aircall/SMS staging.\n"
+            "- Under COMM KIT Sales Emails, write exactly 2 friendly sales emails.\n"
+            "- Each email must include a clear Subject: line and a Body: line.\n"
+            "- Do not add model notes, process notes, unsupported stats, or fake urgency.\n"
+        )
+    return (
+        "You are DOPE Copy Maker creating the final visible copy document.\n"
+        "Use the local source-aware brief and the custom prompt to write polished marketing copy.\n"
+        "Do not expose hidden reasoning, API names, model names, prompt analysis, raw payload data, HubSpot IDs, or private metadata.\n"
+        "Never use internal stage/status words like abandoned, SAM, workflow stage, ticket status, or HubSpot ID in the visible output.\n"
+        "Return only visible Markdown for a DOCX document.\n"
+        "Start exactly with DOPE MARKETING.\n"
+        "Include these section headings in this order when possible: "
+        f"{', '.join(required_sections) if required_sections else 'Header, Source-Aware Copy Direction, Generated Copy, Usage Notes'}.\n"
+        "If the custom prompt asks for postcard copy, email copy, ad copy, landing page copy, SMS, or a call script, put that actual copy under Generated Copy.\n"
+        "If the custom prompt asks for billboards, SMS, text messages, headlines, taglines, slogans, CTAs, or yard signs, keep the copy short and do not pad it to report length.\n"
+        "Keep the output practical, specific, reviewable, and client-ready.\n\n"
+        f"CUSTOM COPY MAKER PROMPT:\n{copy_maker_user_prompt(job)}\n\n"
+        f"{comm_kit_rules}\n"
+        f"VALIDATION NOTE TO FIX:\n{retry_note or 'none'}\n\n"
+        f"LOCAL SOURCE-AWARE BRIEF:\n{local_prep}\n\n"
+        f"CONTRACT WRITING RULES:\n{json.dumps(contract.get('writing_rules', []), ensure_ascii=True)}\n\n"
+        "Return final visible copy now."
+    )
+
+
+class NvidiaRequestError(RuntimeError):
+    def __init__(self, http_code: int, message: str) -> None:
+        super().__init__(f"NVIDIA HTTP {http_code}: {message}")
+        self.http_code = http_code
+        self.message = message
+
+
+def nvidia_chat_completion(api_key: str, model: str, prompt: str, base_url: str) -> dict:
+    max_tokens = bounded_int(env("DOPE_COPY_MAKER_NVIDIA_MAX_TOKENS"), 8192, 1024, 16384)
+    reasoning_budget = bounded_int(env("DOPE_COPY_MAKER_NVIDIA_REASONING_BUDGET"), 8192, 0, 16384)
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": float(env("DOPE_COPY_MAKER_NVIDIA_TEMPERATURE", "1")),
+        "top_p": float(env("DOPE_COPY_MAKER_NVIDIA_TOP_P", "0.95")),
+        "max_tokens": max_tokens,
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": True},
+        "reasoning_budget": reasoning_budget,
+    }
+    req = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "alice-dope-copy-maker-worker/1.0",
+        },
+        method="POST",
+    )
+    timeout = bounded_int(env("DOPE_COPY_MAKER_NVIDIA_TIMEOUT"), 900, 60, 1800)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raw = error.read().decode(errors="replace")
+        try:
+            parsed = json.loads(raw)
+            message = parsed.get("error", {}).get("message") or raw
+        except json.JSONDecodeError:
+            message = raw
+        raise NvidiaRequestError(error.code, message[:1200]) from error
+
+
+def extract_nvidia_text(parsed: dict) -> tuple[str, str | None]:
+    choices = parsed.get("choices", []) or []
+    if not choices:
+        return "", None
+    message = choices[0].get("message", {}) or {}
+    content = message.get("content")
+    if isinstance(content, list):
+        text = "\n".join(str(item.get("text") if isinstance(item, dict) else item) for item in content if item)
+    else:
+        text = str(content or "")
+    reasoning = message.get("reasoning_content")
+    return text.strip(), str(reasoning).strip() if reasoning else None
+
+
+def copy_maker_openai_response(api_key: str, model: str, prompt: str) -> tuple[dict, str]:
+    effort = (
+        env("DOPE_COPY_MAKER_OPENAI_REASONING")
+        or env("DOPE_REPORT_OPENAI_REASONING")
+        or "high"
+    )
+    max_tokens = bounded_int(env("DOPE_COPY_MAKER_OPENAI_MAX_OUTPUT_TOKENS"), 6000, 1024, 16000)
+    parsed = openai_response(
+        api_key=api_key,
+        model=model,
+        effort=effort,
+        instructions=(
+            "You are DOPE Copy Maker. Return only polished visible client-ready Markdown. "
+            "Do not reveal hidden reasoning, prompt analysis, raw CRM payloads, API names, or private metadata."
+        ),
+        input_text=prompt,
+        max_tokens=max_tokens,
+    )
+    return parsed, effort
+
+
+def call_copy_maker(job: dict) -> tuple[str, dict]:
+    job_id = job.get("id")
+    local_model = (local_model_candidates(job) or DEFAULT_LOCAL_MODEL_CANDIDATES)[0]
+    provider = local_runtime_provider(local_model)
+    if copy_maker_local_prep_required(job):
+        log("copy_maker_local_prep_start", id=job_id, provider=provider, model=local_model, status=f"prompt_chars={len(copy_maker_user_prompt(job))}")
+        local_parsed = ollama_report_response(local_model, copy_maker_local_prep_prompt(job))
+        local_prep = sanitize_visible_report_text(str(local_parsed.get("response") or "")).strip()
+        if not local_prep:
+            raise RuntimeError("Copy Maker local prep returned empty text")
+        log("copy_maker_local_prep_done", id=job_id, provider=provider, model=local_parsed.get("model") or local_model, status=f"words={word_count(local_prep)}")
+    else:
+        local_parsed = {"model": "none", "usage": {}, "prompt_eval_count": 0, "eval_count": 0}
+        local_prep = (
+            "Local LLM prep disabled by AI LAB. Use the custom Copy Maker prompt, report_contract, "
+            "copy_maker runtime payload, CRM/source context, and selected embedder context directly."
+        )
+        log("copy_maker_local_prep_skipped", id=job_id, provider="payload", model="none", status="local_prep_required=false")
+
+    cloud_provider = copy_maker_cloud_provider(job)
+    model = copy_maker_cloud_model(job, cloud_provider)
+    base_url = copy_maker_cloud_base_url(job, cloud_provider)
+    final_prompt = copy_maker_final_prompt(job, local_prep)
+    completion_provider = cloud_provider
+    if cloud_provider == "qwen":
+        log("copy_maker_qwen_start", id=job_id, provider="qwen/local", model=model, status=f"prompt_chars={len(final_prompt)}")
+        parsed = ollama_report_response(model, final_prompt)
+        report_text = sanitize_visible_report_text(str(parsed.get("response") or ""))
+        if not report_text:
+            raise RuntimeError("Qwen Copy Maker returned empty text")
+        log("copy_maker_qwen_done", id=job_id, provider="qwen/local", model=parsed.get("model") or model, status=f"words={word_count(report_text)}")
+        reasoning = None
+        reasoning_effort = "local_qwen"
+        completion_provider = "qwen/local"
+    else:
+        api_key, api_key_env = copy_maker_api_key(job, cloud_provider)
+        if not api_key:
+            raise RuntimeError(f"{api_key_env} is required for Copy Maker {cloud_provider} cloud completion")
+
+        if cloud_provider == "openai":
+            log("copy_maker_openai_start", id=job_id, provider="openai", model=model, status=f"prompt_chars={len(final_prompt)}")
+            parsed, effort = copy_maker_openai_response(api_key, model, final_prompt)
+            report_text = sanitize_visible_report_text(extract_openai_text(parsed))
+            if not report_text:
+                raise RuntimeError("OpenAI Copy Maker returned empty text")
+            log("copy_maker_openai_done", id=job_id, provider="openai", model=parsed.get("model") or model, status=f"words={word_count(report_text)}")
+            reasoning = None
+            reasoning_effort = effort
+        else:
+            log("copy_maker_nvidia_start", id=job_id, provider="nvidia", model=model, status=f"prompt_chars={len(final_prompt)}")
+            parsed = nvidia_chat_completion(api_key, model, final_prompt, base_url)
+            report_text, reasoning = extract_nvidia_text(parsed)
+            report_text = sanitize_visible_report_text(report_text)
+            if not report_text:
+                raise RuntimeError("NVIDIA Copy Maker returned empty text")
+            log("copy_maker_nvidia_done", id=job_id, provider="nvidia", model=parsed.get("model") or model, status=f"words={word_count(report_text)}")
+            reasoning_effort = "nvidia_thinking"
+
+    report_text = sanitize_visible_report_text(report_text)
+    comm_kit = build_comm_kit_manifest(job, report_text, local_model, local_prep)
+    if copy_maker_comm_kit_enabled(job) and truthy(comm_kit.get("enabled")):
+        report_text = sanitize_visible_report_text(render_structured_comm_kit_document(job, comm_kit, local_prep))
+    report_text = ensure_copy_maker_usage_notes(job, report_text)
+    return report_text, {
+        "provider": completion_provider,
+        "model": parsed.get("model") or model,
+        "local_runtime_provider": provider,
+        "local_model_family": local_model_family(local_parsed.get("model") or local_model),
+        "usage": parsed.get("usage", {}),
+        "reasoning_effort": reasoning_effort,
+        "copy_maker": {
+            "local_prep_model": local_parsed.get("model") or local_model,
+            "local_prep_usage": {
+                "prompt_eval_count": local_parsed.get("prompt_eval_count"),
+                "eval_count": local_parsed.get("eval_count"),
+                "total_duration": local_parsed.get("total_duration"),
+                "load_duration": local_parsed.get("load_duration"),
+            },
+            "local_prep_words": word_count(local_prep),
+            "local_prep_required": copy_maker_local_prep_required(job),
+            "cloud_provider": cloud_provider,
+            "cloud_base_url": base_url,
+            "cloud_model": parsed.get("model") or model,
+            "reasoning_captured": bool(reasoning),
+            "comm_kit": comm_kit,
+        },
+    }
 
 
 def ollama_report_response(model: str, prompt: str) -> dict:
@@ -1610,6 +2918,7 @@ def run_post_generation_review(job: dict, report_text: str, model: str) -> tuple
         parsed = ollama_report_response(review_model, post_generation_review_prompt(job, report_text))
         reviewed = sanitize_visible_report_text(str(parsed.get("response") or ""))
         reviewed = sanitize_unsupported_exact_stats(reviewed, job)
+        reviewed = sanitize_past_timing_windows(reviewed, job)
         document_preview = full_document_text(job, reviewed)
         quality_errors = visible_text_quality_errors(document_preview, job)
         words = word_count(reviewed)
@@ -1690,6 +2999,17 @@ def sanitize_visible_report_text(text: str) -> str:
         cleaned = cleaned[starts[1]:]
     elif starts and starts[0] > 0 and contains_meta_leak(cleaned[: starts[0]]):
         cleaned = cleaned[starts[0]:]
+    seen_dope_header = False
+    deduped_lines = []
+    for line in cleaned.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if re.match(r"^\s*(?:#{1,6}\s*)?(?:\*\*)?DOPE MARKETING(?:\*\*)?\s*$", line, flags=re.I):
+            if seen_dope_header:
+                continue
+            seen_dope_header = True
+            deduped_lines.append("DOPE MARKETING")
+            continue
+        deduped_lines.append(line)
+    cleaned = "\n".join(deduped_lines)
     cleaned = re.sub(r"\bworkswith\b", "works with", cleaned, flags=re.I)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned.strip()
@@ -1779,11 +3099,103 @@ def unsupported_exact_stats(text: str, job: dict) -> list[str]:
 def sanitize_unsupported_exact_stats(text: str, job: dict) -> str:
     cleaned = str(text or "")
     for stat in unsupported_exact_stats(cleaned, job):
-        cleaned = re.sub(rf"(?<![\w.]){re.escape(stat)}(?![\w.])", "measurable", cleaned)
         spaced = re.sub(r"(?<=\d)(?=%)", r"\\s*", re.escape(stat))
-        cleaned = re.sub(rf"(?<![\w.]){spaced}(?![\w.])", "measurable", cleaned)
-    cleaned = re.sub(r"\bmeasurable\s+(?:increase|lift|response|conversion|growth|improvement)\b", "measurable lift", cleaned, flags=re.I)
-    cleaned = re.sub(r"\bmeasurable\s*-\s*measurable\b", "measurable", cleaned, flags=re.I)
+        stat_pattern = rf"(?<![\w.])(?:{re.escape(stat)}|{spaced})(?![\w.])"
+        cleaned = re.sub(rf"{stat_pattern}\s*(?:off|discount|savings)\b(?:\s+(?:your|the)\s+first\s+service)?", "a clear first-service offer", cleaned, flags=re.I)
+        cleaned = re.sub(rf"{stat_pattern}\s+of\s+customers\b", "many local customers", cleaned, flags=re.I)
+        cleaned = re.sub(rf"{stat_pattern}\s+(?:higher|better|more)\s+(?:response|conversion|lift|growth)\b", "stronger trackable response", cleaned, flags=re.I)
+        cleaned = re.sub(rf"{stat_pattern}\s+(?:response|conversion|growth|lift|increase|improvement)\b", "trackable response", cleaned, flags=re.I)
+        cleaned = re.sub(stat_pattern, "trackable", cleaned, flags=re.I)
+    cleaned = re.sub(r"\btrackable\s+(?:increase|lift|response|conversion|growth|improvement)\b", "trackable lift", cleaned, flags=re.I)
+    cleaned = re.sub(r"\btrackable\s*-\s*trackable\b", "trackable", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(?:measurable|trackable)\s+of\s+customers\b", "many local customers", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(?:measurable|trackable)\s+off\b(?:\s+(?:your|the)\s+first\s+service)?", "a clear first-service offer", cleaned, flags=re.I)
+    return cleaned
+
+
+def display_date(value: str | None) -> str:
+    parsed = parse_iso_date(value)
+    if not parsed:
+        return str(value or "").strip()
+    return parsed.strftime("%B %-d, %Y") if sys.platform != "win32" else parsed.strftime("%B %#d, %Y")
+
+
+def visible_placeholder_markers(text: str, job: dict) -> list[str]:
+    markers = []
+    cleaned = text or ""
+    facts = source_fact_sheet(job)
+    inferred = str(facts.get("inferred_industry") or "").strip().lower()
+    if re.search(r"\byour local service area\b|\blocal service area\b", cleaned, flags=re.I):
+        markers.append("generic service-area placeholder")
+    if re.search(r"\bmeasurable\s+(?:of|off|higher|response|conversion|growth|lift|increase|improvement)\b", cleaned, flags=re.I):
+        markers.append("measurable placeholder wording")
+    if inferred and inferred != "local service business" and re.search(r"\bindustry\s*:\s*local service business\b", cleaned, flags=re.I):
+        markers.append("generic industry header despite inferred industry")
+    dope_mentions = len(re.findall(r"^\s*(?:#\s*)?DOPE MARKETING\s*$", cleaned, flags=re.I | re.M))
+    if dope_mentions > 1:
+        markers.append("duplicate DOPE MARKETING header")
+    if re.search(r"^\s*Client Strategy Proposal\s*$", cleaned, flags=re.I | re.M):
+        markers.append("legacy Client Strategy Proposal heading")
+    return markers
+
+
+def parse_iso_date(value: str | None):
+    try:
+        return dt.date.fromisoformat(str(value or "")[:10])
+    except ValueError:
+        return None
+
+
+MONTH_NAME_TO_NUMBER = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+
+def past_timing_markers(text: str, job: dict) -> list[str]:
+    timing = report_timing_context(job)
+    current_date = parse_iso_date(timing.get("authoritative_current_date"))
+    if not current_date:
+        return []
+    markers = []
+    timing_words = r"launch|mail|drop|start|begin|production|print|timing|response|campaign"
+    for match in re.finditer(
+        r"\b(?:early|mid|late)?\s*(january|february|march|april|may|june|july|august|september|october|november|december)\b",
+        text or "",
+        flags=re.I,
+    ):
+        month = MONTH_NAME_TO_NUMBER.get(match.group(1).lower())
+        if not month or month >= current_date.month:
+            continue
+        window = (text or "")[max(0, match.start() - 90): match.end() + 90]
+        if re.search(timing_words, window, flags=re.I):
+            label = re.sub(r"\s+", " ", match.group(0)).strip()
+            if label not in markers:
+                markers.append(label)
+    return markers
+
+
+def sanitize_past_timing_windows(text: str, job: dict) -> str:
+    timing = report_timing_context(job)
+    replacement = display_date(timing.get("earliest_production_ready_date")) or "the next practical production window"
+    cleaned = str(text or "")
+    for marker in past_timing_markers(cleaned, job):
+        marker_pattern = re.escape(marker).replace(r"\ ", r"\s+")
+        cleaned = re.sub(rf"\b(in|by|during|for)\s+{marker_pattern}\b", f"after {replacement}", cleaned, flags=re.I)
+        cleaned = re.sub(rf"\b{marker_pattern}\b", f"after {replacement}", cleaned, flags=re.I)
+    cleaned = re.sub(r"\blaunch\s+in\s+after\b", "launch after", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bmail\s+in\s+after\b", "mail after", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bdrop\s+in\s+after\b", "drop after", cleaned, flags=re.I)
     return cleaned
 
 
@@ -1813,20 +3225,37 @@ def generic_report_markers(text: str, job: dict) -> list[str]:
     ]
     if visible_name and not any(variant and variant.lower() in (text or "").lower() for variant in visible_variants):
         markers.append("client name missing")
-    industry = str((job.get("report_contract") or {}).get("client", {}).get("industry") or (job.get("company") or {}).get("industry") or "").strip()
-    if industry and industry.lower() != "local service business" and industry.lower() not in (text or "").lower():
+    industry = inferred_industry(job)
+    if industry and industry.lower() != "local service business" and not industry_present_in_text(industry, text):
         markers.append("specific industry missing")
     if re.search(r"\blocal service business\b", text or "", flags=re.I) and industry and industry.lower() not in {"", "local service business"}:
         markers.append("generic local service business wording")
     return markers
 
 
+def industry_present_in_text(industry: str, text: str) -> bool:
+    lowered = (text or "").lower()
+    industry_lower = str(industry or "").lower()
+    if industry_lower in lowered:
+        return True
+    parts = [part.strip() for part in re.split(r"\s*(?:/|&|\band\b|,)\s*", industry_lower) if part.strip()]
+    return any(len(part) >= 4 and part in lowered for part in parts)
+
+
 def visible_text_quality_errors(text: str, job: dict) -> list[str]:
     errors = []
     cleaned = text or ""
-    audience = str(job.get("report_contract", {}).get("audience") or job.get("metadata", {}).get("report_audience") or "client")
+    audience = report_audience(job)
     if contains_meta_leak(cleaned):
         errors.append("visible copy contains model planning or prompt echo")
+    if audience == "copy_maker":
+        duplicate_headings = duplicate_heading_titles(cleaned)
+        if duplicate_headings:
+            errors.append(f"visible copy repeats section headings: {', '.join(duplicate_headings[:5])}")
+        empty_headings = empty_heading_titles(cleaned)
+        if empty_headings:
+            errors.append(f"visible copy has empty section headings: {', '.join(empty_headings[:5])}")
+        return errors
     if not re.match(r"^\s*(#\s*)?(\*\*)?DOPE MARKETING\b", cleaned, flags=re.I):
         errors.append("visible copy does not start with DOPE MARKETING")
     required_tables = job.get("report_contract", {}).get("required_tables", []) or []
@@ -1850,6 +3279,12 @@ def visible_text_quality_errors(text: str, job: dict) -> list[str]:
         fake_stats = unsupported_exact_stats(cleaned, job)
         if fake_stats:
             errors.append(f"visible client report includes unsupported exact percentages/statistics: {', '.join(fake_stats[:6])}")
+        placeholder_markers = visible_placeholder_markers(cleaned, job)
+        if placeholder_markers:
+            errors.append(f"visible client report contains generic placeholders: {', '.join(placeholder_markers)}")
+        past_timing = past_timing_markers(cleaned, job)
+        if past_timing:
+            errors.append(f"visible client report recommends past timing windows: {', '.join(past_timing[:4])}")
         generic_markers = generic_report_markers(cleaned, job)
         if generic_markers:
             errors.append(f"visible client report is too generic: {', '.join(generic_markers)}")
@@ -1867,6 +3302,8 @@ def structural_quality_errors(errors: list[str]) -> bool:
             "prompt echo",
             "model planning",
             "unsupported exact percentages",
+            "generic placeholders",
+            "past timing windows",
             "leaks internal language",
             "empty section headings",
             "repeats section headings",
@@ -1912,6 +3349,7 @@ def call_local_ollama(job: dict) -> tuple[str, dict]:
                 )
                 report_text = sanitize_visible_report_text(str(parsed.get("response") or ""))
                 report_text = sanitize_unsupported_exact_stats(report_text, job)
+                report_text = sanitize_past_timing_windows(report_text, job)
                 document_preview = full_document_text(job, report_text)
                 quality_errors = visible_text_quality_errors(document_preview, job)
                 words = word_count(report_text)
@@ -2015,6 +3453,13 @@ def call_local_ollama(job: dict) -> tuple[str, dict]:
 
 
 def generate_report_text(job: dict) -> tuple[str, dict]:
+    log(
+        "audience_detected",
+        id=job.get("id"),
+        status=f"audience={report_audience(job)} copy_maker={copy_maker_enabled(job)}",
+    )
+    if copy_maker_enabled(job):
+        return call_copy_maker(job)
     if not local_report_required(job):
         log("forcing_local_report", id=job.get("id"), provider="ollama/local", status="DOPE reports are local-only")
     return call_local_ollama(job)
@@ -2054,7 +3499,9 @@ def call_openai(job: dict) -> tuple[str, dict]:
                     input_text=input_text,
                     max_tokens=max_tokens,
                 )
-                report_text = extract_openai_text(parsed).strip()
+                report_text = sanitize_visible_report_text(extract_openai_text(parsed))
+                report_text = sanitize_unsupported_exact_stats(report_text, job)
+                report_text = sanitize_past_timing_windows(report_text, job)
                 if word_count(report_text) < minimum:
                     log(
                         "openai_retry",
@@ -2074,7 +3521,9 @@ def call_openai(job: dict) -> tuple[str, dict]:
                         ),
                         max_tokens=max(max_tokens, 20000),
                     )
-                    report_text = extract_openai_text(parsed).strip()
+                    report_text = sanitize_visible_report_text(extract_openai_text(parsed))
+                    report_text = sanitize_unsupported_exact_stats(report_text, job)
+                    report_text = sanitize_past_timing_windows(report_text, job)
 
                 if not report_text:
                     raise RuntimeError("OpenAI returned empty report text")
@@ -2125,6 +3574,37 @@ def openai_response(api_key: str, model: str, effort: str, instructions: str, in
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "User-Agent": "alice-dope-market-report-worker/2.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=360) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raw = error.read().decode(errors="replace")
+        try:
+            parsed = json.loads(raw)
+            message = parsed.get("error", {}).get("message") or raw
+        except json.JSONDecodeError:
+            message = raw
+        raise OpenAIRequestError(error.code, message[:1200]) from error
+
+
+def openai_image_generation(api_key: str, model: str, prompt: str, size: str, quality: str, output_format: str = "jpeg") -> dict:
+    body = {
+        "model": model,
+        "prompt": prompt,
+        "size": size,
+        "quality": quality,
+        "output_format": output_format,
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/images/generations",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "alice-dope-market-report-worker/design-press",
         },
         method="POST",
     )
@@ -2923,10 +4403,7 @@ def report_image_block(image: dict, index: int) -> str:
 
 
 def markdown_to_word_body(text: str, logo: tuple[bytes, str] | None, report_images: list[dict] | None = None) -> str:
-    body = [
-        paragraph("DOPE MARKETING", style="Kicker", keep_next=True),
-        paragraph("Client Strategy Proposal", style="Subtitle", keep_next=True),
-    ]
+    body = []
     if logo:
         width, height = image_size(logo[0])
         body.append(image_run(width, height, rel_id="rIdLogo", name="Company logo"))
@@ -3085,7 +4562,8 @@ def validate_report_file(job: dict, docx_path: Path, document_text: str) -> list
     words = word_count(document_text)
     hard_min_words = hard_minimum_words(job)
     if words < hard_min_words:
-        errors.append(f"generated report is too short ({words} words; hard minimum {hard_min_words})")
+        label = "copy output" if report_audience(job) == "copy_maker" else "report"
+        errors.append(f"generated {label} is too short ({words} words; hard minimum {hard_min_words})")
     errors.extend(visible_text_quality_errors(document_text, job))
     return errors
 
@@ -3297,6 +4775,18 @@ def array_like(value) -> list:
     return [value]
 
 
+def design_press_index_payload(value: dict | None) -> dict | None:
+    if not isinstance(value, dict):
+        return value
+    payload = dict(value)
+    preview = payload.get("openai_preview")
+    if isinstance(preview, dict):
+        preview_payload = dict(preview)
+        preview_payload.pop("image_base64", None)
+        payload["openai_preview"] = preview_payload
+    return payload
+
+
 def write_local_report_record(job: dict, docx_path: Path, manifest: dict, complete_result: dict | None = None) -> None:
     complete_result = complete_result or {}
     record = {
@@ -3320,6 +4810,7 @@ def write_local_report_record(job: dict, docx_path: Path, manifest: dict, comple
         "logo_embedded": manifest.get("logo_embedded"),
         "logo_reason": manifest.get("logo_reason"),
         "canva": manifest.get("canva"),
+        "design_press": design_press_index_payload(manifest.get("design_press")),
         "quality": {
             "errors": manifest.get("quality_errors", []),
             "warnings": manifest.get("quality_warnings", []),
@@ -3425,13 +4916,13 @@ def retry_note_from_error(message: str) -> str:
     return (
         "The previous draft failed DOPE/SUN validation. Rewrite from scratch and fix this exact issue: "
         f"{cleaned[:600]}. "
-        "Return only the client-visible report. Start with DOPE MARKETING. Include every required section title "
-        "from the contract in order, and include every required Markdown table named by the report contract. "
+        "Return only the visible document. Start with DOPE MARKETING. Include every required section title "
+        "from the contract in order. Include required Markdown tables only when the contract asks for tables. "
         "If the failure mentions page visual QA, make the report cleaner, shorter, less crowded, with clearer headings, fewer dense paragraphs, and easier tables."
     )
 
 
-def process_one(client: DopeClient, dry_run: bool = False) -> bool:
+def process_one(client: DopeClient, dry_run: bool = False, gate: ReportResourceGate | None = None) -> bool:
     job = client.next_report()
     if not job:
         log("idle")
@@ -3442,6 +4933,27 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
     log("claimed", id=job_id, status=company_name)
     try:
         with ReportHeartbeat(client, job):
+            slot_heavy = False
+            if gate:
+                slot_heavy = gate.acquire(job)
+            try:
+                return process_claimed_report(client, job, company_name, dry_run=dry_run)
+            finally:
+                if gate:
+                    gate.release(slot_heavy)
+    except Exception as error:
+        message = f"{type(error).__name__}: {error}"
+        log("failed", id=job_id, status=message[:160])
+        try:
+            client.fail(job, message)
+        except Exception as fail_error:
+            log("fail_endpoint_error", id=job_id, status=f"{type(fail_error).__name__}: {fail_error}")
+        return False
+
+
+def process_claimed_report(client: DopeClient, job: dict, company_name: str, dry_run: bool = False) -> bool:
+    job_id = job.get("id")
+    try:
             logo = client.fetch_logo(job)
             report_images, media_fetch_errors = client.fetch_report_images(job, logo=logo)
             vision_notes = vision_scan_images(job, report_images)
@@ -3458,13 +4970,22 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
                 _retrieval_context, embedding_meta = ensure_embedding_context(job)
                 document_text = full_document_text(job, report_text)
                 timestamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
-                filename = f"{timestamp}-{slug(company_name)}-market-report.docx"
+                document_kind = report_document_kind(job)
+                filename = f"{timestamp}-{slug(company_name)}-{document_kind}.docx"
                 REPORT_DIR.mkdir(parents=True, exist_ok=True)
                 docx_path = REPORT_DIR / filename
                 create_report_docx(job, document_text, logo, docx_path, report_images=report_images)
                 canva_packet = write_canva_packet(job, document_text, docx_path)
                 log("canva_packet", id=job_id, status=f"{canva_packet['format']} csv={canva_packet['csv_path']}")
                 page_visual_qa = run_page_visual_qa(job, docx_path, document_text)
+                design_press = report_design_press_runtime(job)
+                if design_press.get("enabled"):
+                    log(
+                        "design_press_requested",
+                        id=job_id,
+                        provider="alice-design-press",
+                        status=f"template={design_press.get('template')} style={design_press.get('style')} output={design_press.get('output')}",
+                    )
                 sections = report_section_titles(job, document_text)
                 report_title = report_display_title(job, document_text, sections, company_name)
                 words = word_count(document_text)
@@ -3476,6 +4997,8 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
                     "node_id": node_id(client.worker_id),
                     "maza_address": node_maza_address(),
                     "generated_at": now_iso(),
+                    "report_audience": report_audience(job),
+                    "document_kind": document_kind,
                     "provider": ai_meta["provider"],
                     "model": ai_meta["model"],
                     "local_runtime_provider": ai_meta.get("local_runtime_provider"),
@@ -3517,6 +5040,8 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
                         "fetch_errors": media_fetch_errors + ([] if logo else [logo_reason]),
                     },
                     "canva": canva_packet,
+                    "design_press": design_press,
+                    "comm_kit": ai_meta.get("copy_maker", {}).get("comm_kit", {"enabled": False}),
                     "local_path": str(docx_path),
                     "source_artifact_id": job_id,
                     "source_deal_id": job.get("deal", {}).get("id"),
@@ -3544,6 +5069,13 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
                         "page_visual_qa_enabled": report_page_visual_qa_enabled(job),
                         "page_visual_qa_model": report_page_visual_qa_model(job),
                         "page_visual_qa": page_visual_qa,
+                        "design_press_enabled": bool(design_press.get("enabled")),
+                        "design_press_template": design_press.get("template"),
+                        "design_press_style": design_press.get("style"),
+                        "design_press_output": design_press.get("output"),
+                        "design_press_renderer": design_press.get("renderer"),
+                        "copy_maker_enabled": copy_maker_enabled(job),
+                        "copy_maker": ai_meta.get("copy_maker", {}),
                     },
                     "job_attempt": job_attempt,
                     "max_job_attempts": max_attempts,
@@ -3556,6 +5088,14 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
                         log("quality_retry", id=job_id, status=f"attempt={job_attempt} {message[:140]}")
                         continue
                     raise last_error
+                if design_press.get("enabled"):
+                    if dry_run:
+                        design_press["openai_preview"] = {"enabled": False, "status": "skipped_dry_run"}
+                    else:
+                        design_press["openai_preview"] = generate_openai_design_press_preview(job, document_text, report_title)
+                    manifest["design_press"] = design_press
+                    manifest["pipeline"]["design_press_openai_status"] = design_press.get("openai_preview", {}).get("status")
+                    manifest["pipeline"]["design_press_openai_model"] = design_press.get("openai_preview", {}).get("model")
                 if dry_run:
                     write_local_report_record(job, docx_path, manifest, {"status": "dry_run"})
                     log("dry_run_ready", id=job_id, provider=ai_meta["provider"], model=ai_meta["model"], status=str(docx_path))
@@ -3577,24 +5117,53 @@ def process_one(client: DopeClient, dry_run: bool = False) -> bool:
                 raise last_error
             raise RuntimeError(f"report failed after {max_attempts} attempts")
     except Exception as error:
-        message = f"{type(error).__name__}: {error}"
-        log("failed", id=job_id, status=message[:160])
+        raise error
+
+
+def report_worker_concurrency(value: int | str | None = None) -> int:
+    configured = value if value not in (None, "") else env("DOPE_REPORT_WORKER_CONCURRENCY", "1")
+    return bounded_int(configured, 1, 1, 2)
+
+
+def report_slot_worker_id(base_worker_id: str, slot_index: int, total_slots: int) -> str:
+    base = str(base_worker_id or DEFAULT_WORKER_ID).strip() or DEFAULT_WORKER_ID
+    if total_slots <= 1:
+        return base
+    if re.search(r"-slot-\d+\Z", base):
+        base = re.sub(r"-slot-\d+\Z", "", base)
+    return f"{base}-slot-{slot_index}"
+
+
+def report_worker_loop(slot_index: int, total_slots: int, args: argparse.Namespace, gate: ReportResourceGate) -> None:
+    base_client = DopeClient()
+    client = DopeClient(worker_id=report_slot_worker_id(base_client.worker_id, slot_index, total_slots))
+    log("worker_slot_started", status=f"slot={slot_index}/{total_slots} worker_id={client.worker_id}")
+    while True:
         try:
-            client.fail(job, message)
-        except Exception as fail_error:
-            log("fail_endpoint_error", id=job_id, status=f"{type(fail_error).__name__}: {fail_error}")
-        return False
+            process_one(client, dry_run=args.dry_run, gate=gate)
+        except Exception as error:
+            log("worker_slot_error", status=f"slot={slot_index}/{total_slots} {type(error).__name__}: {error}")
+        time.sleep(max(args.poll_seconds, 2.0))
 
 
 def main() -> int:
     load_env_files()
+    log(
+        "copy_maker_env",
+        status=(
+            f"nvidia_key={'present' if env('NVIDIA_API_KEY') or env('NVIDIA_NIM_API_KEY') else 'missing'} "
+            f"openai_key={'present' if env('OPENAI_API_KEY') else 'missing'}"
+        ),
+    )
     parser = argparse.ArgumentParser(description="Alice-side worker for DOPE market-report DOCX generation.")
     parser.add_argument("--status", action="store_true", help="Check worker API status and exit.")
     parser.add_argument("--recent", action="store_true", help="Print the local completed-report index and exit.")
     parser.add_argument("--once", action="store_true", help="Process one queued report and exit.")
     parser.add_argument("--dry-run", action="store_true", help="Generate locally after claiming, but do not complete the job.")
     parser.add_argument("--poll-seconds", type=float, default=float(env("DOPE_REPORT_WORKER_POLL_SECONDS", "10")), help="Polling delay for daemon mode.")
+    parser.add_argument("--concurrency", type=int, default=report_worker_concurrency(), help="Number of report jobs to process at once. Capped at 2; heavy model jobs run exclusively.")
     args = parser.parse_args()
+    concurrency = report_worker_concurrency(args.concurrency)
 
     client = DopeClient()
     if args.recent:
@@ -3609,16 +5178,51 @@ def main() -> int:
 
     status = client.status()
     log("status", status=f"enabled={status.get('enabled')}", queued=status.get("queued"))
+    log("worker_concurrency", status=f"slots={concurrency} heavy_models_exclusive={truthy(env('DOPE_REPORT_HEAVY_MODELS_EXCLUSIVE', '1'))}")
     if args.status:
-        print(json.dumps({k: status.get(k) for k in ["ok", "worker_id", "enabled", "queued", "generating", "stale_generating", "worker_lease_seconds", "ready", "failed", "archived", "completed"]}, indent=2))
+        payload = {k: status.get(k) for k in ["ok", "worker_id", "enabled", "queued", "generating", "stale_generating", "worker_lease_seconds", "ready", "failed", "archived", "completed"]}
+        payload["local_concurrency"] = concurrency
+        payload["heavy_models_exclusive"] = truthy(env("DOPE_REPORT_HEAVY_MODELS_EXCLUSIVE", "1"))
+        print(json.dumps(payload, indent=2))
         return 0
 
+    gate = ReportResourceGate(concurrency)
     if args.once:
-        return 0 if process_one(client, dry_run=args.dry_run) else 1
+        if concurrency <= 1:
+            return 0 if process_one(client, dry_run=args.dry_run, gate=gate) else 1
+        results: list[bool] = []
+        threads = []
+        for slot_index in range(1, concurrency + 1):
+            slot_client = DopeClient(worker_id=report_slot_worker_id(client.worker_id, slot_index, concurrency))
+            thread = threading.Thread(
+                target=lambda c=slot_client: results.append(process_one(c, dry_run=args.dry_run, gate=gate)),
+                name=f"dope-report-once-{slot_index}",
+            )
+            thread.start()
+            threads.append(thread)
+        for thread in threads:
+            thread.join()
+        return 0 if any(results) else 1
 
-    while True:
-        process_one(client)
-        time.sleep(max(args.poll_seconds, 2.0))
+    if concurrency <= 1:
+        while True:
+            process_one(client, gate=gate)
+            time.sleep(max(args.poll_seconds, 2.0))
+
+    threads = []
+    for slot_index in range(1, concurrency + 1):
+        thread = threading.Thread(
+            target=report_worker_loop,
+            args=(slot_index, concurrency, args, gate),
+            name=f"dope-report-worker-{slot_index}",
+            daemon=False,
+        )
+        thread.start()
+        threads.append(thread)
+
+    for thread in threads:
+        thread.join()
+    return 0
 
 
 if __name__ == "__main__":

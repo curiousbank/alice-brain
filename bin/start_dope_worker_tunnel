@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+set -a
+[[ -f "$ROOT_DIR/.env" ]] && source "$ROOT_DIR/.env"
+for env_file in "$HOME/.config/autos/alice.env" "$HOME/.config/autos/dope.env"; do
+  [[ -f "$env_file" ]] && source "$env_file"
+done
+set +a
+
+SSH_TARGET="${DVE_SMS_TUNNEL_SSH_TARGET:-sun-dev}"
+LOCAL_PORT="${DVE_SMS_TUNNEL_PORT:-18182}"
+REMOTE_HOST="${DVE_SMS_TUNNEL_REMOTE_HOST:-127.0.0.1}"
+REMOTE_PORT="${DVE_SMS_TUNNEL_REMOTE_PORT:-8182}"
+
+while true; do
+  ssh \
+    -N \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -L "${LOCAL_PORT}:${REMOTE_HOST}:${REMOTE_PORT}" \
+    "$SSH_TARGET" || true
+  sleep 5
+done

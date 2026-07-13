@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SERVICE_LABEL="com.curiousbank.alice-brain.dope-sms-worker"
+TUNNEL_LABEL="com.curiousbank.alice-brain.dope-worker-tunnel"
+
+require_env() {
+  local env_file="$ROOT_DIR/.env"
+  if [[ ! -f "$env_file" ]]; then
+    echo "Missing $env_file. Copy .env.example to .env and add AUTOS_WORKER_TOKEN first." >&2
+    exit 1
+  fi
+  if ! grep -Eq '^(AUTOS_WORKER_TOKEN|PINBALL_OVEN_TOKEN|AI_OVEN_NODE_TOKEN)=' "$env_file"; then
+    echo "$env_file does not contain an AUTOS_WORKER_TOKEN-style credential." >&2
+    exit 1
+  fi
+}
+
+install_launchd() {
+  local runtime_root="${ALICE_BRAIN_SERVICE_ROOT:-$HOME/.local/share/alice-brain-runtime}"
+  local target="$HOME/Library/LaunchAgents/${SERVICE_LABEL}.plist"
+  local tunnel_target="$HOME/Library/LaunchAgents/${TUNNEL_LABEL}.plist"
+  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs" "$runtime_root"
+  rsync -a --delete \
+    --exclude ".git" \
+    --exclude "log" \
+    --exclude "logs" \
+    --exclude "tmp" \
+    "$ROOT_DIR/" "$runtime_root/"
+  chmod 700 "$runtime_root"
+  chmod +x "$runtime_root/bin/start_dope_sms_worker" "$runtime_root/bin/start_dope_worker_tunnel" "$runtime_root/bin/autos_cc_worker" "$runtime_root/bin/install_dope_sms_worker_service"
+
+  if launch_tunnel_enabled; then
+    sed \
+      -e "s#__ALICE_BRAIN_ROOT__#${runtime_root}#g" \
+      -e "s#__HOME__#${HOME}#g" \
+      "$ROOT_DIR/config/launchd/${TUNNEL_LABEL}.plist" > "$tunnel_target"
+    launchctl bootout "gui/$(id -u)" "$tunnel_target" >/dev/null 2>&1 || true
+    launchctl bootstrap "gui/$(id -u)" "$tunnel_target"
+    launchctl kickstart -k "gui/$(id -u)/${TUNNEL_LABEL}"
+  fi
+
+  sed \
+    -e "s#__ALICE_BRAIN_ROOT__#${runtime_root}#g" \
+    -e "s#__HOME__#${HOME}#g" \
+    "$ROOT_DIR/config/launchd/${SERVICE_LABEL}.plist" > "$target"
+
+  launchctl bootout "gui/$(id -u)" "$target" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$target"
+  launchctl kickstart -k "gui/$(id -u)/${SERVICE_LABEL}"
+  echo "Installed and started launchd service: $SERVICE_LABEL"
+  if launch_tunnel_enabled; then
+    echo "Installed and started launchd tunnel: $TUNNEL_LABEL"
+  fi
+  echo "Runtime copy: $runtime_root"
+  echo "Logs: $HOME/Library/Logs/alice-brain-dope-sms-worker.log"
+}
+
+install_systemd() {
+  local user_dir="$HOME/.config/systemd/user"
+  local target="$user_dir/dope-sms-worker.service"
+  local tunnel_target="$user_dir/dope-worker-tunnel.service"
+  mkdir -p "$user_dir"
+  if launch_tunnel_enabled; then
+    cp "$ROOT_DIR/config/systemd/dope-worker-tunnel.service" "$tunnel_target"
+  fi
+  cp "$ROOT_DIR/config/systemd/dope-sms-worker.service" "$target"
+  systemctl --user daemon-reload
+  if launch_tunnel_enabled; then
+    systemctl --user enable --now dope-worker-tunnel.service
+  fi
+  systemctl --user enable --now dope-sms-worker.service
+  echo "Installed and started systemd user service: dope-sms-worker.service"
+  systemctl --user status dope-sms-worker.service --no-pager | sed -n '1,12p'
+}
+
+launch_tunnel_enabled() {
+  [[ "${DVE_SMS_TUNNEL_ENABLED:-0}" =~ ^(1|true|yes|on)$ ]]
+}
+
+require_env
+set -a
+[[ -f "$ROOT_DIR/.env" ]] && source "$ROOT_DIR/.env"
+for env_file in "$HOME/.config/autos/alice.env" "$HOME/.config/autos/dope.env"; do
+  [[ -f "$env_file" ]] && source "$env_file"
+done
+set +a
+
+case "$(uname -s)" in
+  Darwin)
+    install_launchd
+    ;;
+  Linux)
+    install_systemd
+    ;;
+  *)
+    echo "Unsupported OS: $(uname -s)" >&2
+    exit 1
+    ;;
+esac

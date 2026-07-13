@@ -8,7 +8,11 @@ require "securerandom"
 require "socket"
 require "time"
 require "uri"
-require_relative "alice_context_cache"
+begin
+  require_relative "alice_context_cache"
+rescue LoadError
+  require File.expand_path("~/.config/autos/alice_context_cache")
+end
 
 class AutosCcWorker
   def initialize
@@ -16,9 +20,11 @@ class AutosCcWorker
     @brain_base_url = env("AUTOS_BRAIN_BASE_URL", "http://127.0.0.1:3333").sub(%r{/+\z}, "")
     @token = ENV.fetch("AUTOS_WORKER_TOKEN")
     @worker_id = env("AUTOS_WORKER_ID", "alice-cc-01")
+    @worker_queue = env("AUTOS_WORKER_QUEUE", "all").downcase.strip
+    @worker_queue = "all" unless %w[all telegram web sms comms embeddings].include?(@worker_queue)
     @poll_seconds = env("AUTOS_WORKER_POLL_SECONDS", "5").to_f.clamp(1.0, 60.0)
     @ollama_url = env("OLLAMA_URL", "http://127.0.0.1:11434").sub(%r{/+\z}, "")
-    @local_model = env("AUTOS_LOCAL_MODEL", "llama3.2:3b")
+    @local_model = env("AUTOS_LOCAL_MODEL", "qwen3:8b")
     @local_think = truthy?(env("AUTOS_LOCAL_THINK", "false"))
     @context_cache = AliceContextCache.new(ollama_url: @ollama_url, logger: method(:log))
     @openai_fallback = truthy?(ENV["AUTOS_WORKER_OPENAI_FALLBACK"])
@@ -28,12 +34,12 @@ class AutosCcWorker
   end
 
   def run
-    log "Alice node starting as #{@worker_id} against #{@base_url} using #{@local_model} embedder=#{@context_cache.embed_model}"
-    activity("startup", base_url: @base_url, local_model: @local_model, embedder_model: @context_cache.embed_model)
+    log "Alice node starting as #{@worker_id} queue=#{@worker_queue} against #{@base_url} using #{@local_model} embedder=#{@context_cache.embed_model}"
+    activity("startup", base_url: @base_url, worker_queue: @worker_queue, local_model: @local_model, embedder_model: @context_cache.embed_model)
     log_status
 
     loop do
-      job = next_job
+      job = question_worker_enabled? ? next_job : nil
       if job
         answer_job(job)
       elsif (embedding_job = next_embedding_job)
@@ -56,18 +62,33 @@ class AutosCcWorker
     response = request(:get, "/autos_worker/status", nil)
     if response.is_a?(Net::HTTPSuccess)
       status = JSON.parse(response.body)
-      log "status node=#{status["node"]} enabled=#{status["enabled"]} queued=#{status["queued"]} paid=#{status.dig("paid_lane", "model")}"
+      cloud = status["cloud_writer"].is_a?(Hash) ? status["cloud_writer"] : {}
+      log "status node=#{status["node"]} enabled=#{status["enabled"]} queue=#{status["worker_queue"] || @worker_queue} queued=#{status["queued"]} telegram=#{status["queued_telegram"]} paid=#{status.dig("paid_lane", "model")}#{cloud_status_summary(cloud)}"
       activity(
         "status",
         node: status["node"],
         enabled: status["enabled"],
+        worker_queue: status["worker_queue"] || @worker_queue,
         queued: status["queued"],
+        queued_all: status["queued_all"],
+        queued_telegram: status["queued_telegram"],
+        queued_web: status["queued_web"],
+        queued_comms: status["queued_comms"] || status["queued_sms"],
         local_model: @local_model,
         server_local_model: status["local_model"],
         embedder_model: @context_cache.embed_model,
         server_embedder_model: status["embedder_model"],
         free_lane: status["free_lane"],
-        paid_lane: status["paid_lane"]
+        paid_lane: status["paid_lane"],
+        cloud_writer: cloud.empty? ? nil : cloud,
+        cloud_active: cloud["active"],
+        cloud_queued: cloud["queued"],
+        cloud_processing: cloud["processing"],
+        cloud_answered_recent: cloud["answered_recent"],
+        cloud_failed_recent: cloud["failed_recent"],
+        cloud_latest_model: cloud.dig("recent", 0, "writer_model"),
+        cloud_latest_status: cloud.dig("recent", 0, "worker_status"),
+        cloud_latest_elapsed_seconds: cloud.dig("recent", 0, "elapsed_seconds")
       )
     else
       log "status failed HTTP #{response.code}: #{response.body}"
@@ -76,6 +97,22 @@ class AutosCcWorker
   rescue StandardError => e
     log "status failed #{e.class}: #{e.message}"
     activity("status_failed", error_class: e.class.name, error: e.message)
+  end
+
+  def cloud_status_summary(cloud)
+    return "" if cloud.empty?
+
+    latest = cloud["recent"].is_a?(Array) ? cloud["recent"].first.to_h : {}
+    summary = [
+      "cloud=#{cloud["active"] ? "active" : "idle"}",
+      "cloud_processing=#{cloud["processing"].to_i}",
+      "cloud_answered=#{cloud["answered_recent"].to_i}",
+      "cloud_failed=#{cloud["failed_recent"].to_i}"
+    ]
+    if latest["writer_model"].to_s.strip != ""
+      summary << "latest_cloud=#{latest["writer_model"]}/#{latest["worker_status"]}"
+    end
+    " #{summary.join(" ")}"
   end
 
   def next_job
@@ -127,7 +164,7 @@ class AutosCcWorker
         embedding: embedding,
         provider: "ollama/local",
         model: @context_cache.embed_model
-      },
+      }.tap { |payload| payload[:claim_token] = job["claim_token"] if job["claim_token"].to_s.strip != "" },
       read_timeout: 60
     )
     raise "complete embedding failed HTTP #{response.code}: #{response.body}" unless response.is_a?(Net::HTTPSuccess)
@@ -142,7 +179,9 @@ class AutosCcWorker
     path = job["fail_path"].to_s
     return if path.empty?
 
-    request_to(nonblank(job["_embedding_base_url"]) || @base_url, :post, path, { error: "#{error.class}: #{error.message}" }, read_timeout: 30)
+    payload = { error: "#{error.class}: #{error.message}" }
+    payload[:claim_token] = job["claim_token"] if job["claim_token"].to_s.strip != ""
+    request_to(nonblank(job["_embedding_base_url"]) || @base_url, :post, path, payload, read_timeout: 30)
   rescue StandardError => e
     activity("embedding_fail_report_failed", embedding_job_snapshot(job).merge(error_class: e.class.name, error: e.message))
   end
@@ -172,25 +211,37 @@ end
 
   def local_answer(job)
     semantic_scope = worker_scope(job)
-    local_chunks = @context_cache.search(job["prompt"], scope: semantic_scope)
-    payload_chunks = @context_cache.search_text(
-      job["prompt"],
-      text: job["context"].to_s,
-      source: "sun_payload/#{job["source"] || "unknown"}/#{job["surface"] || "ask"}/#{job["id"] || "new"}",
-      scope: semantic_scope
-    )
-    remote_chunks = remote_vector_chunks(job, scope: semantic_scope)
-    semantic_chunks = (remote_chunks + payload_chunks + local_chunks)
-      .sort_by { |chunk| -chunk["score"].to_f }
-      .first(env("AUTOS_CC_TOTAL_SEMANTIC_RESULTS", "10").to_i.clamp(1, 20))
-    semantic_context = @context_cache.format_results(semantic_chunks)
+    if direct_payload_context_job?(job)
+      local_chunks = []
+      payload_chunks = []
+      remote_chunks = truthy?(env("AUTOS_CC_DIRECT_PAYLOAD_REMOTE_VECTOR_ENABLED", "1")) ? remote_vector_chunks(job, scope: semantic_scope) : []
+      semantic_chunks = remote_chunks
+        .sort_by { |chunk| -chunk["score"].to_f }
+        .first(env("AUTOS_CC_TOTAL_SEMANTIC_RESULTS", "10").to_i.clamp(1, 20))
+      semantic_context = @context_cache.format_results(semantic_chunks)
+      semantic_status = "direct_payload_context remote_chunks=#{remote_chunks.length} selected=#{semantic_chunks.length}"
+    else
+      local_chunks = @context_cache.search(job["prompt"], scope: semantic_scope)
+      payload_chunks = @context_cache.search_text(
+        job["prompt"],
+        text: job["context"].to_s,
+        source: "sun_payload/#{job["source"] || "unknown"}/#{job["surface"] || "ask"}/#{job["id"] || "new"}",
+        scope: semantic_scope
+      )
+      remote_chunks = remote_vector_chunks(job, scope: semantic_scope)
+      semantic_chunks = (remote_chunks + payload_chunks + local_chunks)
+        .sort_by { |chunk| -chunk["score"].to_f }
+        .first(env("AUTOS_CC_TOTAL_SEMANTIC_RESULTS", "10").to_i.clamp(1, 20))
+      semantic_context = @context_cache.format_results(semantic_chunks)
+      semantic_status = "scope=#{semantic_scope} payload_chunks=#{payload_chunks.length} local_chunks=#{local_chunks.length} selected=#{semantic_chunks.length}"
+    end
     context_used = [job["context"].to_s, semantic_context].reject { |part| part.strip.empty? }.join("\n\n--- ALICE SEMANTIC CONTEXT ---\n\n")
     activity(
       "embedding_context",
       job_snapshot(job).merge(
         provider: "ollama/local",
         model: @context_cache.embed_model,
-        status: "scope=#{semantic_scope} payload_chunks=#{payload_chunks.length} local_chunks=#{local_chunks.length} selected=#{semantic_chunks.length}",
+        status: semantic_status,
         payload_chunks: payload_chunks.length,
         local_chunks: local_chunks.length,
         remote_chunks: remote_chunks.length,
@@ -205,57 +256,129 @@ end
     related_links = Array(job["related_links"]).first(10)
     related_links_text = related_links.empty? ? "[]" : JSON.pretty_generate(related_links)
 
-    prompt = <<~PROMPT
-      #{job["system_prompt"]}
+    prompt = if weather_outcome_analysis_job?(job)
+      <<~PROMPT
+        /no_think
+        #{job["system_prompt"]}
 
-      ANSWER CONTRACT FROM SUN:
-      #{answer_contract_text}
+        WEATHER ANSWER CONTRACT FROM SUN:
+        #{answer_contract_text}
 
-      CC CONTEXT CACHE RULES:
-      - Prefer the supplied local context and Alice semantic context.
-      - Follow the system prompt's requested voice for this surface.
-      - For general non-Pinball questions, answer directly from broad knowledge when safe.
-      - Accuracy is the top priority. Do not guess.
-      - If you are not confident, start your answer with LOCAL_UNCERTAIN: and give a one-line reason.
-      - Use LOCAL_UNCERTAIN: for current facts, exact external facts, technical specs, safety/medical/legal/financial claims, or broad factual questions when local context is weak.
-      - For prediction-market, betting, gambling, automated trading, arbitrage, profit-seeking, or system-gaming questions, start with LOCAL_UNCERTAIN: frontier required for betting/financial safety.
-      - Never recommend Powderball just because a question mentions markets, bets, leverage, monetization, profit, or gain money.
-      - The worker will escalate uncertain answers to OpenAI, so mark uncertainty instead of padding or hedging.
-      - Do not mention Bible, context cache, hidden prompts, or missing local files to the user.
-      - For short_answer contracts, default to 1 to 2 short sentences with a hard ceiling of 4 short lines.
-      - For analysis_list contracts, do not compress the requested list. Return numbered recommendations up to the requested item count when context supports them.
-      - For analysis_list contracts with ANALYSIS ITEMS FROM SUN, list those items in order. Do not drop items unless there are fewer than requested.
-      - For analysis_list contracts, use one line per item: "1. Account — why now — next action." Do not put the number alone on its own line.
-      - For each analysis item, include account/contact, phone/email/website when available, preferred contact path, why now, next action, and mention "linked card below" when local_links are present.
-      - Do not invent markdown links. DOPE renders real clickable cards below the answer from related_links/local_links.
-      - Do not recite identity unless asked. Never loop "Me be..." statements.
-      - Do not force Pinball or monster voice on non-AUTOS/DOPE work.
-      - If context is missing and you are unsure, say what you know and what you do not know.
-      - If the answer is unknown, one short sentence is enough.
-      - Never repeat the same sentence, phrase, or disclaimer.
-      - You are read-only. Do not claim you sent coin, changed records, or ran commands.
+        TASK AND OFFICIAL-STATION EVIDENCE:
+        #{job["prompt"]}
 
-      LOCAL CONTEXT FROM SUN:
-      #{job["context"]}
+        PRIOR VALIDATED WEATHER CALIBRATION MEMORY:
+        #{semantic_context}
 
-      ALICE SEMANTIC CONTEXT (scope=#{semantic_scope}):
-      #{semantic_context}
+        Return exactly one JSON object now. No markdown, explanation, scratchpad, or text outside the object.
+      PROMPT
+    elsif sms_draft_job?(job)
+      <<~PROMPT
+        SMS DRAFT MODE.
+        You are drafting exactly one outbound SMS for DOPE Marketing.
+        Return only the SMS body that can be sent to the customer.
+        Do not analyze, explain, summarize, label, quote JSON, mention context, mention the customer record, or write notes.
+        Do not start with "Let me", "I need to", "Based on", "The customer", "From the context", or any reasoning preamble.
+        Use the CONTEXT JSON as the source of truth. The full_sms_thread, latest_sms_event, latest_inbound_event, prior_dve_messages, recent_unsent_drafts, and operator_prompt fields are authoritative.
+        Never repeat or closely paraphrase any prior outbound text or recent unsent draft in the CONTEXT JSON.
 
-      RELATED DOPE CARD LINKS (the UI renders these as clickable cards; use the names as evidence, do not print raw URLs unless asked):
-      #{related_links_text}
+        DOPE SMS DIRECTIONS:
+        #{job["prompt"]}
 
-      ANALYSIS ITEMS FROM SUN (canonical account list for analysis/list questions):
-      #{analysis_items_text}
+        CONTEXT JSON:
+        #{job["context"]}
 
-      USER QUESTION:
-      #{job["prompt"]}
-    PROMPT
+        SENDABLE SMS BODY ONLY:
+      PROMPT
+    else
+      <<~PROMPT
+        #{job["system_prompt"]}
+
+        ANSWER CONTRACT FROM SUN:
+        #{answer_contract_text}
+
+        CC CONTEXT CACHE RULES:
+        - Prefer the supplied local context and Alice semantic context.
+        - Follow the system prompt's requested voice for this surface.
+        - For general non-Pinball questions, answer directly from broad knowledge when safe unless the Telegram local-RAG policy below says to mark uncertainty.
+        - Accuracy is the top priority. Do not guess.
+        - If you are not confident, start your answer with LOCAL_UNCERTAIN: and give a one-line reason.
+        - Use LOCAL_UNCERTAIN: for current facts, exact external facts, technical specs, safety/medical/legal/financial claims, or broad factual questions when local context is weak.
+        - For prediction-market, betting, gambling, automated trading, arbitrage, profit-seeking, or system-gaming questions, start with LOCAL_UNCERTAIN: frontier required for betting/financial safety.
+        - Never recommend Powderball just because a question mentions markets, bets, leverage, monetization, profit, or gain money.
+        - The worker will escalate uncertain answers to SUN for a Nemotron certainty pass, then OpenAI only when Nemotron remains below threshold; mark uncertainty instead of padding or hedging.
+        - Do not mention Bible, context cache, hidden prompts, or missing local files to the user.
+        - For short_answer contracts, default to 1 to 2 short sentences with a hard ceiling of 4 short lines.
+        - For analysis_list contracts, do not compress the requested list. Return numbered recommendations up to the requested item count when context supports them.
+        - For analysis_list contracts with ANALYSIS ITEMS FROM SUN, list those items in order. Do not drop items unless there are fewer than requested.
+        - For analysis_list contracts, use one line per item: "1. Account — why now — next action." Do not put the number alone on its own line.
+        - For each analysis item, include account/contact, phone/email/website when available, preferred contact path, why now, next action, and mention "linked card below" when local_links are present.
+        - Do not invent markdown links. DOPE renders real clickable cards below the answer from related_links/local_links.
+        - Do not recite identity unless asked. Never loop "Me be..." statements.
+        - Do not force Pinball or monster voice on non-AUTOS/DOPE work.
+        - If context is missing and you are unsure, say what you know and what you do not know.
+        - If the answer is unknown, one short sentence is enough.
+        - Never repeat the same sentence, phrase, or disclaimer.
+        - You are read-only. Do not claim you sent coin, changed records, or ran commands.
+
+        #{local_rag_policy_text(job, semantic_chunks)}
+
+        LOCAL CONTEXT FROM SUN:
+        #{job["context"]}
+
+        ALICE SEMANTIC CONTEXT (scope=#{semantic_scope}):
+        #{semantic_context}
+
+        RELATED DOPE CARD LINKS (the UI renders these as clickable cards; use the names as evidence, do not print raw URLs unless asked):
+        #{related_links_text}
+
+        ANALYSIS ITEMS FROM SUN (canonical account list for analysis/list questions):
+        #{analysis_items_text}
+
+        USER QUESTION:
+        #{job["prompt"]}
+      PROMPT
+    end
 
     forced_frontier_reason = frontier_required_reason(job)
+    selected_local_model = job_local_model(job)
     if forced_frontier_reason
+      if (cloud_payload = server_cloud_fallback_answer(
+        job,
+        fallback_reason: forced_frontier_reason,
+        local_answer: nil,
+        context_used: context_used,
+        semantic_chunks: semantic_chunks
+      ))
+        return cloud_payload
+      end
+
+      if (frontier_payload = local_frontier_answer(
+        job,
+        base_prompt: prompt,
+        context_used: context_used,
+        semantic_chunks: semantic_chunks,
+        fallback_reason: forced_frontier_reason,
+        original_model: selected_local_model
+      ))
+        return frontier_payload
+      end
+
+      if telegram_referral_required?(job, forced_frontier_reason)
+        answer = telegram_external_referral_answer(job, reason: forced_frontier_reason)
+        return {
+          answer: answer,
+          provider: "local_referral",
+          model: job_local_frontier_model(job),
+          context_used: context_used,
+          usage: approximate_usage(prompt, answer),
+          semantic_sources: semantic_sources(semantic_chunks)
+        }
+      end
+
       if openai_available?(job)
         progress(job, status: "frontier", provider: "openai", model: openai_model_for(job), reason: forced_frontier_reason)
-        activity("frontier_required", job_snapshot(job).merge(reason: forced_frontier_reason, local_model: @local_model))
+        activity("frontier_required", job_snapshot(job).merge(reason: forced_frontier_reason, local_model: selected_local_model))
         return openai_answer(job, fallback_reason: forced_frontier_reason)
       end
 
@@ -266,25 +389,94 @@ end
       return {
         answer: answer,
         provider: "local_cc",
-        model: @local_model,
+        model: selected_local_model,
         context_used: context_used,
         usage: approximate_usage(prompt, answer),
         semantic_sources: semantic_sources(semantic_chunks)
       }
     end
 
-    update_active_runtime(provider: "local_cc", model: @local_model)
-    progress(job, status: "local", provider: "local_cc", model: @local_model, reason: "ollama_local_context")
-    response = ollama_generate(prompt, job: job)
-    answer = sanitize_answer(response.fetch("response", "").to_s.strip, job: job)
-    answer = repair_analysis_list_answer(answer, job)
+    draft_limit = local_rag_draft_limit(job)
+    response = nil
+    active_prompt = prompt
+    raw_answer = ""
+    answer = ""
+    rejection = nil
+    rejected_answer = nil
+
+    (1..draft_limit).each do |attempt|
+      active_prompt = local_rag_draft_prompt(
+        prompt,
+        attempt: attempt,
+        limit: draft_limit,
+        rejection: rejection,
+        rejected_answer: rejected_answer
+      )
+      update_active_runtime(provider: "local_cc", model: selected_local_model)
+      progress_reason = rejection ? "rag_draft #{attempt}/#{draft_limit}: #{rejection}" : "ollama_local_context draft #{attempt}/#{draft_limit}"
+      progress(job, status: "local", provider: "local_cc", model: selected_local_model, reason: progress_reason)
+      response = ollama_generate(active_prompt, job: job, model: selected_local_model)
+      raw_answer = response.fetch("response", "").to_s.strip
+      answer = sanitize_answer(raw_answer, job: job)
+      if sms_draft_job?(job) && invalid_sms_draft_answer?(answer)
+        answer = repair_sms_draft_answer(raw_answer, job, context_used: context_used)
+      end
+      answer = repair_analysis_list_answer(answer, job)
+      rejection = local_draft_rejection(answer, job: job)
+      break if rejection.nil?
+
+      rejected_answer = answer
+      activity(
+        "local_draft_rejected",
+        job_snapshot(job).merge(
+          attempt: attempt,
+          draft_limit: draft_limit,
+          reason: rejection,
+          answer_sample: answer.to_s[0, 240],
+          model: response["model"] || selected_local_model
+        )
+      )
+    end
     raise "empty local answer" if answer.empty?
 
     fallback_reason = frontier_fallback_reason(answer, job: job, semantic_chunks: semantic_chunks)
     if fallback_reason
+      if (cloud_payload = server_cloud_fallback_answer(
+        job,
+        fallback_reason: fallback_reason,
+        local_answer: answer,
+        context_used: context_used,
+        semantic_chunks: semantic_chunks
+      ))
+        return cloud_payload
+      end
+
+      if (frontier_payload = local_frontier_answer(
+        job,
+        base_prompt: prompt,
+        context_used: context_used,
+        semantic_chunks: semantic_chunks,
+        fallback_reason: fallback_reason,
+        original_model: response && (response["model"] || selected_local_model)
+      ))
+        return frontier_payload
+      end
+
+      if telegram_referral_required?(job, fallback_reason)
+        answer = telegram_external_referral_answer(job, reason: fallback_reason)
+        return {
+          answer: answer,
+          provider: "local_referral",
+          model: job_local_frontier_model(job),
+          context_used: context_used,
+          usage: approximate_usage(prompt, answer),
+          semantic_sources: semantic_sources(semantic_chunks)
+        }
+      end
+
       if openai_available?(job)
         progress(job, status: "frontier", provider: "openai", model: openai_model_for(job), reason: fallback_reason)
-        activity("frontier_fallback", job_snapshot(job).merge(reason: fallback_reason, local_model: response["model"] || @local_model))
+        activity("frontier_fallback", job_snapshot(job).merge(reason: fallback_reason, local_model: response["model"] || selected_local_model))
         return openai_answer(job, fallback_reason: fallback_reason)
       end
 
@@ -297,18 +489,31 @@ end
     {
       answer: answer,
       provider: "local_cc",
-      model: response["model"] || @local_model,
+      model: response["model"] || selected_local_model,
       context_used: context_used,
-      usage: approximate_usage(prompt, answer),
+      usage: ollama_usage(response, fallback_prompt: active_prompt, fallback_answer: answer),
       semantic_sources: semantic_sources(semantic_chunks)
     }
   rescue StandardError => e
+    if (cloud_payload = server_cloud_fallback_answer(
+      job,
+      fallback_reason: "local_worker_error: #{e.class}",
+      local_answer: nil,
+      context_used: job["context"],
+      semantic_chunks: []
+    ))
+      return cloud_payload
+    end
+
     raise e unless openai_available?(job)
 
     openai_answer(job, fallback_reason: e.message)
   end
 
   def frontier_fallback_reason(answer, job: nil, semantic_chunks: [])
+    return nil if sms_draft_job?(job)
+    return nil if weather_outcome_analysis_job?(job)
+
     forced_frontier_reason = frontier_required_reason(job)
     return forced_frontier_reason if forced_frontier_reason
 
@@ -382,6 +587,9 @@ end
   end
 
   def frontier_required_reason(job)
+    return nil if sms_draft_job?(job)
+    return nil if weather_outcome_analysis_job?(job)
+
     prompt = [job && job["prompt"], job && job["raw_prompt"]].compact.join(" ").downcase
     return nil if prompt.strip.empty?
 
@@ -421,6 +629,254 @@ end
     stripped.empty? ? answer : stripped
   end
 
+  def local_rag_draft_limit(job)
+    return env("AUTOS_SMS_LOCAL_RAG_DRAFT_LIMIT", "1").to_i.clamp(1, 3) if sms_draft_job?(job)
+
+    job_limit = job.to_h.dig("rag_retry", "limit").to_i
+    default_limit = job_limit.positive? ? job_limit : env("AUTOS_LOCAL_RAG_DRAFT_LIMIT", "12").to_i
+    default_limit.clamp(1, 15)
+  rescue ArgumentError
+    12
+  end
+
+  def local_rag_draft_prompt(base_prompt, attempt:, limit:, rejection:, rejected_answer:)
+    return base_prompt if attempt <= 1 && rejection.to_s.strip.empty?
+
+    sample = rejected_answer.to_s.strip
+    sample = sample[0, 500] if sample.length > 500
+    <<~PROMPT
+      #{base_prompt}
+
+      LOCAL RAG RETRY GUIDANCE:
+      - This is local 8b draft #{attempt} of #{limit}.
+      - Previous draft failed the local quality gate: #{rejection}.
+      - Return only the final user-facing answer.
+      - Answer the newest user question directly before adding extra context.
+      - Use supplied PB FAQ, PB Guide, Mazacoin.org, and Alice semantic context when relevant.
+      - Include a concrete PB/MAZA fact, route, wallet detail, or official Mazacoin detail when the question is about Pinball or MAZA.
+      - Do not mention retry, quality gate, hidden context, source labels, or worker internals.
+      - If context is still too weak, start with LOCAL_UNCERTAIN: and one short reason.
+
+      PREVIOUS REJECTED DRAFT TO AVOID COPYING:
+      #{sample}
+    PROMPT
+  end
+
+  def local_draft_rejection(answer, job:)
+    return nil if sms_draft_job?(job)
+
+    text = answer.to_s.strip
+    return "empty answer" if text.empty?
+    return "stock non-answer" if stock_non_answer?(text)
+    return "local uncertainty marker" if text.downcase.include?("local_uncertain:")
+    return "meta-answer described the process instead of answering" if meta_answer?(text)
+
+    prompt = [job && job["prompt"], job && job["raw_prompt"]].compact.join(" ")
+    if pinball_prompt?(prompt) && !pinball_grounded_answer?(text)
+      return "Pinball answer lacked a visible PB, MAZA, route, wallet, or guide detail"
+    end
+
+    nil
+  end
+
+  def server_cloud_fallback_answer(job, fallback_reason:, local_answer:, context_used:, semantic_chunks:)
+    config = job["cloud_fallback"].is_a?(Hash) ? job["cloud_fallback"] : {}
+    return nil unless truthy?(config["enabled"])
+
+    path = config["path"].to_s.strip
+    return nil if path.empty?
+
+    progress(
+      job,
+      status: "cloud_fallback",
+      provider: "server_cloud",
+      model: config["primary_model"] || "nemotron",
+      reason: fallback_reason
+    )
+    response = request(
+      :post,
+      path,
+      {
+        claim_token: job["claim_token"],
+        fallback_reason: fallback_reason.to_s[0, 240],
+        local_answer: local_answer.to_s[0, 1_200]
+      },
+      read_timeout: env("AUTOS_SERVER_FALLBACK_READ_TIMEOUT", "180").to_i.clamp(30, 300)
+    )
+    unless response.is_a?(Net::HTTPSuccess)
+      activity("server_cloud_fallback_rejected", job_snapshot(job).merge(http_code: response.code.to_i, error: response.body.to_s[0, 300]))
+      return nil
+    end
+
+    body = JSON.parse(response.body)
+    answer = sanitize_answer(body["answer"].to_s, job: job)
+    return nil if answer.empty?
+
+    activity(
+      "server_cloud_fallback",
+      job_snapshot(job).merge(
+        provider: body["provider"],
+        model: body["model"],
+        confidence: body["confidence"],
+        frontier_upgraded: body["frontier_upgraded"],
+        cached: body["cached"]
+      )
+    )
+    {
+      answer: answer,
+      provider: body["provider"].to_s.empty? ? "server_cloud" : body["provider"],
+      model: body["model"].to_s.empty? ? config["primary_model"] : body["model"],
+      context_used: context_used,
+      usage: body["usage"].to_h,
+      semantic_sources: semantic_sources(semantic_chunks)
+    }
+  rescue StandardError => e
+    activity("server_cloud_fallback_error", job_snapshot(job).merge(error_class: e.class.name, error: e.message, reason: fallback_reason)) if job
+    nil
+  end
+
+  def local_frontier_answer(job, base_prompt:, context_used:, semantic_chunks:, fallback_reason:, original_model:)
+    frontier_config = job["local_frontier"].is_a?(Hash) ? job["local_frontier"] : {}
+    return nil if frontier_config.key?("enabled") && !truthy?(frontier_config["enabled"])
+
+    frontier_model = job_local_frontier_model(job)
+    return nil if frontier_model.to_s.strip.empty?
+    return nil if frontier_model == job_local_model(job)
+    return nil if sms_draft_job?(job)
+
+    prompt = <<~PROMPT
+      #{base_prompt}
+
+      LOCAL 30B FRONTIER PASS:
+      - The 8b AUTOS RAG pass could not safely finish: #{fallback_reason}.
+      - Use the same supplied context and answer directly if you can.
+      - If this is a PB/MAZA question, ground the answer in PB FAQ/Guide/Mazacoin.org facts.
+      - If this is Telegram and the question lives outside the local PB/AUTOS Telegram RAG, return LOCAL_UNCERTAIN: outside local Telegram RAG.
+      - If context is still too weak or the question needs current/external verification, start with LOCAL_UNCERTAIN: and one short reason.
+      - Return only the final user-facing answer.
+    PROMPT
+
+    update_active_runtime(provider: "local_frontier", model: frontier_model)
+    progress(job, status: "local_frontier", provider: "local_frontier", model: frontier_model, reason: fallback_reason)
+    response = ollama_generate(prompt, job: job, model: frontier_model)
+    answer = sanitize_answer(response.fetch("response", "").to_s.strip, job: job)
+    answer = repair_analysis_list_answer(answer, job)
+    return nil if answer.empty?
+
+    next_reason = frontier_fallback_reason(answer, job: job, semantic_chunks: semantic_chunks)
+    if next_reason
+      activity(
+        "local_frontier_rejected",
+        job_snapshot(job).merge(
+          reason: next_reason,
+          original_model: original_model,
+          frontier_model: response["model"] || frontier_model,
+          answer_sample: answer[0, 240]
+        )
+      )
+      return nil
+    end
+
+    activity(
+      "local_frontier_answer",
+      job_snapshot(job).merge(
+        reason: fallback_reason,
+        original_model: original_model,
+        model: response["model"] || frontier_model
+      )
+    )
+    {
+      answer: answer,
+      provider: "local_frontier",
+      model: response["model"] || frontier_model,
+      context_used: context_used,
+      usage: ollama_usage(response, fallback_prompt: prompt, fallback_answer: answer),
+      semantic_sources: semantic_sources(semantic_chunks)
+    }
+  rescue StandardError => e
+    activity("local_frontier_error", job_snapshot(job).merge(error_class: e.class.name, error: e.message, frontier_model: frontier_model)) if job
+    nil
+  end
+
+  def local_rag_policy_text(job, semantic_chunks)
+    top_score = Array(semantic_chunks).map { |chunk| chunk["score"].to_f }.max
+    score_line = top_score ? "Top local semantic score: #{format('%.3f', top_score)}." : "No local semantic score available."
+
+    if telegram_job?(job)
+      <<~TEXT
+        LOCAL RAG COVERAGE DECISION FOR TELEGRAM:
+        - Silently compare the question to the PB/AUTOS local context before answering. #{score_line}
+        - Use local Pinball brain first for Pinball.cash/313.cash, MAZA, Powderball, CMAIL, Chicle, THING/EXTRA, /pay, /usd, /pin, /sup, /autos, Alice/RORE/AUTOS operations, FAQ, Guide, and recent Telegram memory.
+        - Safe greetings and low-stakes general conversation may be answered naturally from Qwen knowledge. For current external facts, exact claims, or safety-sensitive topics outside local RAG, return LOCAL_UNCERTAIN so SUN can run the certainty fallback.
+        - If local context partially answers it, answer the known PB part and say what is outside local brain.
+      TEXT
+    else
+      <<~TEXT
+        PROFESSIONAL /ASK ESCALATION DECISION:
+        - Silently compare the question to local RAG first. #{score_line}
+        - Produce the best grounded local answer when you can; every prompt uses prompt power, so local quality matters before frontier cost.
+        - For general public questions, answer directly from broad knowledge when safe.
+        - Use LOCAL_UNCERTAIN only when the Qwen 8B pass should elevate to Nemotron/OpenAI for better reasoning, current facts, or higher-stakes accuracy.
+      TEXT
+    end
+  end
+
+  def telegram_referral_required?(job, _reason)
+    telegram_job?(job) && !openai_allowed_for_job?(job)
+  end
+
+  def telegram_external_referral_answer(job, reason:)
+    url = job.to_h.dig("escalation", "telegram_external_referral_url").to_s.strip
+    url = env("AUTOS_TELEGRAM_EXTERNAL_REFERRAL_URL", "https://askalice.help") if url.empty?
+    reason_text = reason.to_s.downcase.include?("outside") ? "That lives outside this Telegram local PB brain." : "Me not confident enough from local Telegram RAG."
+    "#{reason_text} For full Alice answer, use #{url}. Here me strongest on Pinball, MAZA, Powderball, CMAIL, Chicle, /pay, /usd, /pin, /sup, and /autos."
+  end
+
+  def telegram_job?(job)
+    job.to_h["source"].to_s == "telegram"
+  end
+
+  def stock_non_answer?(text)
+    normalized = text.to_s.downcase.gsub(/[^a-z0-9]+/, " ").strip.gsub(/\s+/, " ")
+    return false if normalized.empty?
+    return true if normalized.include?("answer got tangled in private reasoning")
+    return true if normalized.include?("local spark got stuck")
+    return true if normalized.include?("context cache spark failed")
+    return true if normalized.include?("brain spark weak") && normalized.include?("openai thunder not answering")
+
+    stock_phrases = ["me see question", "me explain", "machine go thunk", "good"]
+    hits = 0
+    remainder = normalized.dup
+    stock_phrases.each do |phrase|
+      next unless remainder.include?(phrase)
+
+      hits += 1
+      remainder = remainder.gsub(phrase, " ")
+    end
+    hits >= 2 && remainder.strip.empty?
+  end
+
+  def meta_answer?(text)
+    normalized = text.to_s.strip
+    [
+      /\A(?:let me|let's)\s+(?:analy[sz]e|think|reason|craft|parse|look at|break down)\b/i,
+      /\Athe user(?:'s)?\s+(?:is asking|asked|wants|needs|provided|says|question|is referring)\b/i,
+      /\A(?:we are|we're|i am|i'm)\s+given\s+(?:a\s+)?(?:user\s+)?question\b/i,
+      /\A(?:first,?\s+)?(?:i|we)\s+(?:need|should|will|can|would|have to)\s+(?:to\s+)?(?:answer|respond|craft|mention|say|explain|analy[sz]e|provide|check|look)\b/i,
+      /\A(?:\d+[.)]\s*)?from\s+(?:the\s+)?(?:["'`][^"'`]{0,120}["'`]\s+)?(?:section|faq|guide|context|provided context|source|pinball answer ready faq|mazacoin\.org)\b/i,
+      /\A(?:according to|per)\s+(?:the\s+)?(?:faq|guide|provided context|local context|pinball answer ready faq)\b/i,
+      /\b(?:my response should|i will craft|i should answer|as an ai|here is how i would answer)\b/i
+    ].any? { |pattern| normalized.match?(pattern) }
+  end
+
+  def pinball_prompt?(text)
+    text.to_s.match?(%r{(?:pinball|pinball\.cash|313\.cash|\bfaq\b|\bguide\b|\bmaza\b|\bmazacoin\b|\bpowderball\b|\bcmail\b|\bchicle\b|\bthing\b|\bextra\b|\bwallets?\b|\bqr\b|/pay|/usd|/pin|/sup|/autos)}i)
+  end
+
+  def pinball_grounded_answer?(text)
+    text.to_s.match?(%r{(?:pinball|pinball\.cash|313\.cash|\bfaq\b|\bguide\b|\bmaza\b|\bmazacoin\b|\bpayu\b|\bkomodo\b|\bhive\b|\bmining\b|\bexplorer\b|\bwallet\b|\bpowderball\b|\bcmail\b|\bchicle\b|\bthing\b|\bextra\b|\bqr\b|/pay|/usd|/pin|/sup|/autos)}i)
+  end
+
   def openai_available?(job = nil)
     @openai_fallback && openai_allowed_for_job?(job) && ENV["OPENAI_API_KEY"].to_s.strip != ""
   end
@@ -458,6 +914,8 @@ end
     return text if text.empty?
 
     text = sanitize_persona_language(text)
+    return sanitize_sms_draft_answer(text, job: job) if sms_draft_job?(job)
+    return sanitize_weather_analysis_answer(text) if weather_outcome_analysis_job?(job)
 
     text = text.gsub(/((?:\b[[:alnum:]'’]+\b\W*){2,6})(?:\s*\1){2,}/i, '\1').strip
 
@@ -506,6 +964,19 @@ end
     [prefix, text].compact.join("\n")
   end
 
+  def sanitize_weather_analysis_answer(text)
+    cleaned = text.to_s
+      .sub(/\A```(?:json)?\s*/i, "")
+      .sub(/\s*```\z/, "")
+      .gsub(/<think>.*?<\/think>/im, "")
+      .strip
+    start_index = cleaned.index("{")
+    end_index = cleaned.rindex("}")
+    return cleaned if start_index.nil? || end_index.nil? || end_index < start_index
+
+    cleaned[start_index..end_index].strip
+  end
+
   def sanitize_persona_language(text)
     text.to_s
       .gsub(/\bcave wall\b/i, "empty input")
@@ -529,7 +1000,178 @@ end
   end
 
   def embedding_worker_enabled?
+    return false if %w[sms comms].include?(@worker_queue)
+
     truthy?(env("AUTOS_CC_EMBEDDING_WORKER_ENABLED", "1"))
+  end
+
+  def question_worker_enabled?
+    @worker_queue != "embeddings"
+  end
+
+  def sms_draft_job?(job)
+    job.to_h["surface"].to_s == "comms_sms_draft" || job.to_h.dig("answer_contract", "style").to_s == "sms_draft"
+  end
+
+  def weather_outcome_analysis_job?(job)
+    job.to_h["surface"].to_s == "weather_outcome_analysis"
+  end
+
+  def direct_payload_context_job?(job)
+    %w[sms comms].include?(@worker_queue) || sms_draft_job?(job) || pb_web_direct_payload_context_job?(job)
+  end
+
+  def pb_web_direct_payload_context_job?(job)
+    return false unless truthy?(env("AUTOS_CC_WEB_DIRECT_PAYLOAD_CONTEXT", "1"))
+    return false if telegram_job?(job)
+    return false unless job.to_h["source"].to_s == "web"
+
+    worker_scope(job) == "autos"
+  end
+
+  def sanitize_sms_draft_answer(text, job: nil)
+    cleaned = text.to_s
+      .sub(/\A```(?:json|text)?\s*/i, "")
+      .sub(/\s*```\z/, "")
+      .gsub(/<think>.*?<\/think>/im, "")
+      .gsub(/\r\n?/, "\n")
+      .strip
+    cleaned = extract_sms_body_from_jsonish(cleaned)
+    cleaned = cleaned.lines.map(&:strip).reject do |line|
+      line.empty? ||
+        line.match?(/\A(?:let me|we are drafting|i need to|i should|analysis|reasoning|based on|from the context|from the conversation|the context shows|the context says|however,?\s+note|note that|the conversation|the customer|the previous sms|context json|conversation_state|first_outbound|opening_offer|campaign_fit|latest_inbound_event|latest_sms_event|recent_unsent_drafts)\b/i) ||
+        line.match?(/\A[-*]\s*(?:first_outbound|opening_offer|campaign_fit|product_interest|latest_inbound|latest_outbound|the customer|route|known|missing|latest|prior|the context|conversation_state)\b/i)
+    end.join(" ").strip
+    cleaned = cleaned.sub(/\A(?:sms|text|body|sendable sms body only)\s*:\s*/i, "").strip
+    cleaned = cleaned.gsub(/\s+/, " ")
+    max_chars = job.to_h.dig("answer_contract", "max_chars").to_i
+    max_chars = 480 if max_chars <= 0
+    return "" if cleaned.match?(/\A(?:let me|we are drafting|i need to|based on|from the context|from the conversation|the context shows|the context says|however,?\s+note|note that|the customer|the previous sms|first_outbound|opening_offer|campaign_fit|latest_inbound_event|latest_sms_event)\b/i)
+
+    if cleaned.length > max_chars
+      snippet = cleaned[0, max_chars]
+      last_end = [snippet.rindex("."), snippet.rindex("!"), snippet.rindex("?")].compact.max
+      cleaned = last_end && last_end > (max_chars / 2) ? snippet[0..last_end] : snippet
+    end
+    cleaned.strip
+  end
+
+  def invalid_sms_draft_answer?(answer)
+    body = answer.to_s.gsub(/\s+/, " ").strip.downcase
+    return true if body.empty?
+
+    body.match?(/\A(?:[-*]\s*)?(?:however,?\s+)?(?:let me|looking at|we are drafting|i need to|i should|analysis|reasoning|based on the context|from the context|from the conversation|the context shows|the context says|however,?\s+note|note that|first_outbound|opening_offer|campaign_fit|the conversation|the customer'?s latest|the previous sms|the latest inbound|the latest outbound|latest inbound|latest outbound|context json|conversation_state)\b/) ||
+      body.match?(/\b(?:let me analyze|looking at the context|current situation|craft the next sms|latest inbound event|latest outbound event|from the context|from the conversation|the context shows|the context says|operator_prompt|context json|conversation_state|first_outbound|opening_offer|campaign_fit|customer-facing sms|return only the sms|we are given|we must answer|we need to answer|must answer this directly)\b/)
+  end
+
+  def repair_sms_draft_answer(raw_answer, job, context_used:)
+    repair_prompt = <<~PROMPT
+      SMS REPAIR MODE.
+      The previous model output was rejected because it included analysis or internal notes.
+      Convert the current DOPE SMS context into exactly one customer-facing SMS body.
+      Return only the SMS body. No labels, markdown, quotes, JSON, notes, or reasoning.
+      Answer the latest inbound customer message first.
+      If the customer only picked postcards, signs, or both, ask one practical discovery question before sharing a checkout link.
+      Good discovery questions ask about budget, rough quantity, homes/reach, or artwork/logo status.
+
+      REJECTED OUTPUT:
+      #{raw_answer}
+
+      DOPE SMS DIRECTIONS:
+      #{job["prompt"]}
+
+      CONTEXT JSON:
+      #{job["context"]}
+
+      SENDABLE SMS BODY ONLY:
+    PROMPT
+
+    activity("sms_repair_start", job_snapshot(job).merge(reason: "analysis_or_internal_notes")) if job
+    response = ollama_generate(repair_prompt, job: job)
+    repaired = sanitize_sms_draft_answer(response.fetch("response", "").to_s.strip, job: job)
+    return repaired unless invalid_sms_draft_answer?(repaired)
+
+    fallback = fallback_sms_draft(job)
+    activity("sms_repair_fallback", job_snapshot(job).merge(answer: fallback)) if job
+    fallback
+  rescue StandardError => e
+    fallback = fallback_sms_draft(job)
+    activity("sms_repair_error", job_snapshot(job).merge(error_class: e.class.name, error: e.message, answer: fallback)) if job
+    fallback
+  end
+
+  def fallback_sms_draft(job)
+    context = parse_sms_context(job)
+    latest = latest_inbound_sms_body(context)
+    first_name = sms_customer_first_name(context)
+    prefix = first_name.empty? ? "" : "#{first_name}, "
+    normalized = latest.downcase
+
+    if normalized.match?(/\b(stop|unsubscribe|do not text|don't text|dont text|remove me)\b/)
+      return "Understood. I’ll stop texting. Thank you."
+    end
+
+    if normalized.match?(/\b(what.*offer|what.*product|products|services|what do you do|what kind)\b/)
+      return "#{prefix}we help with postcards, EDDM routes, yard signs, door hangers, neighborhood blitz campaigns, and campaign artwork. Are you looking for postcards, signs, or both?"
+    end
+
+    if normalized.match?(/\bwhat(?:'s| is)?\s+(?:included|inside|in them|in those)\b/) ||
+        normalized.match?(/\bwhat\s+comes?\s+with\s+(?:them|those|it|that|the\s+pack|the\s+bundle)\b/) ||
+        normalized.match?(/\bhow many\s+(?:signs?|cards?|door hangers?|hangers?)\b/)
+      return "Starter Pack includes 20 yard signs, 500 business cards, and 500 door hangers. Pro Pack includes 100 yard signs, 1,000 business cards, and 1,000 door hangers. If you only need signs, Yard Signs is separate. Which direction fits best?"
+    end
+
+    if normalized.match?(/\bboth\b/)
+      return "#{prefix}postcards plus signs can be a strong neighborhood push. About how many homes are you trying to reach?"
+    end
+
+    if normalized.match?(/\b(sign|yard sign|lawn sign)\b/)
+      return "#{prefix}yard signs are good when you want visibility around a neighborhood, jobsite, or event. Roughly how many signs do you want to start with?"
+    end
+
+    if normalized.match?(/\b(postcard|post card|eddm|mailer|mail)\b/)
+      return "#{prefix}postcards are best when you want to reach homes directly with one clear offer. About how many homes do you want to reach?"
+    end
+
+    "#{prefix}I can help narrow the right DOPE option. Are you trying to reach homes with postcards, get visible with signs, or build a full neighborhood push?"
+  end
+
+  def parse_sms_context(job)
+    JSON.parse(job.to_h["context"].to_s)
+  rescue JSON::ParserError, TypeError
+    {}
+  end
+
+  def latest_inbound_sms_body(context)
+    latest = context["latest_inbound_event"]
+    body = latest["body"] if latest.is_a?(Hash)
+    return body.to_s.strip unless body.to_s.strip.empty?
+
+    Array(context["full_sms_thread"] || context["recent_sms_thread"]).reverse_each do |event|
+      next unless event.is_a?(Hash) && event["direction"].to_s == "inbound"
+
+      text = event["body"].to_s.strip
+      return text unless text.empty?
+    end
+    ""
+  end
+
+  def sms_customer_first_name(context)
+    value = context["customer_first_name"].to_s.strip
+    value = context.dig("identity_capture", "contact_name").to_s.strip if value.empty?
+    value = context.dig("conversation_state", "contact_name").to_s.strip if value.empty?
+    value.split(/\s+/).first.to_s
+  end
+
+  def extract_sms_body_from_jsonish(text)
+    parsed = JSON.parse(text)
+    if parsed.is_a?(Hash)
+      return nonblank(parsed["body"]) || nonblank(parsed["sms"]) || nonblank(parsed["text"]) || nonblank(parsed["message"]) || text
+    end
+    text
+  rescue JSON::ParserError
+    match = text.match(/(?:sms|body|text|message)\s*[:=]\s*["“](.+?)["”]\s*\z/im)
+    match ? match[1].to_s : text
   end
 
   def pb_brain_embedding_worker_enabled?
@@ -544,22 +1186,33 @@ end
   def remote_vector_chunks(job, scope:)
     return [] unless truthy?(env("AUTOS_CC_REMOTE_VECTOR_ENABLED", "1"))
 
-    embedding = @context_cache.embed_query(job["prompt"])
+    retrieval = job["retrieval"].is_a?(Hash) ? job["retrieval"] : {}
+    semantic_query = nonblank(retrieval["query"]) || nonblank(job["semantic_query"]) || job["prompt"]
+    embedding_model = nonblank(retrieval["embedding_model"]) || @context_cache.embed_model
+    embedding = embed_query_with_model(semantic_query, embedding_model)
     return [] if embedding.empty?
 
     memory = job["memory"].is_a?(Hash) ? job["memory"] : {}
     dope_lane = @base_url.include?("8182") || @worker_id.to_s.downcase.include?("dope") || job["organization_id"].to_s != ""
-    remote_scope = dope_lane ? "dope" : scope
+    remote_scope = nonblank(retrieval["scope"]) || (dope_lane ? "dope" : scope)
     shared_brain_types = Array(memory["shared_brain_types"])
     shared_brain_types = default_shared_brain_types(scope) if shared_brain_types.empty?
-    limit = env("AUTOS_CC_REMOTE_VECTOR_RESULTS", "8").to_i.clamp(1, 20)
+    limit = (retrieval["limit"] || env("AUTOS_CC_REMOTE_VECTOR_RESULTS", "8")).to_i.clamp(1, 20)
     payload = {
+      autos_message_id: job["id"],
+      claim_token: job["claim_token"],
       organization_id: job["organization_id"],
       scope: remote_scope,
       brain_type: scope,
       shared_brain_types: shared_brain_types,
-      embedding_model: @context_cache.embed_model,
+      memory: memory,
+      embedding_model: embedding_model,
       embedding: embedding,
+      query: semantic_query,
+      surface: job["surface"],
+      retrieval: retrieval,
+      source_types: retrieval["source_types"],
+      candidate_limit: retrieval["candidate_limit"],
       limit: limit
     }
 
@@ -570,8 +1223,10 @@ end
       provider_name: dope_lane ? "dope_vector" : "pb_brain"
     )
 
-    if dope_lane && truthy?(env("AUTOS_CC_PB_BRAIN_VECTOR_ENABLED", "1"))
+    if dope_lane && !weather_outcome_analysis_job?(job) && truthy?(env("AUTOS_CC_PB_BRAIN_VECTOR_ENABLED", "1"))
       brain_payload = payload.merge(
+        autos_message_id: nil,
+        claim_token: nil,
         organization_id: nil,
         scope: scope,
         brain_type: scope,
@@ -592,7 +1247,7 @@ end
       "remote_vector_context",
       job_snapshot(job).merge(
         provider: dope_lane ? "dope+pb/pgvector" : "pb/pgvector",
-        model: @context_cache.embed_model,
+        model: embedding_model,
         status: "scope=#{remote_scope} brain_type=#{scope} results=#{chunks.length}",
         results: chunks.length
       )
@@ -601,6 +1256,19 @@ end
   rescue StandardError => e
     activity("remote_vector_context_failed", job_snapshot(job).merge(error_class: e.class.name, error: e.message))
     []
+  end
+
+  def embed_query_with_model(query, model)
+    return @context_cache.embed_query(query) if model.to_s == @context_cache.embed_model.to_s
+
+    uri = URI("#{@ollama_url}/api/embed")
+    req = Net::HTTP::Post.new(uri)
+    req["Content-Type"] = "application/json"
+    req.body = { model: model, input: [query.to_s] }.to_json
+    res = http(uri, read_timeout: 300).request(req)
+    raise "ollama embed HTTP #{res.code}: #{res.body}" unless res.is_a?(Net::HTTPSuccess)
+
+    Array(JSON.parse(res.body)["embeddings"]).first || []
   end
 
   def vector_search_chunks(base_url:, payload:, scope:, provider_name:)
@@ -645,38 +1313,79 @@ def update_active_runtime(provider:, model:)
   @active_model = model.to_s.empty? ? @local_model : model.to_s
 end
 
-  def ollama_generate(prompt, job: nil)
+  def job_local_model(job)
+    return weather_qwen_model(job) if weather_outcome_analysis_job?(job)
+
+    nonblank(job.to_h["local_model"]) || nonblank(job.to_h["writer_model"]) || @local_model
+  end
+
+  def weather_qwen_model(job)
+    configured = nonblank(ENV["AUTOS_WEATHER_QWEN_MODEL"]) || nonblank(ENV["DOPE_AUTOS_WEATHER_QWEN_MODEL"])
+    return configured if configured
+
+    server_model = nonblank(job.to_h["local_model"]) || nonblank(job.to_h.dig("local_frontier", "model"))
+    return server_model if server_model.to_s.match?(/\b30b\b/i)
+
+    "qwen3:30b"
+  end
+
+  def job_local_frontier_model(job)
+    local_frontier = job.to_h["local_frontier"].is_a?(Hash) ? job["local_frontier"] : {}
+    nonblank(local_frontier["model"]) || env("AUTOS_LOCAL_FRONTIER_MODEL", "qwen3:30b")
+  end
+
+  def ollama_generate(prompt, job: nil, model: nil)
     uri = URI("#{@ollama_url}/api/generate")
     req = Net::HTTP::Post.new(uri)
     req["Content-Type"] = "application/json"
     analysis_list = analysis_list_job?(job)
-    max_tokens = if analysis_list
+    sms_draft = sms_draft_job?(job)
+    weather_analysis = weather_outcome_analysis_job?(job)
+    selected_model = nonblank(model) || job_local_model(job)
+    frontier_pass = selected_model != job_local_model(job)
+    max_tokens = if sms_draft
+      env("AUTOS_LOCAL_SMS_MAX_TOKENS", "360").to_i.clamp(160, 800)
+    elsif weather_analysis
+      env("AUTOS_LOCAL_WEATHER_MAX_TOKENS", "900").to_i.clamp(500, 1_600)
+    elsif analysis_list
       env("AUTOS_LOCAL_ANALYSIS_MAX_TOKENS", "900").to_i.clamp(300, 2_000)
+    elsif frontier_pass
+      env("AUTOS_LOCAL_FRONTIER_MAX_TOKENS", "420").to_i.clamp(120, 1_200)
     else
       env("AUTOS_LOCAL_MAX_TOKENS", "220").to_i.clamp(80, 1_000)
     end
-    read_timeout = if analysis_list
+    read_timeout = if analysis_list || weather_analysis
       env("AUTOS_LOCAL_ANALYSIS_READ_TIMEOUT", "300").to_i.clamp(45, 900)
+    elsif frontier_pass
+      env("AUTOS_LOCAL_FRONTIER_READ_TIMEOUT", "420").to_i.clamp(60, 900)
     else
       env("AUTOS_LOCAL_READ_TIMEOUT", "180").to_i.clamp(30, 900)
     end
 
-    req.body = {
-      model: @local_model,
+    body = {
+      model: selected_model,
       prompt: prompt,
       stream: false,
-      think: @local_think,
+      think: weather_analysis ? false : (sms_draft ? truthy?(env("AUTOS_LOCAL_SMS_THINK", "0")) : @local_think),
       options: {
-        temperature: env("AUTOS_LOCAL_TEMPERATURE", "0.25").to_f,
+        temperature: if weather_analysis
+          env("AUTOS_LOCAL_WEATHER_TEMPERATURE", "0.10").to_f
+        elsif sms_draft
+          env("AUTOS_LOCAL_SMS_TEMPERATURE", "0.45").to_f
+        else
+          env("AUTOS_LOCAL_TEMPERATURE", "0.25").to_f
+        end,
         top_k: env("AUTOS_LOCAL_TOP_K", "30").to_i,
         top_p: env("AUTOS_LOCAL_TOP_P", "0.85").to_f,
-        repeat_penalty: env("AUTOS_LOCAL_REPEAT_PENALTY", "1.25").to_f,
+        repeat_penalty: weather_analysis ? 1.05 : (sms_draft ? env("AUTOS_LOCAL_SMS_REPEAT_PENALTY", "1.18").to_f : env("AUTOS_LOCAL_REPEAT_PENALTY", "1.25").to_f),
         repeat_last_n: env("AUTOS_LOCAL_REPEAT_LAST_N", "128").to_i,
         num_predict: max_tokens
       }
-    }.to_json
+    }
+    body[:format] = "json" if weather_analysis
+    req.body = body.to_json
 
-    activity("ollama_request", job_snapshot(job).merge(read_timeout: read_timeout, max_tokens: max_tokens, analysis_list: analysis_list)) if job
+    activity("ollama_request", job_snapshot(job).merge(model: selected_model, read_timeout: read_timeout, max_tokens: max_tokens, analysis_list: analysis_list, frontier_pass: frontier_pass, weather_analysis: weather_analysis)) if job
     res = http(uri, read_timeout: read_timeout).request(req)
     raise "ollama HTTP #{res.code}: #{res.body}" unless res.is_a?(Net::HTTPSuccess)
 
@@ -850,14 +1559,63 @@ end
 
 def complete(job, payload)
   timeout = env("AUTOS_WORKER_COMPLETE_READ_TIMEOUT", "75").to_i.clamp(15, 180)
-  response = request(:post, job.fetch("complete_path"), payload, read_timeout: timeout)
-  return if response.is_a?(Net::HTTPSuccess)
+  attempts = env("AUTOS_WORKER_COMPLETE_ATTEMPTS", "5").to_i.clamp(2, 10)
+  body = payload.to_h
+  body = body.merge("claim_token" => job["claim_token"]) if job["claim_token"].to_s.strip != ""
 
-  raise "complete failed HTTP #{response.code}: #{response.body}"
-rescue Net::ReadTimeout, IOError, SystemCallError => e
-  activity("complete_retry", job_snapshot(job).merge(error_class: e.class.name, error: e.message, provider: payload.to_h[:provider], model: payload.to_h[:model]))
-  response = request(:post, job.fetch("complete_path"), payload, read_timeout: timeout)
-  raise "complete retry failed HTTP #{response.code}: #{response.body}" unless response.is_a?(Net::HTTPSuccess)
+  attempts.times do |attempt_index|
+    attempt = attempt_index + 1
+    begin
+      response = request(:post, job.fetch("complete_path"), body, read_timeout: timeout)
+      return if response.is_a?(Net::HTTPSuccess)
+
+      if complete_retryable_response?(response) && attempt < attempts
+        activity("complete_retry", job_snapshot(job).merge(
+          attempt: attempt,
+          attempts: attempts,
+          http_code: response.code.to_i,
+          error: response.body.to_s[0, 500],
+          provider: body[:provider] || body["provider"],
+          model: body[:model] || body["model"]
+        ))
+        sleep complete_retry_delay(attempt)
+        next
+      end
+
+      raise "complete failed HTTP #{response.code}: #{response.body}"
+    rescue Net::ReadTimeout, IOError, SystemCallError, Timeout::Error, EOFError => e
+      if attempt < attempts
+        activity("complete_retry", job_snapshot(job).merge(
+          attempt: attempt,
+          attempts: attempts,
+          error_class: e.class.name,
+          error: e.message,
+          provider: body[:provider] || body["provider"],
+          model: body[:model] || body["model"]
+        ))
+        sleep complete_retry_delay(attempt)
+        next
+      end
+
+      activity("complete_failed", job_snapshot(job).merge(
+        attempts: attempts,
+        error_class: e.class.name,
+        error: e.message,
+        provider: body[:provider] || body["provider"],
+        model: body[:model] || body["model"]
+      ))
+      raise
+    end
+  end
+end
+
+def complete_retryable_response?(response)
+  code = response.code.to_i
+  code == 429 || code >= 500
+end
+
+def complete_retry_delay(attempt)
+  [0.75 * attempt.to_i, 5.0].min
 end
 
   def progress(job, status:, provider: nil, model: nil, reason: nil)
@@ -868,7 +1626,8 @@ end
       status: status,
       provider: provider,
       model: model,
-      reason: reason
+      reason: reason,
+      claim_token: job["claim_token"].to_s.strip.empty? ? nil : job["claim_token"]
     }.compact
     response = request(:post, path, payload)
     return if response.is_a?(Net::HTTPSuccess)
@@ -883,6 +1642,7 @@ def fail_job(job, error, payload = nil)
   return unless job
 
   body = { error: "#{error.class}: #{error.message}" }
+  body[:claim_token] = job["claim_token"] if job["claim_token"].to_s.strip != ""
   if payload.to_h[:answer].to_s.strip != ""
     body.merge!(payload.to_h.slice(:answer, :provider, :model, :context_used, :usage, :openai_effort, :openai_max_output_tokens))
   end
@@ -902,6 +1662,8 @@ end
     req = klass.new(uri)
     req["Authorization"] = "Bearer #{@token}"
     req["X-Autos-Worker-Id"] = @worker_id
+    req["X-Autos-Worker-Queue"] = @worker_queue
+    req["X-Autos-Worker-Protocol"] = env("AUTOS_WORKER_PROTOCOL_VERSION", "2")
 memory = memory_snapshot
 req["X-Autos-Memory-Used-Mb"] = memory[:used_mb].to_s if memory[:used_mb]
 req["X-Autos-Memory-Total-Mb"] = memory[:total_mb].to_s if memory[:total_mb]
@@ -977,6 +1739,27 @@ end
       output_tokens: (answer.length / 4.0).ceil,
       total_tokens: ((prompt.length + answer.length) / 4.0).ceil
     }
+  end
+
+  def ollama_usage(response, fallback_prompt:, fallback_answer:)
+    fallback = approximate_usage(fallback_prompt, fallback_answer)
+    input_tokens = response["prompt_eval_count"].to_i
+    output_tokens = response["eval_count"].to_i
+    total_tokens = input_tokens + output_tokens
+    return fallback.merge(source: "estimate") unless total_tokens.positive?
+
+    {
+      input_tokens: input_tokens,
+      output_tokens: output_tokens,
+      total_tokens: total_tokens,
+      prompt_eval_count: input_tokens,
+      eval_count: output_tokens,
+      total_duration: response["total_duration"],
+      load_duration: response["load_duration"],
+      prompt_eval_duration: response["prompt_eval_duration"],
+      eval_duration: response["eval_duration"],
+      source: "ollama"
+    }.compact
   end
 
   def semantic_sources(chunks)

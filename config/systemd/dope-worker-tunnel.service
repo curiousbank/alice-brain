@@ -1,0 +1,16 @@
+[Unit]
+Description=Alice Brain SSH tunnel to DOPE worker endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Desktop/alice-brain
+ExecStart=%h/Desktop/alice-brain/bin/start_dope_worker_tunnel
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

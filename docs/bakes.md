@@ -1,4 +1,4 @@
-# Bakes And Hourly MAZA Payouts
+# Bakes And 30-Minute MAZA Payouts
 
 Bakes are accepted units of AI work. A worker may request credit for a completed job, but SUN/PB creates the official Bake only after validation.
 
@@ -77,15 +77,15 @@ The Oven Registry can own or display the node and payout records below.
 - `status`: `draft`, `sent`, `failed`
 - `metadata`
 
-## Hourly Thumper Flow
+## 30-Minute Thumper Flow
 
-Run hourly on SUN/PB only:
+Run every 30 minutes on SUN/PB only:
 
 ```text
-Find accepted unpaid ai_bakes for the last closed hour.
+Find accepted unpaid ai_bakes for the last closed 30-minute window.
 Group by maza_address.
 Calculate payout amount from bake_count and configured rate.
-Create one payout batch for the hour.
+Create one payout batch for the window.
 Create one payout row/output per address inside that batch.
 Send one batched MAZA transaction using PB wallet code only if AI_BAKES_PAYOUT_ENABLED=1.
 Mark grouped bakes paid with the shared payout tx_id and each address output_index.
@@ -93,16 +93,16 @@ Mark grouped bakes paid with the shared payout tx_id and each address output_ind
 
 ## Duplicate Address Rule
 
-The payout builder must collapse duplicate addresses before it builds or sends the hourly batch transaction.
+The payout builder must collapse duplicate addresses before it builds or sends the 30-minute batch transaction.
 
 Required behavior:
 
 - normalize and validate every public `maza_address`,
-- group all accepted unpaid bakes by normalized address and closed hourly window,
+- group all accepted unpaid bakes by normalized address and closed 30-minute window,
 - sum `maza_amount` for every bake in the group,
-- create exactly one hourly `ai_bake_payout_batches` row for the closed window,
+- create exactly one `ai_bake_payout_batches` row for the closed 30-minute window,
 - create at most one `ai_bake_payouts` row per address inside that batch,
-- create at most one transaction output per address in the hourly batch transaction,
+- create at most one transaction output per address in the 30-minute batch transaction,
 - mark all grouped bakes paid only after the shared batch transaction has a `tx_id`.
 
 If a payout build sees the same address twice, that is not two payments. It is one address with a larger amount.
@@ -111,7 +111,7 @@ Reference shape:
 
 ```ruby
 groups = accepted_unpaid_bakes.group_by { |bake| normalize_maza_address(bake.maza_address) }
-batch = create_hourly_batch(window_start:, window_end:)
+batch = create_thirty_minute_batch(window_start:, window_end:)
 
 groups.each do |maza_address, bakes|
   total_amount = bakes.sum(&:maza_amount)
@@ -122,12 +122,12 @@ end
 
 If duplicate pending payout rows already exist for the same `batch_id/maza_address`, PB should merge them or void the duplicates before sending. Never send two outputs to the same address in one AI bake payout batch.
 
-## Hourly Batch Transaction
+## 30-Minute Batch Transaction
 
-The preferred payout shape is one MAZA transaction per hour for all active nodes:
+The preferred payout shape is one MAZA transaction every 30 minutes for all active nodes:
 
 ```text
-hourly_ai_bake_batch_tx
+thirty_minute_ai_bake_batch_tx
   output 0 -> node address A, summed payout for address A
   output 1 -> node address B, summed payout for address B
   output 2 -> node address C, summed payout for address C
@@ -135,7 +135,7 @@ hourly_ai_bake_batch_tx
 
 This keeps fees, logs, and explorer review simple. The batch transaction is the payment proof. Each `ai_bake_payouts` row points to the shared `tx_id` plus its own `output_index`.
 
-If the wallet RPC supports a native multi-recipient call such as `sendmany`, PB should use that for the hourly batch. If not, PB should build an equivalent raw transaction with one output per normalized address. Either way, the builder must preflight the output map before signing or sending:
+If the wallet RPC supports a native multi-recipient call such as `sendmany`, PB should use that for the 30-minute batch. If not, PB should build an equivalent raw transaction with one output per normalized address. Either way, the builder must preflight the output map before signing or sending:
 
 ```ruby
 outputs = payouts.each_with_object({}) do |payout, map|
@@ -157,9 +157,14 @@ Default safety:
 ```sh
 AI_BAKES_ENABLED=1
 AI_BAKES_PAYOUT_ENABLED=0
-AI_BAKES_MAZA_PER_BAKE=0.01000
-AI_BAKES_MIN_PAYOUT_MAZA=0.01000
+AI_OVEN_PAYOUT_INTERVAL_MINUTES=30
+AI_OVEN_MAZA_PER_BAKE=5
+AI_OVEN_RESERVE_PERCENT=24
+AI_OVEN_PAYOUT_SOURCE_MAZA_ADDRESS=MNHxyG4ZRD5acR9HAjfWnSFBHMKmCvTGLD
+AI_BAKES_MIN_PAYOUT_MAZA=5
 ```
+
+`AI_BAKES_PAYOUT_ENABLED` should remain `0` until an operator has reviewed the exact dry-run batch outputs. The payout source address is public; wallet keys stay on PB/SUN only.
 
 ## Status For PB
 

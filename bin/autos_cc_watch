@@ -271,6 +271,25 @@ def print_idle_summaries
   end
 end
 
+def cloud_status_suffix(event)
+  cloud = event["cloud_writer"]
+  return "" unless cloud.is_a?(Hash) && !cloud.empty?
+
+  latest_model = event["cloud_latest_model"].to_s.presence ||
+    Array(cloud["recent"]).first.to_h["writer_model"].to_s.presence
+  latest_status = event["cloud_latest_status"].to_s.presence ||
+    Array(cloud["recent"]).first.to_h["worker_status"].to_s.presence
+  latest = [latest_model, latest_status].compact.join("/")
+  bits = [
+    "cloud=#{cloud["active"] ? "active" : "idle"}",
+    "cloud_processing=#{cloud["processing"].to_i}",
+    "cloud_answered=#{cloud["answered_recent"].to_i}",
+    "cloud_failed=#{cloud["failed_recent"].to_i}"
+  ]
+  bits << "latest=#{latest}" if latest.present?
+  " #{bits.join(" ")}"
+end
+
 def render(event, stream_name:, raw:)
   record_state(event, stream_name)
 
@@ -295,7 +314,7 @@ def render(event, stream_name:, raw:)
     else
       server_model = event["server_local_model"]
       suffix = server_model && server_model != event["local_model"] ? " server_model=#{server_model}" : ""
-      puts "[#{time}] #{stream_name} status enabled=#{event["enabled"]} queued=#{event["queued"]} model=#{event["local_model"]}#{suffix}"
+      puts "[#{time}] #{stream_name} status enabled=#{event["enabled"]} queued=#{event["queued"]} model=#{event["local_model"]}#{suffix}#{cloud_status_suffix(event)}"
     end
   when "status_failed"
     puts "[#{time}] #{stream_name} status failed #{event["http_code"] || event["error_class"]}: #{event["body"] || event["error"]}"

@@ -7,6 +7,8 @@ log/
 logs/
 reports/
 tmp/
+*.bak-*
+*.bad-scp-dir-*/
 *.log
 *.jsonl
 *.manifest.json

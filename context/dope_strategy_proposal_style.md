@@ -14,7 +14,7 @@ Default rhythm:
 4. Budget
 5. Measurement & Reporting / Data & Setup / Optional Campaigns & Print / Next Steps
 
-Target length: roughly 5 pages, dense but readable. The report should feel like an account manager could review it with a customer on a call.
+Target length: follow the active report contract first. In normal DOPE jobs, keep the proposal short enough for an account manager to review with a customer on a call: usually 3 to 5 skimmable sections/pages, not a long research report.
 
 ## Visual Rhythm
 
@@ -34,6 +34,8 @@ Target length: roughly 5 pages, dense but readable. The report should feel like 
 - Favor specific operational language: audience, goal, trigger, timing, filters, cadence, tracking, budget, next step.
 - Do not over-explain strategy theory.
 - Do not invent client data. Use placeholders or call out needed setup when the deal payload lacks data.
+- Use the DOPE /map data signals to make the report feel specific: industry, market, service area, status, website, logo/media, related deals, campaign preferences, and CRM/setup gaps.
+- Make it personal and useful, not theatrical. Avoid strange metaphors, mascot voice, hype, or overly clever copy.
 
 ## Section Order
 
@@ -169,4 +171,4 @@ Keep it decisive:
 - Do not copy client names, numbers, dates, geography, CRM, prices, or campaign specifics from the examples into unrelated reports.
 - Prefer proposal pages and practical tables over long narrative sections.
 - Keep recommendations tied to DOPE services: direct mail, postcards, print, EDM/email, landing pages, QR/payment links, CRM follow-up, and human approval.
-- If the job contract explicitly requests a deeper market report, include the proposal structure first, then add deeper analysis as an appendix.
+- If the job contract explicitly requests a deeper market report, include the contract structure first and keep any deeper analysis concise. Do not append local legacy sections unless the contract names them.

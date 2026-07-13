@@ -30,7 +30,7 @@ user registers oven on /ai
   -> SUN/PB shows one-time setup bundle
   -> node saves .env locally and opens outbound tunnels
 SUN/PB queues job
-  -> node polls /next
+  -> node polls /next with X-Autos-Worker-Queue
   -> SUN returns scoped payload and complete/fail/heartbeat endpoints
   -> node runs local embedder/LLM/vision
   -> node creates artifact and manifest
@@ -40,6 +40,14 @@ SUN/PB queues job
   -> SUN updates frontend record
   -> SUN records accepted Bake for MAZA payout
 ```
+
+`X-Autos-Worker-Queue` can be:
+
+- `all`: any PB/AUTOS answer job.
+- `web`: non-Telegram PB/AUTOS answer jobs.
+- `telegram`: Telegram-only PB/AUTOS answer jobs.
+
+Run `telegram` as a second worker process when chat responsiveness matters.
 
 ## Completion Manifest Requirements
 

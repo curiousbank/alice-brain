@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+set -a
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  source "$ROOT_DIR/.env"
+fi
+for env_file in "$HOME/.config/autos/alice.env" "$HOME/.config/autos/dope.env"; do
+  if [[ -f "$env_file" ]]; then
+    source "$env_file"
+  fi
+done
+set +a
+
+if [[ -z "${AUTOS_WORKER_TOKEN:-}" && -d "$HOME/Desktop/DOPE" ]]; then
+  AUTOS_WORKER_TOKEN="$(
+    cd "$HOME/Desktop/DOPE"
+    RAILS_ENV="${RAILS_ENV:-production}" /home/wb/.local/bin/mise exec ruby@3.4.9 -- bundle exec rails runner 'print DopeSettings.autos_worker_token'
+  )"
+  export AUTOS_WORKER_TOKEN
+fi
+
+export AUTOS_WORKER_ID="${DVE_SMS_WORKER_ID:-alice-dope-sms-01}"
+export AUTOS_WORKER_BASE_URL="${DVE_SMS_WORKER_BASE_URL:-${AUTOS_WORKER_BASE_URL:-http://127.0.0.1:8182}}"
+export AUTOS_BRAIN_BASE_URL="${DVE_SMS_BRAIN_BASE_URL:-${AUTOS_BRAIN_BASE_URL:-$AUTOS_WORKER_BASE_URL}}"
+export AUTOS_WORKER_QUEUE="sms"
+export AUTOS_WORKER_POLL_SECONDS="${AUTOS_WORKER_POLL_SECONDS:-1}"
+export AUTOS_LOCAL_MODEL="${DVE_SMS_LOCAL_MODEL:-qwen3:8b}"
+export AUTOS_CC_EMBEDDING_WORKER_ENABLED="0"
+export AUTOS_CC_EMBED_MODEL="${DVE_SMS_EMBED_MODEL:-qwen3-embedding:8b-q4_K_M}"
+export AUTOS_WORKER_ACTIVITY_LOG="$HOME/.config/autos/log/dope_cc_activity.jsonl"
+
+exec "$ROOT_DIR/bin/autos_cc_worker"

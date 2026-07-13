@@ -74,21 +74,37 @@ def bridge_status() -> dict:
     return payload
 
 
-def report_worker_status() -> dict:
-    worker = ROOT / "bin" / "dope_market_report_worker"
-    if not worker.exists():
-        return {"ok": False, "error": "dope_market_report_worker missing"}
-    if not (os.environ.get("DOPE_REPORT_WORKER_TOKEN") or os.environ.get("AUTOS_WORKER_TOKEN")):
-        return {"ok": False, "configured": False, "error": "worker token missing"}
-    code, stdout, stderr = run([str(worker), "--status"], timeout=30)
-    json_start = stdout.find("{")
-    payload_text = stdout[json_start:].strip() if json_start >= 0 else stdout.strip()
+def autos_worker_status() -> dict:
+    token = os.environ.get("AUTOS_WORKER_TOKEN") or os.environ.get("PINBALL_OVEN_TOKEN") or os.environ.get("AI_OVEN_NODE_TOKEN")
+    base_url = (os.environ.get("AUTOS_WORKER_BASE_URL") or "https://313.cash").rstrip("/")
+    worker_id = os.environ.get("AUTOS_WORKER_ID") or os.environ.get("ALICE_NODE_ID") or "alice-local-01"
+    if not token:
+        return {"ok": False, "configured": False, "error": "AUTOS worker token missing"}
+
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        f"{base_url}/autos_worker/status",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Autos-Worker-Id": worker_id,
+            "X-Forwarded-Proto": "https",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
     try:
-        payload = json.loads(payload_text)
-    except json.JSONDecodeError:
-        payload = {"raw": stdout.strip()[:1000], "error": stderr.strip()[:300]}
-    payload["command_exit"] = code
-    return payload
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            payload["ok"] = True
+            payload["base_url"] = base_url
+            payload["worker_id"] = worker_id
+            return payload
+    except urllib.error.HTTPError as error:
+        return {"ok": False, "configured": True, "http_status": error.code, "error": error.read().decode("utf-8", errors="ignore")[:300]}
+    except Exception as error:
+        return {"ok": False, "configured": True, "error": f"{type(error).__name__}: {error}"}
 
 
 def main() -> int:
@@ -101,7 +117,7 @@ def main() -> int:
         load_env(path)
 
     maza_address = os.environ.get("MAZA_ADDRESS", "").strip()
-    node_id = os.environ.get("ALICE_NODE_ID") or os.environ.get("NODE_ID") or os.environ.get("DOPE_REPORT_WORKER_ID") or "alice-local-01"
+    node_id = os.environ.get("ALICE_NODE_ID") or os.environ.get("AI_OVEN_NODE_ID") or os.environ.get("AUTOS_WORKER_ID") or "alice-local-01"
     status = {
         "ok": True,
         "generated_at": now_iso(),
@@ -109,19 +125,22 @@ def main() -> int:
         "maza_address_configured": bool(maza_address),
         "maza_address_hint": f"{maza_address[:8]}...{maza_address[-6:]}" if len(maza_address) > 16 else ("configured" if maza_address else "missing"),
         "tokens": {
-            "dope_report_worker_token": bool(os.environ.get("DOPE_REPORT_WORKER_TOKEN")),
+            "oven_node_token": bool(os.environ.get("AI_OVEN_NODE_TOKEN") or os.environ.get("PINBALL_OVEN_TOKEN")),
             "autos_worker_token": bool(os.environ.get("AUTOS_WORKER_TOKEN")),
         },
         "urls": {
-            "dope_report_worker_base_url": os.environ.get("DOPE_REPORT_WORKER_BASE_URL") or os.environ.get("DOPE_WORKER_BASE_URL"),
             "autos_worker_base_url": os.environ.get("AUTOS_WORKER_BASE_URL"),
             "rore_redis_configured": bool(os.environ.get("AGENT_BRIDGE_REDIS_URL")),
         },
         "ollama": model_map(),
         "rore": bridge_status(),
-        "report_worker": report_worker_status(),
+        "autos_worker": autos_worker_status(),
     }
-    status["ok"] = status["maza_address_configured"] and all(status["ollama"].get("baseline", {}).values())
+    status["ok"] = (
+        status["maza_address_configured"]
+        and all(status["ollama"].get("baseline", {}).values())
+        and status["autos_worker"].get("ok") is True
+    )
     print(json.dumps(status, indent=2, ensure_ascii=True))
     return 0 if status["ok"] else 1
 

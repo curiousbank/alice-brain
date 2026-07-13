@@ -23,7 +23,7 @@ Free web/Telegram prompts can route to CC when enabled:
 
 ```bash
 AUTOS_LOCAL_WORKER_ENABLED=1
-AUTOS_LOCAL_MODEL="llama3.2:3b"
+AUTOS_LOCAL_MODEL="qwen3:8b"
 AUTOS_FREE_MODEL="gpt-5.4"
 AUTOS_FREE_REASONING="xhigh"
 ```
@@ -54,7 +54,7 @@ Install Ollama and pull a small local model:
 ```bash
 brew install ollama
 ollama serve
-ollama pull llama3.2:3b
+ollama pull qwen3:8b
 ```
 
 From a PB checkout on Alice:
@@ -63,7 +63,7 @@ From a PB checkout on Alice:
 export AUTOS_WORKER_BASE_URL="http://sun-dev:3333"
 export AUTOS_WORKER_TOKEN="same-long-random-secret-from-sun"
 export AUTOS_WORKER_ID="alice-cc-01"
-export AUTOS_LOCAL_MODEL="llama3.2:3b"
+export AUTOS_LOCAL_MODEL="qwen3:8b"
 ./bin/autos_cc_worker
 ```
 

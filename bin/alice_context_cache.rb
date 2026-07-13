@@ -8,6 +8,7 @@ require "time"
 require "uri"
 
 class AliceContextCache
+  attr_reader :embed_model
   DEFAULT_AUTOS_PATTERNS = [
     "README.md",
     "config/routes.rb",
@@ -96,6 +97,10 @@ class AliceContextCache
     []
   end
 
+  def embed_query(text)
+    embed_many([text.to_s]).first || []
+  end
+
   def format_results(chunks)
     return "No extra Alice semantic context matched." if chunks.empty?
 
@@ -170,11 +175,39 @@ class AliceContextCache
 
   def load_or_rebuild(scope_name)
     profile = @profiles.fetch(scope_name)
+    unless sync_rebuild_on_search?
+      if File.file?(profile[:index_path])
+        return JSON.parse(File.read(profile[:index_path]))
+      end
+
+      log "semantic context index missing scope=#{scope_name}; skipping synchronous rebuild"
+      return empty_index(scope_name)
+    end
+
     return rebuild_profile!(scope_name) if index_stale?(profile)
 
     JSON.parse(File.read(profile[:index_path]))
   rescue JSON::ParserError
+    unless sync_rebuild_on_search?
+      log "semantic context index unreadable scope=#{scope_name}; skipping synchronous rebuild"
+      return empty_index(scope_name)
+    end
+
     rebuild_profile!(scope_name)
+  end
+
+  def sync_rebuild_on_search?
+    truthy?(env("AUTOS_CC_SYNC_REBUILD_ON_SEARCH", "0"))
+  end
+
+  def empty_index(scope_name)
+    {
+      "version" => 2,
+      "scope" => scope_name,
+      "model" => @embed_model,
+      "chunk_count" => 0,
+      "chunks" => []
+    }
   end
 
   def rebuild_profile!(scope_name)

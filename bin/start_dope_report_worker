@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+set -a
+for env_file in \
+  "$ROOT_DIR/.env" \
+  "$HOME/.config/autos/alice.env" \
+  "$HOME/.config/autos/dope.env" \
+  "$HOME/.config/pinball/dope-worker.env"; do
+  if [[ -f "$env_file" ]]; then
+    source "$env_file"
+  fi
+done
+set +a
+
+if [[ -z "${DOPE_REPORT_WORKER_TOKEN:-}" && -d "$HOME/Desktop/DOPE" ]]; then
+  DOPE_REPORT_WORKER_TOKEN="$(
+    cd "$HOME/Desktop/DOPE"
+    RAILS_ENV="${RAILS_ENV:-production}" /home/wb/.local/bin/mise exec ruby@3.4.9 -- \
+      bundle exec rails runner 'print DopeSettings.dope_report_worker_token'
+  )"
+  export DOPE_REPORT_WORKER_TOKEN
+fi
+
+if [[ -z "${DOPE_REPORT_WORKER_TOKEN:-}" ]]; then
+  echo "DOPE_REPORT_WORKER_TOKEN is required for the DOPE report worker" >&2
+  exit 1
+fi
+
+export DOPE_REPORT_WORKER_ID="${DOPE_REPORT_WORKER_ID:-sun-dope-reports-01}"
+export DOPE_REPORT_WORKER_BASE_URL="${DOPE_REPORT_WORKER_BASE_URL:-http://127.0.0.1:8182}"
+export DOPE_REPORT_LOCAL_MODEL="${DOPE_REPORT_LOCAL_MODEL:-qwen3:30b}"
+export DOPE_REPORT_EMBEDDER_MODEL="${DOPE_REPORT_EMBEDDER_MODEL:-qwen3-embedding:8b-q4_K_M}"
+export DOPE_REPORT_WORKER_POLL_SECONDS="${DOPE_REPORT_WORKER_POLL_SECONDS:-10}"
+export OLLAMA_URL="${OLLAMA_URL:-http://127.0.0.1:11434}"
+
+exec /usr/bin/python3 "$ROOT_DIR/bin/dope_market_report_worker"

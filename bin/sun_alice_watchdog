@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -u
+
+STATE_DIR="$HOME/.local/state/alice-watchdog"
+mkdir -p "$STATE_DIR"
+
+log() {
+  printf '[sun_alice_watchdog] %s %s\n' "$(date --iso-8601=seconds)" "$*"
+}
+
+restart_inactive() {
+  local service="$1"
+  if systemctl --user is-active --quiet "$service"; then
+    return
+  fi
+
+  log "$service inactive; restarting"
+  systemctl --user restart "$service"
+}
+
+check_http() {
+  local name="$1"
+  local service="$2"
+  local url="$3"
+  local accepted_codes="$4"
+  local state_file="$STATE_DIR/$name.failures"
+  local code failures
+
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null || true)"
+  if [[ "$code" =~ $accepted_codes ]]; then
+    rm -f "$state_file"
+    return
+  fi
+
+  failures=0
+  if [[ -f "$state_file" ]]; then
+    read -r failures < "$state_file" || failures=0
+  fi
+  failures=$((failures + 1))
+  printf '%s\n' "$failures" > "$state_file"
+  log "$name health failed code=${code:-none} count=$failures"
+
+  if (( failures >= 2 )); then
+    log "$name failed twice; restarting $service"
+    systemctl --user restart "$service"
+    rm -f "$state_file"
+  fi
+}
+
+env_value() {
+  local path="$1"
+  local key="$2"
+  sed -n "s/^${key}=//p" "$path" 2>/dev/null | tail -1 | sed "s/^[\"']//;s/[\"']$//"
+}
+
+check_worker_auth() {
+  local name="$1"
+  local service="$2"
+  local url="$3"
+  local token_file="$4"
+  local token_key="$5"
+  local queue="$6"
+  local state_file="$STATE_DIR/$name.failures"
+  local response_file="$STATE_DIR/$name.response"
+  local token code failures
+
+  token="$(env_value "$token_file" "$token_key")"
+  code="$(curl -sS -o "$response_file" -w '%{http_code}' --max-time 10 \
+    -H "Authorization: Bearer $token" \
+    -H "X-Autos-Worker-Id: sun-watchdog" \
+    -H "X-Autos-Worker-Queue: $queue" \
+    "$url" 2>/dev/null || true)"
+
+  if [[ "$code" = "200" ]] && grep -q '"enabled":true' "$response_file"; then
+    rm -f "$state_file" "$response_file"
+    return
+  fi
+
+  failures=0
+  if [[ -f "$state_file" ]]; then
+    read -r failures < "$state_file" || failures=0
+  fi
+  failures=$((failures + 1))
+  printf '%s\n' "$failures" > "$state_file"
+  rm -f "$response_file"
+  log "$name authentication/queue check failed code=${code:-none} count=$failures"
+
+  if (( failures >= 2 )); then
+    log "$name failed twice; restarting $service to reload credentials"
+    systemctl --user restart "$service"
+    rm -f "$state_file"
+  fi
+}
+
+restart_inactive ollama.service
+restart_inactive dope-puma.service
+restart_inactive pb-puma.service
+restart_inactive dope-sms-worker.service
+restart_inactive dope-autos-web-worker.service
+restart_inactive dope-autos-embedding-worker.service
+restart_inactive dope-report-worker.service
+restart_inactive pb-autos-worker.service
+restart_inactive cg-alice-bridge-watch.service
+restart_inactive rore-sun-cg.service
+restart_inactive rore-telegram-autos.service
+restart_inactive pbha-sky-primary-forward.service
+
+check_http ollama ollama.service http://127.0.0.1:11434/api/tags '^(200)$'
+check_http dope dope-puma.service http://127.0.0.1:8182/up '^(200)$'
+check_http pinball pb-puma.service http://127.0.0.1:3333/up '^(200|301|302)$'
+check_worker_auth dope-worker-auth dope-sms-worker.service \
+  http://127.0.0.1:8182/autos_worker/status \
+  /home/wb/.config/pinball/dope-worker.env AUTOS_WORKER_TOKEN sms
+check_worker_auth pb-worker-auth pb-autos-worker.service \
+  http://127.0.0.1:3333/autos_worker/status \
+  /home/wb/.config/pinball/alice-local-01.oven.env AI_OVEN_NODE_TOKEN all
+
+log "healthy"
