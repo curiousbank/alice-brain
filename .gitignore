@@ -1,0 +1,30 @@
+.env
+.env.*
+!.env.example
+
+# Local worker output
+log/
+logs/
+reports/
+tmp/
+*.bak-*
+*.bad-scp-dir-*/
+*.log
+*.jsonl
+*.manifest.json
+*.docx
+*.pdf
+*.png
+*.wav
+
+# Python/Ruby/Node local state
+__pycache__/
+*.pyc
+.bundle/
+vendor/bundle/
+node_modules/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

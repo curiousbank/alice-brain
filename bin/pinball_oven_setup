@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="${ROOT}/.env"
+ENV_EXAMPLE="${ROOT}/.env.example"
+SETUP_URL="${PINBALL_OVEN_SETUP_URL:-https://313.cash/ai}"
+
+say() {
+  printf "\n==> %s\n" "$*"
+}
+
+warn() {
+  printf "\n!! %s\n" "$*" >&2
+}
+
+ask_yes_no() {
+  local prompt="$1"
+  local default="${2:-y}"
+  local suffix="[Y/n]"
+  [[ "${default}" == "n" ]] && suffix="[y/N]"
+  read -r -p "${prompt} ${suffix} " reply || true
+  reply="${reply:-$default}"
+  [[ "${reply}" =~ ^[Yy]$ ]]
+}
+
+secret_like_content() {
+  grep -Ev '^[[:space:]]*(#|$)' "$1" |
+    grep -Eiq "(BEGIN (RSA|DSA|EC|OPENSSH|PRIVATE) KEY|seed phrase|mnemonic|private[ _-]?key|wallet\.dat|rpcpassword|aws_secret|backblaze|OPENAI_API_KEY=sk-)"
+}
+
+require_env_value() {
+  local key="$1"
+  [[ -f "${ENV_FILE}" ]] && grep -Eq "^${key}=.+" "${ENV_FILE}"
+}
+
+bundle_has_required_values() {
+  local path="$1"
+  grep -Eq "^(AI_OVEN_NODE_TOKEN|PINBALL_OVEN_TOKEN|AUTOS_WORKER_TOKEN)=.+" "${path}" &&
+    grep -Eq "^ALICE_NODE_ID=.+" "${path}" &&
+    grep -Eq "^(MAZA_ADDRESS|AI_OVEN_MAZA_ADDRESS)=.+" "${path}"
+}
+
+allowed_bundle_key() {
+  case "$1" in
+    ALICE_NODE_ID | AI_OVEN_NODE_ID | MAZA_ADDRESS | AI_OVEN_MAZA_ADDRESS | \
+      AI_OVEN_NODE_TOKEN | PINBALL_OVEN_TOKEN | AUTOS_WORKER_TOKEN | \
+      AUTOS_WORKER_BASE_URL | AUTOS_BRAIN_BASE_URL | AUTOS_WORKER_ID | AUTOS_WORKER_QUEUE | \
+      AUTOS_WORKER_POLL_SECONDS | AUTOS_LOCAL_MODEL | AUTOS_EMBEDDER_MODEL | \
+      AUTOS_VISION_MODEL | OLLAMA_URL)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+bundle_has_safe_syntax() {
+  local path="$1"
+  local line key value
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    if [[ ! "${line}" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]]; then
+      warn "Setup bundle contains a line that is not KEY=VALUE data."
+      return 1
+    fi
+
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    case "${value}" in
+      *'$'* | *'`'* | *';'* | *'|'* | *'&'* | *'<'* | *'>'* | *'\'*)
+        warn "Setup bundle contains shell metacharacters in ${key}."
+        return 1
+        ;;
+    esac
+  done <"${path}"
+}
+
+write_sanitized_bundle() {
+  local source_file="$1"
+  local destination="$2"
+  local line key
+
+  printf "# Sanitized Pinball Oven Registry setup. Keep private; do not commit.\n" >"${destination}"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ "${line}" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"
+    allowed_bundle_key "${key}" || continue
+    printf "%s\n" "${line}" >>"${destination}"
+  done <"${source_file}"
+}
+
+env_value() {
+  local key="$1"
+  [[ -f "${ENV_FILE}" ]] || return 0
+  awk -F= -v key="${key}" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "${ENV_FILE}"
+}
+
+append_env_default() {
+  local key="$1"
+  local value="$2"
+  [[ -n "${value}" ]] || return 0
+  require_env_value "${key}" && return 0
+  printf "%s=%s\n" "${key}" "${value}" >>"${ENV_FILE}"
+}
+
+normalize_env_file() {
+  local node_id maza_address token
+
+  node_id="$(env_value ALICE_NODE_ID)"
+  [[ -n "${node_id}" ]] || node_id="$(env_value AI_OVEN_NODE_ID)"
+  [[ -n "${node_id}" ]] || node_id="alice-local-01"
+
+  maza_address="$(env_value MAZA_ADDRESS)"
+  [[ -n "${maza_address}" ]] || maza_address="$(env_value AI_OVEN_MAZA_ADDRESS)"
+
+  token="$(env_value AUTOS_WORKER_TOKEN)"
+  [[ -n "${token}" ]] || token="$(env_value AI_OVEN_NODE_TOKEN)"
+  [[ -n "${token}" ]] || token="$(env_value PINBALL_OVEN_TOKEN)"
+
+  append_env_default "ALICE_NODE_ID" "${node_id}"
+  append_env_default "AI_OVEN_NODE_ID" "${node_id}"
+  append_env_default "AUTOS_WORKER_ID" "${node_id}"
+  append_env_default "MAZA_ADDRESS" "${maza_address}"
+  append_env_default "AI_OVEN_MAZA_ADDRESS" "${maza_address}"
+  append_env_default "AUTOS_WORKER_TOKEN" "${token}"
+  append_env_default "AUTOS_WORKER_BASE_URL" "https://313.cash"
+  append_env_default "AUTOS_BRAIN_BASE_URL" "https://313.cash"
+  append_env_default "AUTOS_LOCAL_MODEL" "qwen3:8b"
+  append_env_default "AUTOS_EMBEDDER_MODEL" "qwen3-embedding:4b"
+  append_env_default "AUTOS_VISION_MODEL" "qwen3-vl:8b"
+  chmod 600 "${ENV_FILE}"
+}
+
+save_env_bundle_file() {
+  local source_file="$1"
+  local sanitized_file
+  if ! bundle_has_safe_syntax "${source_file}"; then
+    warn "Refusing to save unsafe setup text."
+    return 1
+  fi
+
+  if secret_like_content "${source_file}"; then
+    warn "The setup text looked like it contained a private key, seed, wallet secret, or API key. Refusing to save it."
+    return 1
+  fi
+
+  if ! bundle_has_required_values "${source_file}"; then
+    warn "The setup bundle must include ALICE_NODE_ID, a public MAZA address, and an Oven/AUTOS token."
+    return 1
+  fi
+
+  if [[ -L "${ENV_FILE}" ]]; then
+    warn "Refusing to replace a symbolic-link .env file."
+    return 1
+  fi
+
+  if [[ -f "${ENV_FILE}" ]]; then
+    cp "${ENV_FILE}" "${ENV_FILE}.backup.$(date +%Y%m%d%H%M%S)"
+  fi
+  sanitized_file="$(mktemp)"
+  chmod 600 "${sanitized_file}"
+  if ! write_sanitized_bundle "${source_file}" "${sanitized_file}"; then
+    rm -f "${sanitized_file}"
+    return 1
+  fi
+  mv "${sanitized_file}" "${ENV_FILE}"
+  chmod 600 "${ENV_FILE}"
+  normalize_env_file
+  say "Saved private node env to ${ENV_FILE}"
+}
+
+try_clipboard_bundle() {
+  command -v pbpaste >/dev/null 2>&1 || return 1
+
+  local tmp_file
+  tmp_file="$(mktemp)"
+  pbpaste >"${tmp_file}" || true
+
+  if [[ -s "${tmp_file}" ]] && bundle_has_required_values "${tmp_file}" && ask_yes_no "Use the Oven Registry setup bundle currently on your clipboard?" "y"; then
+    if ! save_env_bundle_file "${tmp_file}"; then
+      rm -f "${tmp_file}"
+      return 1
+    fi
+    rm -f "${tmp_file}"
+    return 0
+  fi
+
+  rm -f "${tmp_file}"
+  return 1
+}
+
+write_env_bundle() {
+  local tmp_file
+  tmp_file="$(mktemp)"
+  cat >"${tmp_file}" <<'EOF'
+# Paste the one-time Oven Registry setup bundle from https://313.cash/ai below.
+# Finish by typing END on its own line and pressing Return.
+EOF
+  : >"${tmp_file}"
+
+  say "Open ${SETUP_URL}, log in, register an oven, then copy the one-time setup bundle."
+  if command -v open >/dev/null 2>&1; then
+    open "${SETUP_URL}" >/dev/null 2>&1 || true
+  fi
+
+  printf "\nPaste setup bundle now. Type END on its own line when finished.\n\n"
+  while IFS= read -r line; do
+    [[ "${line}" == "END" ]] && break
+    printf "%s\n" "${line}" >>"${tmp_file}"
+  done
+
+  if [[ ! -s "${tmp_file}" ]]; then
+    rm -f "${tmp_file}"
+    warn "No setup bundle pasted."
+    return 1
+  fi
+
+  if ! save_env_bundle_file "${tmp_file}"; then
+    rm -f "${tmp_file}"
+    return 1
+  fi
+  rm -f "${tmp_file}"
+}
+
+ensure_env() {
+  if [[ ! -f "${ENV_FILE}" && -f "${ENV_EXAMPLE}" ]]; then
+    cp "${ENV_EXAMPLE}" "${ENV_FILE}"
+    chmod 600 "${ENV_FILE}"
+  fi
+
+  if [[ ! -f "${ENV_FILE}" ]] || ! require_env_value "AUTOS_WORKER_TOKEN" || ! require_env_value "ALICE_NODE_ID"; then
+    try_clipboard_bundle || write_env_bundle
+  else
+    normalize_env_file
+    say "Existing .env found. Tokens will not be printed."
+  fi
+}
+
+ensure_ollama() {
+  if command -v ollama >/dev/null 2>&1; then
+    return
+  fi
+
+  warn "Ollama is not installed."
+  if command -v brew >/dev/null 2>&1 && ask_yes_no "Install Ollama with Homebrew now?" "y"; then
+    brew install ollama
+  else
+    warn "Install Ollama, then rerun this setup."
+    exit 1
+  fi
+}
+
+ensure_ollama_running() {
+  if ollama list >/dev/null 2>&1; then
+    return
+  fi
+
+  say "Starting Ollama in the background."
+  mkdir -p "${ROOT}/log"
+  nohup ollama serve >"${ROOT}/log/ollama.log" 2>&1 &
+  sleep 3
+
+  if ! ollama list >/dev/null 2>&1; then
+    warn "Ollama did not respond yet. Check ${ROOT}/log/ollama.log"
+    exit 1
+  fi
+}
+
+main() {
+  cd "${ROOT}"
+  printf "\n"
+  printf "PINBALL AI OVEN SETUP\n"
+  printf "Public node registration: %s\n" "${SETUP_URL}"
+  printf "This setup never asks for wallet private keys, seed phrases, database credentials, or storage keys.\n"
+
+  ensure_env
+  ensure_ollama
+  ensure_ollama_running
+
+  if ask_yes_no "Install or verify baseline local models now?" "y"; then
+    "${ROOT}/bin/install_baseline_models"
+  fi
+
+  say "Checking node registration and local model readiness."
+  if "${ROOT}/bin/alice_node_status"; then
+    say "Node status looks ready."
+  else
+    warn "Node status is not ready yet. Fix the reported item, then rerun this setup."
+  fi
+
+  if ask_yes_no "Start the PB/AUTOS worker now in this Terminal window?" "n"; then
+    exec "${ROOT}/bin/autos_cc_worker"
+  fi
+
+  say "Setup finished. To start later: cd \"${ROOT}\" && ./bin/autos_cc_worker"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

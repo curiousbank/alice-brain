@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+required_models=(
+  "qwen3-embedding:4b"
+  "qwen3:8b"
+  "qwen3-vl:8b"
+)
+
+if ! command -v ollama >/dev/null 2>&1; then
+  echo "ollama is required. Install it first:"
+  echo "  brew install ollama"
+  exit 1
+fi
+
+echo "Installing Alice Brain baseline Ollama models..."
+for model in "${required_models[@]}"; do
+  echo "==> ollama pull ${model}"
+  ollama pull "${model}"
+done
+
+if [[ "${INSTALL_GLM_OCR:-0}" == "1" ]]; then
+  echo "==> ollama pull glm-ocr:bf16"
+  ollama pull "glm-ocr:bf16"
+else
+  echo "Skipping optional glm-ocr:bf16. Run INSTALL_GLM_OCR=1 ./bin/install_baseline_models to include it."
+fi
+
+echo
+echo "Installed model list:"
+ollama list
