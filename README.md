@@ -9,6 +9,57 @@ This repository is the public PB/AUTOS baseline. Customer-specific report,
 messaging, and operator extensions are intentionally maintained outside this
 repository.
 
+## WHY ALICE?
+
+AI compute should be useful without being powerful enough to own the application
+that requested it. Alice Brain turns a Mac or Linux machine into a least-privileged
+AI Oven: it receives one scoped job, runs an approved local model, returns a bounded
+result, and lets the controller decide whether that result is accepted.
+
+That separation provides four practical benefits:
+
+- local Qwen/Ollama capacity can be added, removed, or upgraded independently;
+- prompts and approved context can be processed locally without copying application
+  credentials onto the oven;
+- every result can report the actual node, model, output digest, and source job;
+- a failed or untrusted oven can be paused or revoked without giving it database,
+  storage, messaging, or wallet authority.
+
+Alice is the compute plane, not the central brain of record. The name describes the
+worker kit and runtime contract; authority remains with the controller.
+
+## How the three projects fit
+
+Alice Brain is designed to work with
+[WIZWIKI](https://github.com/curiousbank/WIZWIKI) and
+[Rotary Relay](https://github.com/curiousbank/rotary-relay):
+
+- **WIZWIKI** is the application and controller. It owns organization data, approved
+  knowledge, queues, policy, validation, audit records, and external-action gates.
+- **Alice Brain** is the outbound-only execution plane. It polls scoped HTTPS work,
+  runs local models, and submits answers, embeddings, or artifact metadata for
+  controller-side validation.
+- **Rotary Relay (RoRe)** is the optional private coordination plane. It carries node
+  health, receipts, diagnostics, capability signals, and operator/agent coordination.
+  It does not replace Alice's HTTPS job boundary or WIZWIKI's validation.
+
+## Path to full potential
+
+The public baseline is deliberately narrow. The next production milestones are:
+
+1. finish per-oven, per-lane credentials with rotation, pause, and revocation;
+2. add durable job leases, idempotent completion, retry limits, and dead-letter review;
+3. attest model inventory and resource limits so scheduling matches real capacity;
+4. isolate model execution with explicit filesystem, network, time, and memory budgets;
+5. sign result receipts and expose controller-verified provenance and acceptance state;
+6. connect RoRe health through a broker or per-node ACLs without granting raw Redis
+   authority to an oven; and
+7. keep payouts controller-side: close one 30-minute window, aggregate accepted Bakes
+   by public address, and create at most one transaction output per address.
+
+These are roadmap boundaries, not claims that the public worker implements every
+milestone today.
+
 ## Requirements
 
 - macOS 13+ on Apple Silicon, or a Linux system supported by Ollama
@@ -75,8 +126,7 @@ enforced by the controller token as well as the worker header.
 
 See [docs/security.md](docs/security.md) and
 [docs/worker_protocol.md](docs/worker_protocol.md) for the full trust model.
-Rotary Relay coordination is maintained separately at
-[curiousbank/rotary-relay](https://github.com/curiousbank/rotary-relay).
+Rotary Relay coordination is maintained in its separate repository linked above.
 
 ## Tests
 
