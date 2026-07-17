@@ -17,9 +17,15 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BASELINE_MODELS = ["qwen3-embedding:4b", "qwen3:8b", "qwen3-vl:8b"]
-OPTIONAL_MODELS = ["glm-ocr:bf16"]
+DEFAULT_REQUIRED_MODELS = ["qwen3:8b"]
+KNOWN_OPTIONAL_MODELS = [
+    "qwen3-embedding:0.6b",
+    "qwen3-embedding:4b",
+    "qwen3-vl:8b",
+    "glm-ocr:bf16",
+]
 ENV_KEY = re.compile(r"^[A-Z][A-Z0-9_]*$")
+PROCESS_ENV_KEYS = frozenset(os.environ)
 
 
 def load_env(path: Path) -> None:
@@ -34,7 +40,9 @@ def load_env(path: Path) -> None:
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
             value = value[1:-1]
-        if ENV_KEY.match(key) and key not in os.environ:
+        # Later protected env files mirror shell sourcing, while explicit
+        # process or service-unit variables remain authoritative.
+        if ENV_KEY.match(key) and key not in PROCESS_ENV_KEYS:
             os.environ[key] = value
 
 
@@ -57,11 +65,36 @@ def now_iso() -> str:
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def env_value(*names: str) -> str:
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def required_models() -> list[str]:
+    configured = env_value("ALICE_REQUIRED_MODELS")
+    if configured:
+        models = [part.strip() for part in configured.split(",") if part.strip()]
+        if models:
+            return list(dict.fromkeys(models))
+
+    model = env_value("AUTOS_LOCAL_MODEL", "PB_AUTOS_LOCAL_MODEL")
+    return [model] if model else DEFAULT_REQUIRED_MODELS.copy()
+
+
 def model_map() -> dict:
     code, stdout, stderr = run(["ollama", "list"], timeout=30)
     models = {}
+    required = required_models()
     if code != 0:
-        return {"ok": False, "error": (stderr or stdout).strip()[:300], "models": models}
+        return {
+            "ok": False,
+            "error": (stderr or stdout).strip()[:300],
+            "models": models,
+            "required": {model: False for model in required},
+        }
     for line in stdout.splitlines()[1:]:
         parts = re.split(r"\s+", line.strip())
         if parts:
@@ -69,8 +102,13 @@ def model_map() -> dict:
     return {
         "ok": True,
         "models": models,
-        "baseline": {model: bool(models.get(model)) for model in BASELINE_MODELS},
-        "optional": {model: bool(models.get(model)) for model in OPTIONAL_MODELS},
+        "required": {model: bool(models.get(model)) for model in required},
+        "baseline": {model: bool(models.get(model)) for model in required},
+        "optional": {
+            model: bool(models.get(model))
+            for model in KNOWN_OPTIONAL_MODELS
+            if model not in required
+        },
     }
 
 
@@ -117,8 +155,12 @@ def autos_worker_status() -> dict:
         or os.environ.get("AI_OVEN_NODE_TOKEN")
     )
     worker_id = (
-        os.environ.get("AUTOS_WORKER_ID")
-        or os.environ.get("ALICE_NODE_ID")
+        env_value(
+            "AUTOS_WORKER_ID",
+            "PB_AUTOS_WORKER_ID",
+            "ALICE_NODE_ID",
+            "AI_OVEN_NODE_ID",
+        )
         or "alice-local-01"
     )
     if not token:
@@ -126,7 +168,8 @@ def autos_worker_status() -> dict:
 
     try:
         base_url = validated_base_url(
-            os.environ.get("AUTOS_WORKER_BASE_URL") or "https://313.cash"
+            env_value("AUTOS_WORKER_BASE_URL", "PB_AUTOS_WORKER_BASE_URL")
+            or "https://313.cash"
         )
     except ValueError as error:
         return {"ok": False, "configured": True, "error": str(error)}
@@ -136,6 +179,20 @@ def autos_worker_status() -> dict:
         headers={
             "Authorization": f"Bearer {token}",
             "X-Autos-Worker-Id": worker_id,
+            "X-Autos-Worker-Queue": env_value(
+                "AUTOS_WORKER_QUEUE", "PB_AUTOS_WORKER_QUEUE"
+            )
+            or "all",
+            "X-Autos-Worker-Protocol": "2",
+            "X-Rore-Protocol": env_value(
+                "AUTOS_RORE_PROTOCOL", "PB_AUTOS_RORE_PROTOCOL"
+            )
+            or "rore.worker.v1",
+            "X-Rore-Oven-Id": env_value(
+                "ALICE_NODE_ID", "AI_OVEN_NODE_ID"
+            )
+            or worker_id,
+            "X-Rore-Capabilities": "autos.worker.v2,status",
             "Accept": "application/json",
         },
         method="GET",
@@ -166,15 +223,26 @@ def main() -> int:
     for path in [
         ROOT / ".env",
         Path.home() / ".config" / "alice-brain" / "node.env",
+        Path.home() / ".config" / "autos" / "alice.env",
+        Path.home() / ".config" / "pinball" / "pb-autos.env",
+        Path.home() / ".config" / "pinball" / "pb-autos-worker.env",
+        Path.home() / ".config" / "pinball" / "alice-local-01.oven.env",
     ]:
         load_env(path)
 
     maza_address = os.environ.get("MAZA_ADDRESS", "").strip()
     node_id = (
-        os.environ.get("ALICE_NODE_ID")
-        or os.environ.get("AI_OVEN_NODE_ID")
-        or os.environ.get("AUTOS_WORKER_ID")
+        env_value(
+            "ALICE_NODE_ID",
+            "AI_OVEN_NODE_ID",
+            "AUTOS_WORKER_ID",
+            "PB_AUTOS_WORKER_ID",
+        )
         or "alice-local-01"
+    )
+    worker_status = autos_worker_status()
+    controller_rore = (
+        worker_status.get("rore") if isinstance(worker_status, dict) else None
     )
     status = {
         "ok": True,
@@ -194,12 +262,22 @@ def main() -> int:
             "autos_worker_token": bool(os.environ.get("AUTOS_WORKER_TOKEN")),
         },
         "ollama": model_map(),
-        "rotary_relay_configured": bool(os.environ.get("AGENT_BRIDGE_REDIS_URL")),
-        "autos_worker": autos_worker_status(),
+        "rore": controller_rore
+        or {
+            "protocol": "rore.worker.v1",
+            "connected": False,
+            "mode": "controller_unavailable",
+        },
+        "legacy_direct_redis_bridge": {
+            "configured": bool(os.environ.get("AGENT_BRIDGE_REDIS_URL")),
+            "enabled": False,
+            "reason": "RORE uses the authenticated controller gateway",
+        },
+        "autos_worker": worker_status,
     }
     status["ok"] = (
         status["maza_address_configured"]
-        and all(status["ollama"].get("baseline", {}).values())
+        and all(status["ollama"].get("required", {}).values())
         and status["autos_worker"].get("ok") is True
     )
     print(json.dumps(status, indent=2, ensure_ascii=True))

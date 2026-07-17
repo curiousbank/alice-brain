@@ -17,11 +17,16 @@ repository.
 - Ruby 3.1+, Python 3.10+, Git, curl, and Ollama
 - Outbound HTTPS access to `https://313.cash`
 
-The baseline model set is:
+The required baseline model is:
 
 - `qwen3:8b`
-- `qwen3-embedding:4b`
-- `qwen3-vl:8b`
+
+Embedding and vision models are optional operator extensions:
+
+- Set `INSTALL_EMBEDDING_MODEL=1` when running
+  `bin/install_baseline_models` to add `qwen3-embedding:4b`.
+- Set `INSTALL_VISION_MODEL=1` to add `qwen3-vl:8b`.
+- Set `INSTALL_GLM_OCR=1` to add `glm-ocr:bf16`.
 
 ## Quick Start
 
@@ -57,7 +62,8 @@ AUTOS_WORKER_TOKEN=one-time-scoped-token
 ```
 
 Supported queues are `all`, `web`, `telegram`, and `embeddings`. Queue scope is
-enforced by the controller token as well as the worker header.
+enforced by the controller token as well as the worker header. Embedding jobs
+remain disabled unless `AUTOS_EMBEDDING_WORKER_ENABLED=1` is explicitly set.
 
 ## Security Boundary
 
@@ -72,6 +78,10 @@ enforced by the controller token as well as the worker header.
 - Job text is untrusted data. It is never passed to a shell.
 - The controller validates all submitted work and decides whether a Bake is
   accepted.
+- Ovens speak `rore.worker.v1` through the authenticated HTTPS worker gateway.
+  They never receive direct Redis credentials.
+- PostgreSQL remains authoritative; if Redis coordination is unavailable, the
+  controller falls back to its durable PostgreSQL worker queue.
 
 See [docs/security.md](docs/security.md) and
 [docs/worker_protocol.md](docs/worker_protocol.md) for the full trust model.
@@ -84,5 +94,6 @@ Rotary Relay coordination is maintained separately at
 ruby -Itest -e 'Dir["test/**/*_test.rb"].sort.each { |file| require File.expand_path(file) }'
 bash -n bin/pinball_oven_setup bin/install_baseline_models "Pinball Oven Setup.command"
 bash test/setup_bundle_test.sh
+bash test/install_baseline_models_test.sh
 python3 -m py_compile bin/alice_node_status
 ```

@@ -122,6 +122,10 @@ module AliceBrain
       @node_id = AliceBrain.validate_identifier(env("ALICE_NODE_ID", @worker_id), "ALICE_NODE_ID")
       @worker_queue = env("AUTOS_WORKER_QUEUE", "all").downcase
       raise ArgumentError, "unsupported AUTOS_WORKER_QUEUE" unless CONTROLLER_QUEUES.include?(@worker_queue)
+      @rore_protocol = AliceBrain.validate_identifier(
+        env("AUTOS_RORE_PROTOCOL", "rore.worker.v1"),
+        "AUTOS_RORE_PROTOCOL"
+      )
 
       @poll_seconds = env("AUTOS_WORKER_POLL_SECONDS", "5").to_f.clamp(1.0, 60.0)
       @local_model = env("AUTOS_LOCAL_MODEL", "qwen3:8b")
@@ -131,7 +135,7 @@ module AliceBrain
     end
 
     def run
-      log "starting worker=#{@worker_id} queue=#{@worker_queue} model=#{@local_model} embedder=#{@embedder_model}"
+      log "starting worker=#{@worker_id} queue=#{@worker_queue} model=#{@local_model} embedder=#{@embedder_model} rore=#{@rore_protocol}"
       log_status
 
       loop do
@@ -261,7 +265,7 @@ module AliceBrain
     end
 
     def complete(job, payload)
-      body = payload.merge(claim_token_payload(job))
+      body = payload.merge(claim_token_payload(job)).merge(rore_receipt(job))
       attempts = env("AUTOS_WORKER_COMPLETE_ATTEMPTS", "4").to_i.clamp(1, 8)
       attempts.times do |index|
         response = controller_request(:post, job.fetch("complete_path"), body, read_timeout: 90)
@@ -283,7 +287,7 @@ module AliceBrain
         status: status,
         provider: provider,
         model: model
-      }.merge(claim_token_payload(job)))
+      }.merge(claim_token_payload(job)).merge(rore_receipt(job)))
       activity("progress_rejected", job_id: job["id"], http_code: response.code.to_i) unless response.is_a?(Net::HTTPSuccess)
     rescue StandardError => error
       activity("progress_failed", job_id: job.to_h["id"], error_class: error.class.name)
@@ -295,7 +299,7 @@ module AliceBrain
 
       controller_request(:post, path, {
         error: safe_error(error)
-      }.merge(claim_token_payload(job)), read_timeout: 30)
+      }.merge(claim_token_payload(job)).merge(rore_receipt(job)), read_timeout: 30)
     rescue StandardError => report_error
       log "failure report rejected #{safe_error(report_error)}"
     end
@@ -304,7 +308,9 @@ module AliceBrain
       response = controller_request(:get, "/autos_worker/status")
       if response.is_a?(Net::HTTPSuccess)
         status = parse_object(response.body)
-        log "controller ready node=#{status["node"]} enabled=#{status["enabled"]} queued=#{status["queued"]}"
+        rore = status["rore"].to_h
+        rore_state = rore["connected"] ? rore["mode"] : "postgres-fallback"
+        log "controller ready node=#{status["node"]} enabled=#{status["enabled"]} queued=#{status["queued"]} rore=#{rore_state}"
       else
         log "controller status HTTP #{response.code}"
       end
@@ -321,6 +327,9 @@ module AliceBrain
       request["X-Autos-Node-Id"] = @node_id
       request["X-Autos-Worker-Queue"] = @worker_queue
       request["X-Autos-Worker-Protocol"] = "2"
+      request["X-Rore-Protocol"] = @rore_protocol
+      request["X-Rore-Oven-Id"] = @node_id
+      request["X-Rore-Capabilities"] = rore_capabilities.join(",")
       request["X-Autos-Local-Model"] = @local_model
       request["X-Autos-Embedder-Model"] = @embedder_model
       request["Content-Type"] = "application/json"
@@ -373,8 +382,40 @@ module AliceBrain
       token.empty? ? {} : { claim_token: token }
     end
 
+    def rore_receipt(job)
+      envelope = job.to_h["rore"].to_h
+      return {} unless envelope["protocol"] == @rore_protocol
+
+      {
+        rore: envelope.slice(
+          "protocol",
+          "message_id",
+          "job_id",
+          "oven_id",
+          "queue",
+          "lease_id",
+          "lease_expires_at",
+          "entry_id",
+          "mode"
+        )
+      }
+    end
+
+    def rore_capabilities
+      capabilities = [
+        "autos.worker.v2",
+        "queue.#{@worker_queue}",
+        "qwen.local",
+        "ollama",
+        "progress",
+        "receipts"
+      ]
+      capabilities << "embeddings" if embedding_worker_enabled?
+      capabilities.uniq
+    end
+
     def embedding_worker_enabled?
-      %w[all embeddings].include?(@worker_queue) && !falsey?(ENV.fetch("AUTOS_EMBEDDING_WORKER_ENABLED", "1"))
+      %w[all embeddings].include?(@worker_queue) && truthy?(ENV.fetch("AUTOS_EMBEDDING_WORKER_ENABLED", "0"))
     end
 
     def read_public_context

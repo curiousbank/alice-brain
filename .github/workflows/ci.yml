@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Run worker security tests
+        run: ruby test/worker_security_test.rb
+
+      - name: Run setup safety tests
+        run: |
+          bash test/setup_bundle_test.sh
+          bash test/install_baseline_models_test.sh
+
+      - name: Check script syntax
+        run: |
+          ruby -c bin/autos_cc_worker
+          python3 -m py_compile bin/alice_node_status
+          bash -n "Pinball Oven Setup.command" bin/install_baseline_models bin/pinball_oven_setup
