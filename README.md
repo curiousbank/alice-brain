@@ -23,8 +23,10 @@ The required baseline model is:
 
 Embedding and vision models are optional operator extensions:
 
-- `qwen3-embedding:4b`
-- `qwen3-vl:8b`
+- Set `INSTALL_EMBEDDING_MODEL=1` when running
+  `bin/install_baseline_models` to add `qwen3-embedding:4b`.
+- Set `INSTALL_VISION_MODEL=1` to add `qwen3-vl:8b`.
+- Set `INSTALL_GLM_OCR=1` to add `glm-ocr:bf16`.
 
 ## Quick Start
 
@@ -92,5 +94,6 @@ Rotary Relay coordination is maintained separately at
 ruby -Itest -e 'Dir["test/**/*_test.rb"].sort.each { |file| require File.expand_path(file) }'
 bash -n bin/pinball_oven_setup bin/install_baseline_models "Pinball Oven Setup.command"
 bash test/setup_bundle_test.sh
+bash test/install_baseline_models_test.sh
 python3 -m py_compile bin/alice_node_status
 ```
