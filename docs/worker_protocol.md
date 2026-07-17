@@ -7,7 +7,9 @@ Alice Brain nodes are treated as untrusted compute providers.
 - **SUN/PB controller**: owns queue, policy, validation, storage, frontend records, and MAZA bake accounting.
 - **Oven Registry**: Pinball web interface for node enrollment, public payout address registration, scoped worker-token issuance, and health/payout visibility.
 - **Alice Brain node**: polls work, computes locally, returns a file or answer, and reports health.
-- **RoRe**: private Redis/file control-plane for agent messages, receipts, and health events.
+- **RORE**: the Oven coordination protocol. SUN currently implements fast
+  dispatch, leases, receipts, and heartbeat state with Redis Streams and TTL
+  keys.
 
 ## Rules
 
@@ -31,11 +33,16 @@ user registers oven on /ai
   -> SUN/PB shows one-time setup bundle
   -> node saves .env locally and opens outbound tunnels
 SUN/PB queues job
+  -> SUN records a durable, content-free RORE dispatch event
   -> node polls /next with X-Autos-Worker-Queue
-  -> SUN returns scoped payload and complete/fail/heartbeat endpoints
+  -> SUN claims the PostgreSQL row and creates a short Redis lease
+  -> SUN returns scoped payload, RORE envelope, and complete/fail/progress endpoints
   -> node runs local embedder/LLM/vision
+  -> node echoes the RORE receipt in progress/complete/fail calls
   -> node creates artifact and manifest
   -> node POSTs complete with file payload
+  -> SUN validates the PostgreSQL claim and clears the lease
+  -> in Stream-dispatch mode SUN also acknowledges the consumer-group entry
   -> SUN validates file and manifest
   -> SUN stores the file at an approved object-storage path
   -> SUN updates frontend record
@@ -95,20 +102,33 @@ Example:
 }
 ```
 
-## RoRe Boundary
+## RORE Boundary
 
-RoRe is useful for:
+RORE is useful for:
 
 - health checks,
-- ACKs,
-- status messages,
+- durable dispatch and pending-entry recovery,
+- ACKs and result receipts,
+- expiring job leases,
+- status and progress messages,
+- dead-letter visibility,
 - operator coordination,
 - non-secret diagnostics.
 
-RoRe is not:
+RORE is not:
 
 - the production database,
 - the file storage layer,
 - a public message bus,
 - a payment ledger,
 - a wallet.
+
+PostgreSQL is authoritative. A Redis outage must degrade to the existing
+PostgreSQL worker queue instead of stopping Alice. Ovens never receive Redis
+credentials and never connect directly to SUN's Redis port. They speak
+`rore.worker.v1` only through the scoped, authenticated `/autos_worker` HTTPS
+channel.
+
+Redis Stream entries and heartbeat keys contain identifiers, queue names,
+capabilities, timings, and state only. Prompts, RAG context, claim tokens,
+wallet data, and infrastructure credentials are forbidden.

@@ -17,9 +17,12 @@ repository.
 - Ruby 3.1+, Python 3.10+, Git, curl, and Ollama
 - Outbound HTTPS access to `https://313.cash`
 
-The baseline model set is:
+The required baseline model is:
 
 - `qwen3:8b`
+
+Embedding and vision models are optional operator extensions:
+
 - `qwen3-embedding:4b`
 - `qwen3-vl:8b`
 
@@ -57,7 +60,8 @@ AUTOS_WORKER_TOKEN=one-time-scoped-token
 ```
 
 Supported queues are `all`, `web`, `telegram`, and `embeddings`. Queue scope is
-enforced by the controller token as well as the worker header.
+enforced by the controller token as well as the worker header. Embedding jobs
+remain disabled unless `AUTOS_EMBEDDING_WORKER_ENABLED=1` is explicitly set.
 
 ## Security Boundary
 
@@ -72,6 +76,10 @@ enforced by the controller token as well as the worker header.
 - Job text is untrusted data. It is never passed to a shell.
 - The controller validates all submitted work and decides whether a Bake is
   accepted.
+- Ovens speak `rore.worker.v1` through the authenticated HTTPS worker gateway.
+  They never receive direct Redis credentials.
+- PostgreSQL remains authoritative; if Redis coordination is unavailable, the
+  controller falls back to its durable PostgreSQL worker queue.
 
 See [docs/security.md](docs/security.md) and
 [docs/worker_protocol.md](docs/worker_protocol.md) for the full trust model.
