@@ -56,8 +56,11 @@ AUTOS_WORKER_ID=my-oven-name
 AUTOS_WORKER_TOKEN=one-time-scoped-token
 ```
 
-Supported queues are `all`, `web`, `telegram`, and `embeddings`. Queue scope is
-enforced by the controller token as well as the worker header.
+Supported queues are `all`, `web`, `telegram`, `embeddings`, and `sms_bot`.
+Queue scope is enforced by the controller token as well as the worker header.
+The `sms_bot` lane accepts only private SMS drafting jobs. It does not run
+embeddings or add the repository's public Pinball product context to customer
+conversations.
 
 ## Security Boundary
 
@@ -72,6 +75,8 @@ enforced by the controller token as well as the worker header.
 - Job text is untrusted data. It is never passed to a shell.
 - The controller validates all submitted work and decides whether a Bake is
   accepted.
+- Rotary Relay remains behind the authenticated controller. Ovens report
+  capabilities over HTTPS and never receive direct Redis access.
 
 See [docs/security.md](docs/security.md) and
 [docs/worker_protocol.md](docs/worker_protocol.md) for the full trust model.

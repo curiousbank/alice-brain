@@ -20,6 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 BASELINE_MODELS = ["qwen3-embedding:4b", "qwen3:8b", "qwen3-vl:8b"]
 OPTIONAL_MODELS = ["glm-ocr:bf16"]
 ENV_KEY = re.compile(r"^[A-Z][A-Z0-9_]*$")
+IDENTIFIER = re.compile(r"^[a-zA-Z0-9_.-]+$")
+CONTROLLER_QUEUES = {"all", "web", "telegram", "embeddings", "sms_bot"}
+RORE_CAPABILITIES = "autos.worker.v2,qwen.local,progress,receipts"
 
 
 def load_env(path: Path) -> None:
@@ -121,8 +124,16 @@ def autos_worker_status() -> dict:
         or os.environ.get("ALICE_NODE_ID")
         or "alice-local-01"
     )
+    worker_queue = (os.environ.get("AUTOS_WORKER_QUEUE") or "all").strip().lower()
     if not token:
         return {"ok": False, "configured": False, "error": "AUTOS worker token missing"}
+    if (
+        not 1 <= len(worker_id.encode("utf-8")) <= 128
+        or not IDENTIFIER.fullmatch(worker_id)
+    ):
+        return {"ok": False, "configured": True, "error": "invalid AUTOS worker id"}
+    if worker_queue not in CONTROLLER_QUEUES:
+        return {"ok": False, "configured": True, "error": "unsupported AUTOS worker queue"}
 
     try:
         base_url = validated_base_url(
@@ -136,6 +147,15 @@ def autos_worker_status() -> dict:
         headers={
             "Authorization": f"Bearer {token}",
             "X-Autos-Worker-Id": worker_id,
+            "X-Autos-Node-Id": os.environ.get("ALICE_NODE_ID") or worker_id,
+            "X-Autos-Worker-Queue": worker_queue,
+            "X-Autos-Worker-Protocol": "2",
+            "X-Autos-Local-Model": os.environ.get("AUTOS_LOCAL_MODEL") or "qwen3:8b",
+            "X-Autos-Embedder-Model": (
+                os.environ.get("AUTOS_EMBEDDER_MODEL") or "qwen3-embedding:4b"
+            ),
+            "X-Rore-Protocol": "rore.worker.v1",
+            "X-Rore-Capabilities": RORE_CAPABILITIES,
             "Accept": "application/json",
         },
         method="GET",
@@ -149,7 +169,14 @@ def autos_worker_status() -> dict:
             payload = json.loads(raw_body.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("worker status response must be an object")
-            payload.update({"ok": True, "base_url": base_url, "worker_id": worker_id})
+            payload.update(
+                {
+                    "ok": True,
+                    "base_url": base_url,
+                    "worker_id": worker_id,
+                    "worker_queue": worker_queue,
+                }
+            )
             return payload
     except urllib.error.HTTPError as error:
         return {
@@ -176,6 +203,19 @@ def main() -> int:
         or os.environ.get("AUTOS_WORKER_ID")
         or "alice-local-01"
     )
+    worker_status = autos_worker_status()
+    rotary_payload = worker_status.get("rore")
+    if not isinstance(rotary_payload, dict):
+        rotary_payload = {}
+    rotary_relay = {
+        "controller_gateway": bool(rotary_payload),
+        "connected": rotary_payload.get("connected") is True,
+        "enabled": rotary_payload.get("enabled") is True,
+        "mode": rotary_payload.get("mode") or "unavailable",
+        "protocol": rotary_payload.get("protocol"),
+        "postgres_authoritative": rotary_payload.get("postgres_authoritative") is True,
+        "direct_redis_required": False,
+    }
     status = {
         "ok": True,
         "generated_at": now_iso(),
@@ -194,8 +234,9 @@ def main() -> int:
             "autos_worker_token": bool(os.environ.get("AUTOS_WORKER_TOKEN")),
         },
         "ollama": model_map(),
-        "rotary_relay_configured": bool(os.environ.get("AGENT_BRIDGE_REDIS_URL")),
-        "autos_worker": autos_worker_status(),
+        "rotary_relay_configured": rotary_relay["controller_gateway"],
+        "rotary_relay": rotary_relay,
+        "autos_worker": worker_status,
     }
     status["ok"] = (
         status["maza_address_configured"]
