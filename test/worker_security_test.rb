@@ -71,4 +71,36 @@ class WorkerSecurityTest < Minitest::Test
     assert_equal "alice-node.1", AliceBrain.validate_identifier("alice-node.1", "node")
     assert_raises(ArgumentError) { AliceBrain.validate_identifier("alice\r\nX-Evil: true", "node") }
   end
+
+  def test_sms_bot_is_a_supported_dedicated_queue
+    assert_includes AliceBrain::CONTROLLER_QUEUES, "sms_bot"
+    refute_includes AliceBrain::RORE_CAPABILITIES, "embeddings"
+  end
+
+  def test_sms_bot_prompt_does_not_include_public_product_context
+    worker = AliceBrain::Worker.allocate
+    worker.instance_variable_set(:@public_context, "UNIQUE PUBLIC PRODUCT CONTEXT")
+
+    sms_prompt = worker.send(:system_content_for, { "surface" => "sms_bot_compute" })
+    regular_prompt = worker.send(:system_content_for, { "surface" => "autos" })
+
+    assert_includes sms_prompt, "customer-facing SMS"
+    refute_includes sms_prompt, "UNIQUE PUBLIC PRODUCT CONTEXT"
+    assert_includes regular_prompt, "UNIQUE PUBLIC PRODUCT CONTEXT"
+  end
+
+  def test_sms_bot_worker_rejects_jobs_from_other_surfaces
+    worker = AliceBrain::Worker.allocate
+    worker.instance_variable_set(:@worker_queue, "sms_bot")
+    worker.instance_variable_set(:@base_uri, AliceBrain.validate_base_uri("https://313.cash"))
+    job = {
+      "id" => 1,
+      "prompt" => "Draft a reply",
+      "surface" => "autos",
+      "complete_path" => "/autos_worker/messages/1/complete",
+      "fail_path" => "/autos_worker/messages/1/fail"
+    }
+
+    assert_raises(ArgumentError) { worker.send(:validate_job!, job) }
+  end
 end

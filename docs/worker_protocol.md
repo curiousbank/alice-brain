@@ -48,8 +48,13 @@ SUN/PB queues job
 - `web`: non-Telegram PB/AUTOS answer jobs.
 - `telegram`: Telegram-only PB/AUTOS answer jobs.
 - `embeddings`: embedding jobs only.
+- `sms_bot`: private, customer-facing SMS drafts only.
 
 Run `telegram` as a second worker process when chat responsiveness matters.
+Run `sms_bot` as a dedicated process. Generic workers do not claim this lane,
+and the SMS worker rejects any payload outside the `sms_bot_compute` surface.
+It uses only controller-supplied, scoped business context and does not run
+embeddings or add Alice Brain's public product context.
 
 ## Completion Manifest Requirements
 
@@ -112,3 +117,9 @@ RoRe is not:
 - a public message bus,
 - a payment ledger,
 - a wallet.
+
+Alice Brain advertises its safe worker capabilities through the authenticated
+HTTPS request. SUN/PB is the only gateway to RoRe's coordination store:
+PostgreSQL remains authoritative for policy, job state, billing, and results,
+while Redis Streams may coordinate queue hints, leases, heartbeats, ACKs, and
+retry recovery. Oven nodes never need a Redis URL or Redis credential.
