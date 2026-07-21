@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "fileutils"
+require "io/console"
 require "json"
 require "time"
 
@@ -16,17 +17,242 @@ class String
 end
 
 DEFAULT_AUTOS_LOG = File.expand_path("~/.config/autos/log/autos_cc_activity.jsonl")
-DEFAULT_DOPE_LOG = File.expand_path("~/.config/autos/log/dope_cc_activity.jsonl")
-DEFAULT_DOPE_REPORT_LOG = File.expand_path("~/.config/autos/log/dope_market_report_worker.jsonl")
 LEGACY_LOG = File.expand_path("../log/autos_cc_activity.jsonl", __dir__)
+
+STREAM_ORDER = %w[AUTOS.SMS AUTOS.WEATHER AUTOS.ASK AUTOS.TELEGRAM].freeze
+STREAM_COLORS = {
+  "AUTOS.SMS" => "255;86;181",
+  "AUTOS.WEATHER" => "42;224;198",
+  "AUTOS.ASK" => "255;190;73",
+  "AUTOS.TELEGRAM" => "92;174;255"
+}.freeze
+
+class AutosWatchDashboard
+  HEADER_ROWS = 5
+  MIN_ROWS = 12
+  RESET = "\e[0m"
+  BORDER = "\e[38;2;48;90;105m"
+  SOFT = "\e[38;2;126;157;190m"
+  WHITE = "\e[1;38;2;238;248;255m"
+  TURQUOISE = "\e[1;38;2;42;224;198m"
+  STEEL = "\e[1;38;2;174;199;212m"
+  PLASMA = "\e[1;38;2;202;84;255m"
+  GREEN = "\e[1;38;2;111;235;162m"
+
+  def initialize(enabled:, stream_count:)
+    @enabled = enabled && $stdout.tty?
+    @stream_count = stream_count
+    @active_stream = nil
+    @last_event = nil
+    @selected_route = ENV.fetch("AUTOS_WATCH_DEFAULT_ROUTE", "waiting").to_s.downcase
+    @active_provider = nil
+    @provider_signals = { qwen: 0, nemotron: 0 }
+    @started = false
+  end
+
+  def start
+    return unless @enabled
+
+    rows, columns = $stdout.winsize
+    return if rows < MIN_ROWS || columns < 62
+
+    @rows = rows
+    @columns = columns
+    @started = true
+    $stdout.write("\e[2J\e[H\e[#{HEADER_ROWS + 1};#{rows}r")
+    draw
+    $stdout.write("\e[#{HEADER_ROWS + 1};1H")
+    $stdout.flush
+  end
+
+  def observe(stream_name, event)
+    return unless @started
+
+    @active_stream = stream_name if STREAM_ORDER.include?(stream_name)
+    @last_event = event["time"].to_s
+    observe_route(event)
+    observe_provider(event)
+    draw
+  end
+
+  def stop
+    return unless @started
+
+    $stdout.write("\e[r\e[#{@rows};1H\e[2K#{RESET}\n")
+    $stdout.flush
+    @started = false
+  end
+
+  private
+
+  def draw
+    width = @columns
+    inner_width = width - 2
+    title = "─ AUTOS WATCH // PBU HYBRID OVEN "
+    title_fill = [width - title.length - 2, 0].max
+    lines = [
+      [["╭", BORDER], [title, TURQUOISE], ["─" * title_fill, BORDER], ["╮", BORDER]],
+      stream_segments(inner_width, first_row: true),
+      stream_segments(inner_width, first_row: false),
+      status_segments(inner_width),
+      [["╰", BORDER], ["─" * inner_width, BORDER], ["╯", BORDER]]
+    ]
+
+    $stdout.write("\e7")
+    lines.each_with_index do |segments, index|
+      $stdout.write("\e[#{index + 1};1H\e[2K#{render_segments(segments, width)}#{RESET}")
+    end
+    $stdout.write("\e8")
+    $stdout.flush
+  end
+
+  def stream_segments(inner_width, first_row:)
+    wide = @columns >= 106
+    streams = if wide
+      first_row ? STREAM_ORDER : []
+    else
+      first_row ? STREAM_ORDER.first(2) : STREAM_ORDER.last(2)
+    end
+
+    segments = [["│ ", BORDER]]
+    if first_row
+      segments << ["(\\_/)", TURQUOISE]
+      segments << ["[", STEEL]
+      segments << ["@", PLASMA]
+      segments << ["_", STEEL]
+      segments << ["@", PLASMA]
+      segments << ["]", STEEL]
+      segments << ["  STREAMS  ", WHITE]
+    elsif wide
+      segments << ["  ROUTE  ", SOFT]
+      segments << [route_label, route_style]
+      segments << ["  //  SIGNAL  ", SOFT]
+      segments << [@active_stream || "waiting for a local event", @active_stream ? stream_style(@active_stream) : SOFT]
+      segments << ["  //  SWITCH @ 313.CASH/AI", SOFT]
+    else
+      segments << [" " * 21, nil]
+    end
+
+    streams.each do |stream|
+      segments << [stream_chip(stream), stream_style(stream, active: stream == @active_stream)]
+      segments << [" ", nil]
+    end
+    if !first_row && !wide
+      segments << ["active: ", SOFT]
+      segments << [@active_stream || "waiting", @active_stream ? stream_style(@active_stream) : SOFT]
+    end
+    close_line(segments, inner_width)
+  end
+
+  def status_segments(inner_width)
+    narrow = @columns < 106
+    last_signal = if @last_event.to_s.empty?
+      "AWAITING SIGNAL"
+    elsif narrow
+      "LAST #{@last_event[/T(\d{2}:\d{2}:\d{2})/, 1] || @last_event}"
+    else
+      "LAST #{@last_event}"
+    end
+    segments = [
+      ["│ ", BORDER],
+      ["● ", GREEN],
+      [narrow ? route_label : "SELECTED #{route_label}", route_style],
+      ["  //  ", SOFT],
+      ["QWEN #{@provider_signals[:qwen]}", TURQUOISE],
+      ["  //  ", SOFT],
+      ["NEM #{@provider_signals[:nemotron]}", PLASMA],
+      ["  //  ", SOFT],
+      [narrow ? "#{@stream_count} FEEDS" : "#{@stream_count} EVENT FEEDS", TURQUOISE],
+      ["  //  ", SOFT],
+      [last_signal, SOFT],
+      [narrow ? "  //  CTRL-C" : "  //  CTRL-C CLOSE", SOFT]
+    ]
+    close_line(segments, inner_width)
+  end
+
+  def close_line(segments, inner_width)
+    visible = segments.sum { |text, _style| text.length }
+    segments.concat([[" " * [inner_width + 1 - visible, 0].max, nil], ["│", BORDER]])
+    segments
+  end
+
+  def stream_chip(stream)
+    stream == @active_stream ? "[● #{stream}]" : "[  #{stream}]"
+  end
+
+  def observe_route(event)
+    selected = event["selected_route"].to_s.downcase.strip
+    selected = event.dig("route", "mode").to_s.downcase.strip if selected.empty? && event["route"].is_a?(Hash)
+    return unless %w[qwen nemotron].include?(selected)
+    return if event.key?("route_switchable") && !event["route_switchable"]
+
+    @selected_route = selected
+  end
+
+  def observe_provider(event)
+    return unless %w[
+      route_selected ollama_request server_cloud_fallback answer complete
+      exam_generator_started exam_generator_completed writer_started writer_completed
+      judge_batch_started judge_completed dojo_completed
+    ].include?(event["event"].to_s)
+
+    text = [event["provider"], event["model"], event["selected_route"]].compact.join(" ").downcase
+    provider = if text.match?(/nemotron|nvidia|server_cloud/)
+      :nemotron
+    elsif text.match?(/qwen|local_cc|ollama/) || event["event"].to_s == "ollama_request"
+      :qwen
+    end
+    return unless provider
+
+    @active_provider = provider
+    @provider_signals[provider] += 1
+  end
+
+  def route_label
+    case @selected_route
+    when "nemotron" then "NEMOTRON"
+    when "qwen" then "QWEN 8B LOCAL"
+    else "ROUTE WAITING"
+    end
+  end
+
+  def route_style
+    @selected_route == "nemotron" ? PLASMA : (@selected_route == "qwen" ? TURQUOISE : SOFT)
+  end
+
+  def stream_style(stream, active: false)
+    rgb = STREAM_COLORS.fetch(stream, "126;157;190")
+    active ? "\e[1;38;2;8;14;22;48;2;#{rgb}m" : "\e[1;38;2;#{rgb}m"
+  end
+
+  def render_segments(segments, width)
+    rendered = +""
+    visible = 0
+    active_style = nil
+
+    segments.each do |text, style|
+      break if visible >= width
+
+      piece = text.to_s.each_char.take(width - visible).join
+      next if piece.empty?
+
+      if style != active_style
+        rendered << RESET if active_style
+        rendered << style if style
+        active_style = style
+      end
+      rendered << piece
+      visible += piece.length
+    end
+    rendered << RESET if active_style
+    rendered
+  end
+end
 
 raw = ARGV.delete("--raw")
 all = ARGV.delete("--all")
 follow = !ARGV.delete("--no-follow")
-autos_only = ARGV.delete("--autos") || ARGV.delete("--pinball") || ARGV.delete("--pinball-autos")
-dope_only = ARGV.delete("--dope")
-reports_only = ARGV.delete("--reports") || ARGV.delete("--dope-reports") || ARGV.delete("--market-reports")
-both = ARGV.delete("--both") || ARGV.delete("--combined")
+ARGV.delete("--autos") || ARGV.delete("--pinball") || ARGV.delete("--pinball-autos")
 
 custom_log = nil
 if (idx = ARGV.index("--log"))
@@ -34,48 +260,67 @@ if (idx = ARGV.index("--log"))
   custom_log = ARGV.delete_at(idx)
 end
 
+stream_specs = []
+while (idx = ARGV.index("--stream"))
+  ARGV.delete_at(idx)
+  raw_spec = ARGV.delete_at(idx).to_s
+  label, path = raw_spec.split("=", 2)
+  abort "autos_cc_watch: --stream expects LABEL=PATH" if label.to_s.strip.empty? || path.to_s.strip.empty?
+
+  stream_specs << { name: label.to_s.strip.upcase, path: File.expand_path(path.to_s.strip) }
+end
+
 LINE_COUNT = Integer(ENV.fetch("AUTOS_CC_WATCH_LINES", "120"))
-IDLE_HEARTBEAT_SECONDS = Integer(ENV.fetch("AUTOS_CC_WATCH_IDLE_HEARTBEAT_SECONDS", "60"))
+STREAM_LABEL = ENV.fetch("AUTOS_WATCH_STREAM_LABEL", "PINBALL.AUTOS")
 
 if ARGV.delete("--help") || ARGV.delete("-h")
-  puts "Usage: bin/autos_cc_watch [--both] [--autos|--pinball] [--dope] [--reports] [--log PATH] [--all] [--no-follow] [--raw]"
+  puts "Usage: bin/autos_cc_watch [--autos|--pinball] [--log PATH] [--stream LABEL=PATH] [--all] [--no-follow] [--raw]"
   puts
-  puts "Default mode:            combined AUTOS + DOPE + DOPE reports"
+  puts "Default mode:            Pinball AUTOS"
   puts "Default AUTOS log:       #{DEFAULT_AUTOS_LOG}"
-  puts "Default DOPE log:        #{DEFAULT_DOPE_LOG}"
-  puts "Default DOPE report log: #{DEFAULT_DOPE_REPORT_LOG}"
   puts "Legacy log:              #{LEGACY_LOG}"
-  puts "Idle heartbeat seconds:  #{IDLE_HEARTBEAT_SECONDS} (set AUTOS_CC_WATCH_IDLE_HEARTBEAT_SECONDS=0 to hide)"
   exit 0
 end
 
-streams = if custom_log
-  [{ name: "CUSTOM", path: File.expand_path(custom_log) }]
-elsif reports_only && !dope_only && !autos_only && !both
-  [{ name: "DOPE.REPORTS", path: DEFAULT_DOPE_REPORT_LOG }]
-elsif dope_only && !autos_only && !both
-  [
-    { name: "DOPE.AUTOS", path: DEFAULT_DOPE_LOG },
-    { name: "DOPE.REPORTS", path: DEFAULT_DOPE_REPORT_LOG }
-  ]
-elsif autos_only && !dope_only && !both
-  [{ name: "PINBALL.AUTOS", path: DEFAULT_AUTOS_LOG }]
+streams = if stream_specs.any?
+  stream_specs
+elsif custom_log
+  [{ name: STREAM_LABEL, path: File.expand_path(custom_log) }]
 else
-  [
-    { name: "PINBALL.AUTOS", path: ENV["AUTOS_WORKER_ACTIVITY_LOG"].to_s.presence || DEFAULT_AUTOS_LOG },
-    { name: "DOPE.AUTOS", path: DEFAULT_DOPE_LOG },
-    { name: "DOPE.REPORTS", path: DEFAULT_DOPE_REPORT_LOG }
-  ]
+  [{ name: "PINBALL.AUTOS", path: ENV["AUTOS_WORKER_ACTIVITY_LOG"].to_s.presence || DEFAULT_AUTOS_LOG }]
 end
 
 STATE = {
   workers: {},
   questions: {},
   fallback: {},
-  reports: {},
-  last_idle: {},
-  last_idle_printed: {}
+  reports: {}
 }
+
+def logical_stream_for(event, configured_name)
+  values = [
+    configured_name,
+    event["worker_id"],
+    event["source"],
+    event["surface"],
+    event["queue"],
+    event["kind"]
+  ].compact.join(" ").downcase
+
+  return "AUTOS.WEATHER" if values.include?("weather")
+  return "AUTOS.TELEGRAM" if values.include?("telegram")
+  return "AUTOS.SMS" if values.match?(/(?:^|[._\s-])(sms|comms)(?:$|[._\s-])/)
+  return "AUTOS.ASK" if values.match?(/(?:^|[._\s-])(ask|web|chicle)(?:$|[._\s-])/)
+  return configured_name if STREAM_ORDER.include?(configured_name)
+
+  "AUTOS.ASK"
+end
+
+def public_text(value)
+  value.to_s
+    .gsub(/\bdope\b/i, "AUTOS")
+    .gsub(/\bdve\b/i, "AUTOS")
+end
 
 def parse_time(value)
   Time.iso8601(value.to_s)
@@ -91,6 +336,16 @@ def event_order(event)
   {
     "startup" => 0,
     "status" => 1,
+    "route_status" => 1,
+    "route_selected" => 2,
+    "dojo_queued" => 2,
+    "exam_generator_started" => 3,
+    "writer_started" => 4,
+    "writer_completed" => 5,
+    "judge_batch_started" => 5,
+    "judge_completed" => 6,
+    "dojo_completed" => 7,
+    "dojo_failed" => 8,
     "claimed" => 2,
     "generation_prompt" => 3,
     "question" => 2,
@@ -112,8 +367,15 @@ def event_order(event)
   }.fetch(event["event"].to_s, 9)
 end
 
+def event_sequence_order(event)
+  sequence = event["sequence"]
+  return sequence.to_i unless sequence.nil?
+
+  event_order(event)
+end
+
 def compact_text(text, max = nil)
-  value = text.to_s.strip
+  value = public_text(text).strip
   return "" if value.empty?
   return value unless max && value.length > max
 
@@ -124,7 +386,7 @@ def compact_text(text, max = nil)
 end
 
 def print_block(label, text)
-  value = text.to_s.strip
+  value = public_text(text).strip
   return if value.empty?
 
   puts "#{label}:"
@@ -135,14 +397,15 @@ def origin_label(event, stream_name)
   source = event["source"].to_s
   surface = event["surface"].to_s
 
+  return "weather brain" if stream_name == "AUTOS.WEATHER" || surface == "weather_outcome_analysis"
   return "telegram" if source == "telegram"
   return "power prompt/thumper" if source == "thumper"
   return "web guest/private" if source == "web" && surface == "chicle_private"
   return "web guest" if source == "web"
-  return "dope ask" if source == "dope" || stream_name.include?("DOPE")
   return "autos system" if source == "system"
+  return "autos service" if source.match?(/\A(?:dope|dve)\z/i)
 
-  [source, surface].reject(&:empty?).join("/").presence || "unknown"
+  public_text([source, surface].reject(&:empty?).join("/")).presence || "unknown"
 end
 
 def destination_label(event, stream_name)
@@ -217,58 +480,13 @@ def record_state(event, stream_name)
       reason: event["reason"],
       local_model: event["local_model"]
     }
-  when "claimed"
-    STATE[:reports][[stream_name, event["id"].to_s]] = {
-      id: event["id"],
-      title: event["status"].to_s,
-      started_at: parse_time(event["time"])
-    }
-  when "completed", "failed", "fail_endpoint_error", "dry_run_ready"
-    STATE[:reports].delete([stream_name, event["id"].to_s])
-  when "idle"
-    STATE[:last_idle][stream_name] = parse_time(event["time"])
   end
 end
 
 def visible_history_event?(event, raw:)
   return true if raw
 
-  event["event"].to_s != "idle"
-end
-
-def should_print_idle?(event, stream_name)
-  return false unless stream_name == "DOPE.REPORTS"
-  return false if IDLE_HEARTBEAT_SECONDS <= 0
-
-  at = parse_time(event["time"])
-  last = STATE[:last_idle_printed][stream_name]
-  return false if last && (at - last) < IDLE_HEARTBEAT_SECONDS
-
-  STATE[:last_idle_printed][stream_name] = at
-  true
-end
-
-def print_active_reports
-  active = STATE[:reports].values
-  return if active.empty?
-
-  puts
-  puts "Active DOPE report process:"
-  active.each do |report|
-    started_at = report[:started_at].is_a?(Time) ? report[:started_at].iso8601 : report[:started_at]
-    title = compact_text(report[:title], 100)
-    puts "  ##{report[:id]} #{title} started=#{started_at}"
-  end
-end
-
-def print_idle_summaries
-  STATE[:last_idle].each do |stream_name, at|
-    next unless stream_name == "DOPE.REPORTS"
-    next if IDLE_HEARTBEAT_SECONDS <= 0
-
-    STATE[:last_idle_printed][stream_name] = at
-    puts "[#{at.iso8601}] #{stream_name} polling no queued report jobs"
-  end
+  !%w[idle embedding_context].include?(event["event"].to_s)
 end
 
 def cloud_status_suffix(event)
@@ -290,7 +508,7 @@ def cloud_status_suffix(event)
   " #{bits.join(" ")}"
 end
 
-def render(event, stream_name:, raw:)
+def render(event, stream_name:, raw:, dashboard:)
   record_state(event, stream_name)
 
   if raw
@@ -300,22 +518,42 @@ def render(event, stream_name:, raw:)
 
   time = event["time"].to_s
   kind = event["event"].to_s
-  if kind == "idle"
-    puts "[#{time}] #{stream_name} polling no queued report jobs" if should_print_idle?(event, stream_name)
-    return
-  end
+  return if %w[idle embedding_context].include?(kind)
+
+  dashboard.observe(stream_name, event)
 
   case kind
   when "startup"
     puts "[#{time}] #{stream_name} worker started #{event["worker_id"]} model=#{event["local_model"]}"
   when "status"
-    if stream_name == "DOPE.REPORTS"
-      puts "[#{time}] #{stream_name} worker #{event["status"]} queued=#{event["queued"]}"
-    else
-      server_model = event["server_local_model"]
-      suffix = server_model && server_model != event["local_model"] ? " server_model=#{server_model}" : ""
-      puts "[#{time}] #{stream_name} status enabled=#{event["enabled"]} queued=#{event["queued"]} model=#{event["local_model"]}#{suffix}#{cloud_status_suffix(event)}"
-    end
+    server_model = event["server_local_model"]
+    suffix = server_model && server_model != event["local_model"] ? " server_model=#{server_model}" : ""
+    puts "[#{time}] #{stream_name} status enabled=#{event["enabled"]} queued=#{event["queued"] || 0} model=#{event["local_model"]}#{suffix}#{cloud_status_suffix(event)}"
+  when "route_status"
+    puts "[#{time}] ROUTE READY #{stream_name} selected=#{event["selected_route"]} provider=#{event["provider"]} model=#{event["model"]} switchable=#{event["route_switchable"]}"
+  when "route_selected"
+    puts "[#{time}] ROUTE SELECTED #{stream_name} ##{event["id"]} #{event["selected_route"]} -> #{event["provider"]} #{event["model"]}"
+  when "dojo_queued"
+    puts
+    puts "[#{time}] SAMPLE DOJO QUEUED #{stream_name} run=#{event["id"]} queue=#{event["queue"].presence || "sample"}"
+  when "exam_generator_started"
+    puts "[#{time}] SAMPLE EXAM GENERATOR START #{stream_name} provider=#{event["provider"]} model=#{event["model"]}"
+  when "exam_generator_completed"
+    puts "[#{time}] SAMPLE EXAM READY #{stream_name} provider=#{event["provider"]} model=#{event["model"]} latency=#{event["latency_ms"]}ms"
+  when "case_inbound_settled"
+    puts "[#{time}] SAMPLE CASE SETTLED #{stream_name} case=#{event["case_number"]}/10 messages=#{event["message_count"] || 1}"
+  when "writer_started"
+    puts "[#{time}] SAMPLE WRITER START #{stream_name} case=#{event["case_number"]}/10 provider=#{event["provider"]} model=#{event["model"]}"
+  when "writer_completed"
+    puts "[#{time}] SAMPLE WRITER DONE #{stream_name} case=#{event["case_number"]}/10 provider=#{event["provider"]} model=#{event["model"]} latency=#{event["latency_ms"]}ms"
+  when "judge_batch_started"
+    puts "[#{time}] SAMPLE JUDGE START #{stream_name} cases=#{event["case_count"] || 10} provider=#{event["provider"]} model=#{event["model"]}"
+  when "judge_completed"
+    puts "[#{time}] SAMPLE JUDGE RECEIPT #{stream_name} case=#{event["case_number"]}/10 score=#{event["score"]}/100"
+  when "dojo_completed"
+    puts "[#{time}] SAMPLE DOJO COMPLETE #{stream_name} score=#{event["score"]}/100 duration=#{event["duration_seconds"]}s provider=#{event["provider"]} model=#{event["model"]}"
+  when "dojo_failed"
+    puts "[#{time}] SAMPLE DOJO FAILED #{stream_name} run=#{event["id"]}"
   when "status_failed"
     puts "[#{time}] #{stream_name} status failed #{event["http_code"] || event["error_class"]}: #{event["body"] || event["error"]}"
   when "claimed"
@@ -364,8 +602,12 @@ def render(event, stream_name:, raw:)
   when "question"
     puts
     puts "[#{time}] QUESTION #{headline(event, stream_name)}"
-    print_block("Q", event["prompt"])
+    print_block("Q", compact_text(event["prompt"], 280))
     puts "context_chars=#{event["context_chars"]}" if event["context_chars"]
+  when "ollama_request"
+    puts "[#{time}] LOCAL OVEN START #{stream_name} ##{event["id"]} model=#{event["model"].presence || "qwen3:8b"}"
+  when "server_cloud_fallback"
+    puts "[#{time}] ROUTE #{stream_name} ##{event["id"]} local -> #{public_text(event["provider"].presence || "cloud")} model=#{event["model"]}"
   when "frontier_fallback"
     local_model = event["local_model"].to_s.presence || "local"
     puts "[#{time}] ROUTE #{stream_name} ##{event["id"]} qwen/local #{local_model} -> openai reason=#{event["reason"]}"
@@ -383,7 +625,7 @@ def render(event, stream_name:, raw:)
     fallback = STATE[:fallback][key_for(event, stream_name)]
     route_note = fallback && event["provider"].to_s == "openai" ? " route=qwen->openai" : ""
     puts "[#{time}] ANSWER #{headline(event, stream_name)} provider=#{event["provider"]} model=#{event["model"]}#{route_note}#{elapsed_suffix}"
-    print_block("A", event["answer"])
+    print_block("A", compact_text(event["answer"], 520))
     usage = event["usage"].is_a?(Hash) ? event["usage"] : {}
     puts "tokens=#{usage["total_tokens"]}" if usage["total_tokens"]
     print_sources(event)
@@ -396,8 +638,10 @@ def render(event, stream_name:, raw:)
     elapsed_suffix = elapsed ? " elapsed=#{elapsed}" : ""
     puts "[#{time}] ERROR #{headline(event, stream_name)} #{event["error_class"]}: #{event["error"]}#{elapsed_suffix}"
   else
-    payload = event.reject { |key, _| %w[time event worker_id].include?(key) }
-    puts "[#{time}] #{stream_name} #{kind} #{payload}"
+    safe_keys = %w[id provider model local_model enabled queued status reason error error_class http_code case_number case_count message_count score latency_ms duration_seconds]
+    payload = event.select { |key, _| safe_keys.include?(key) }
+      .transform_values { |value| compact_text(value, 180) }
+    puts "[#{time}] #{stream_name} #{public_text(kind)} #{payload}"
   end
 end
 
@@ -405,7 +649,7 @@ def parse_line(line, stream_name)
   return nil if line.to_s.strip.empty?
 
   event = JSON.parse(line)
-  event["_stream"] = stream_name
+  event["_stream"] = logical_stream_for(event, stream_name)
   event
 rescue JSON::ParserError => e
   warn "Skipping invalid #{stream_name} activity line: #{e.message}"
@@ -417,40 +661,46 @@ streams.each do |stream|
   FileUtils.touch(stream[:path])
 end
 
-puts "Watching #{streams.map { |stream| "#{stream[:name]}=#{stream[:path]}" }.join(" | ")}" unless raw
+dashboard = AutosWatchDashboard.new(
+  enabled: ENV.fetch("AUTOS_CC_WATCH_DASHBOARD", "0") == "1" && !raw,
+  stream_count: streams.size
+)
 
-initial_events = streams.flat_map do |stream|
-  events = File.readlines(stream[:path]).map { |line| parse_line(line, stream[:name]) }.compact
-  if raw || all
-    events = events.last(LINE_COUNT) unless all
-  else
-    latest_idle = events.reverse.find { |event| event["event"].to_s == "idle" }
-    STATE[:last_idle][stream[:name]] = parse_time(latest_idle["time"]) if latest_idle
-    events = events.select { |event| visible_history_event?(event, raw: raw) }.last(LINE_COUNT)
-  end
-  events
-end
+dashboard.start
+begin
+  puts "Watching #{streams.map { |stream| "#{stream[:name]}=#{stream[:path]}" }.join(" | ")}" unless raw
 
-initial_events.sort_by { |event| [parse_time(event["time"]), event["_stream"].to_s, event["id"].to_s, event_order(event)] }.each do |event|
-  render(event, stream_name: event.delete("_stream"), raw: raw)
-end
-print_active_reports unless raw
-print_idle_summaries unless raw
-
-exit 0 unless follow
-
-files = streams.map do |stream|
-  file = File.open(stream[:path], "r")
-  file.seek(0, IO::SEEK_END)
-  stream.merge(file: file)
-end
-
-loop do
-  files.each do |stream|
-    while (line = stream[:file].gets)
-      event = parse_line(line, stream[:name])
-      render(event, stream_name: event.delete("_stream"), raw: raw) if event
+  initial_events = streams.flat_map do |stream|
+    events = File.readlines(stream[:path]).map { |line| parse_line(line, stream[:name]) }.compact
+    if raw || all
+      events = events.last(LINE_COUNT) unless all
+    else
+      events = events.select { |event| visible_history_event?(event, raw: raw) }.last(LINE_COUNT)
     end
+    events
   end
-  sleep 0.5
+
+  initial_events.sort_by { |event| [parse_time(event["time"]), event["_stream"].to_s, event["id"].to_s, event_sequence_order(event)] }.each do |event|
+    render(event, stream_name: event.delete("_stream"), raw: raw, dashboard: dashboard)
+  end
+
+  exit 0 unless follow
+
+  files = streams.map do |stream|
+    file = File.open(stream[:path], "r")
+    file.seek(0, IO::SEEK_END)
+    stream.merge(file: file)
+  end
+
+  loop do
+    files.each do |stream|
+      while (line = stream[:file].gets)
+        event = parse_line(line, stream[:name])
+        render(event, stream_name: event.delete("_stream"), raw: raw, dashboard: dashboard) if event
+      end
+    end
+    sleep 0.5
+  end
+ensure
+  dashboard.stop
 end
