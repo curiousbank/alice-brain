@@ -951,6 +951,54 @@ def missing_required_section_titles(job: dict, text: str) -> list[str]:
     return missing
 
 
+def sanitize_generic_service_area(text: str) -> str:
+    cleaned = str(text or "")
+    cleaned = re.sub(r"\byour local service area\b", "the campaign area approved before launch", cleaned, flags=re.I)
+    cleaned = re.sub(r"\blocal service area\b", "approved campaign area", cleaned, flags=re.I)
+    return cleaned
+
+
+def complete_grounded_tail_sections(job: dict, text: str) -> str:
+    """Complete safe required tail sections when a local model reaches its token cap."""
+    cleaned = str(text or "").rstrip()
+    missing = missing_required_section_titles(job, cleaned)
+    if not missing:
+        return cleaned
+
+    timing = report_timing_context(job)
+    facts = source_fact_sheet(job)
+    business_name = str(facts.get("client_visible_name") or facts.get("business_name") or "the business").strip()
+    earliest_date = display_date(timing.get("earliest_production_ready_date")) or "the approved production-ready date"
+    lead_days = timing.get("minimum_production_lead_days") or 14
+    appended = []
+
+    for title in missing:
+        aliases = section_aliases(title)
+        normalized_title = normalize_section_text(title)
+        if "timeline" in normalized_title or "launch plan" in normalized_title or aliases & {"launch plan", "timeline launch plan", "suggested timeline", "campaign timeline", "timeline"}:
+            appended.append(
+                "\n".join([
+                    f"## {title}",
+                    "- Confirm the audience, offer, response path, and final creative before production.",
+                    f"- Use {earliest_date} as the earliest production-ready date, allowing at least {lead_days} days for proofing and setup.",
+                    "- Launch one trackable pilot, record every response by source, and use the first results to guide the next approved batch.",
+                ])
+            )
+        elif aliases & {"final recommendation", "final recommendation summary", "next steps", "recommendation summary"}:
+            appended.append(
+                "\n".join([
+                    f"## {title}",
+                    f"Begin with one focused, trackable campaign for {business_name}. Use only approved source facts, connect every response to the CRM, and review the pilot before expanding the next batch.",
+                ])
+            )
+
+    if not appended:
+        return cleaned
+
+    log("grounded_tail_completed", id=job.get("id"), status=f"sections={', '.join(missing)}")
+    return cleaned + "\n\n" + "\n\n".join(appended)
+
+
 def compact_for_prompt(value, limit: int = 4000):
     if isinstance(value, dict):
         return {str(k): compact_for_prompt(v, limit) for k, v in value.items() if v not in (None, "", [], {})}
@@ -3520,6 +3568,8 @@ def call_local_ollama(job: dict, progress_callback=None) -> tuple[str, dict]:
                 report_text = sanitize_visible_report_text(str(parsed.get("response") or ""))
                 report_text = sanitize_unsupported_exact_stats(report_text, job)
                 report_text = sanitize_past_timing_windows(report_text, job)
+                report_text = sanitize_generic_service_area(report_text)
+                report_text = complete_grounded_tail_sections(job, report_text)
                 document_preview = full_document_text(job, report_text)
                 quality_errors = visible_text_quality_errors(document_preview, job)
                 words = word_count(report_text)
