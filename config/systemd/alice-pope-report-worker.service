@@ -30,6 +30,7 @@ Environment=DOPE_REPORT_EMBEDDING_TIMEOUT=600
 Environment=DOPE_REPORT_PROMPT_TOTAL_CHARS=10000
 Environment=OLLAMA_URL=http://127.0.0.1:11434
 EnvironmentFile=%h/.config/pinball/dope-worker.env
+ExecStartPre=/bin/sh -c 'while /usr/bin/pgrep -f "/bin/[d]ope_market_report_worker --once" >/dev/null; do /usr/bin/sleep 5; done'
 ExecStart=/usr/bin/python3 %h/Desktop/alice-brain/bin/dope_market_report_worker --poll-seconds 8 --concurrency 1
 Restart=always
 RestartSec=5
@@ -37,6 +38,7 @@ Nice=5
 CPUWeight=350
 IOWeight=300
 KillSignal=SIGINT
+TimeoutStartSec=2h
 TimeoutStopSec=30
 
 [Install]
