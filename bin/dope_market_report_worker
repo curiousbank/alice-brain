@@ -2008,6 +2008,7 @@ The supplied generation prompt and report contract are authoritative for section
 {outline[:3000]}
 Ground every recommendation in the client fact sheet, retrieved context, timing context, approved media observations, and supplied CRM facts. Never invent facts, prices, dates, statistics, discounts, service areas, proof, or image details.
 Use concise headings, short paragraphs, useful bullets, concrete campaign names, and required Markdown tables. Keep the tone confident and professional.
+Cover every required section before expanding any one section. Reserve output space for the final required headings, especially Timeline / Launch Plan and Final Recommendation, and keep the complete report concise enough to finish cleanly.
 Never expose worker/model/vendor names, tokens, IDs, raw payloads, private metadata, source inventories, internal notes, or hidden reasoning.
 For client reports, omit AM actions, designer/production notes, appendices, assumptions tables, and technical handoff sections unless the contract explicitly requires them.
 Return only complete visible report copy. No JSON, code fences, placeholders, planning notes, prompt echoes, or <think> tags."""
@@ -2047,6 +2048,7 @@ def local_report_prompt(job: dict, retry_note: str | None = None) -> str:
         "- Do not explain what you are creating.\n"
         "- Do not echo the payload, report_contract, section list, missing inputs, or instructions.\n"
         "- Include required Markdown tables using pipe table syntax where the contract asks for tables.\n"
+        "- Include every required section in order; reserve output budget for the final Timeline / Launch Plan and Final Recommendation sections.\n"
         "- No <think> tags, hidden reasoning, planning notes, analysis preface, or notes after the final section.\n\n"
         f"PAYLOAD:\n{package}\n\nReturn the final visible report copy now."
     )
