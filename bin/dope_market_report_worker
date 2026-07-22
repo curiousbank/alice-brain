@@ -310,11 +310,23 @@ class DopeClient:
         form = urllib.parse.urlencode(form_payload).encode("utf-8")
         self.request("POST", endpoint, body=form, headers={"Content-Type": "application/x-www-form-urlencoded"})
 
-    def heartbeat(self, job: dict) -> None:
+    def heartbeat(
+        self,
+        job: dict,
+        phase: str | None = None,
+        progress: int | None = None,
+        detail: str | None = None,
+    ) -> bool:
         endpoint = job.get("output", {}).get("heartbeat_endpoint") or f"/dope_worker/reports/{job['id']}/heartbeat"
         form_payload = {"worker_id": self.worker_id}
         if job.get("claim_token") or job.get("output", {}).get("claim_token"):
             form_payload["claim_token"] = job.get("claim_token") or job.get("output", {}).get("claim_token")
+        if phase:
+            form_payload["progress_phase"] = str(phase)[:40]
+        if progress is not None:
+            form_payload["progress_percent"] = str(max(1, min(int(progress), 99)))
+        if detail:
+            form_payload["progress_detail"] = re.sub(r"\s+", " ", str(detail)).strip()[:180]
         code, _headers, body = self.request(
             "POST",
             endpoint,
@@ -323,6 +335,8 @@ class DopeClient:
         )
         if code not in (200, 204):
             log("heartbeat_rejected", id=job.get("id"), status=f"HTTP {code}: {body.decode(errors='replace')[:160]}")
+            return False
+        return True
 
 
 class ReportHeartbeat:
@@ -334,6 +348,12 @@ class ReportHeartbeat:
         except ValueError:
             self.interval = 60
         self.stop_event = threading.Event()
+        self.state_lock = threading.Lock()
+        self.phase = "claimed"
+        self.progress = 12
+        self.detail = "Local report worker accepted the job."
+        self.last_logged_signature = None
+        self.last_logged_at = 0.0
         self.thread = threading.Thread(target=self._run, name="dope-report-heartbeat", daemon=True)
 
     def __enter__(self):
@@ -352,9 +372,34 @@ class ReportHeartbeat:
 
     def _beat(self) -> None:
         try:
-            self.client.heartbeat(self.job)
+            with self.state_lock:
+                phase = self.phase
+                progress = self.progress
+                detail = self.detail
+            accepted = self.client.heartbeat(self.job, phase=phase, progress=progress, detail=detail)
+            if not accepted:
+                return
+            now = time.monotonic()
+            signature = (phase, progress, detail)
+            if signature != self.last_logged_signature or now - self.last_logged_at >= 60:
+                log(
+                    "progress",
+                    id=self.job.get("id"),
+                    provider="alice/local",
+                    model=env("DOPE_REPORT_LOCAL_MODEL", "qwen3:8b"),
+                    status=f"{progress}% {phase} // {detail}",
+                )
+                self.last_logged_signature = signature
+                self.last_logged_at = now
         except Exception as error:
             log("heartbeat_error", id=self.job.get("id"), status=f"{type(error).__name__}: {str(error)[:160]}")
+
+    def update(self, phase: str, progress: int, detail: str) -> None:
+        with self.state_lock:
+            self.phase = phase
+            self.progress = max(self.progress, max(1, min(int(progress), 99)))
+            self.detail = detail
+        self._beat()
 
 
 class ReportResourceGate:
@@ -863,7 +908,7 @@ def report_section_titles(job: dict, text: str) -> list[str]:
         if title and title not in titles:
             titles.append(title)
 
-    if re.match(r"^\s*(#\s*)?(\*\*)?DOPE MARKETING\b", text or "", flags=re.I):
+    if re.match(r"^\s*(#\s*)?(\*\*)?(?:WIZWIKI|DOPE) MARKETING\b", text or "", flags=re.I):
         add("Header")
 
     first_lines = normalized_lines[:12]
@@ -934,19 +979,29 @@ def embedding_runtime(job: dict) -> dict:
         or env("DOPE_REPORT_EMBEDDER_MODEL")
         or DEFAULT_EMBEDDER_MODEL
     ).strip()
+    legacy_fallback = str(runtime.get("fallback") or "").strip()
+    # Older report contracts used `fallback` for a human-readable instruction.
+    # Only accept it as a model identifier when it actually looks like one.
+    legacy_fallback_model = legacy_fallback if legacy_fallback and not re.search(r"\s", legacy_fallback) else ""
     fallback_model = str(
         runtime.get("fallback_model")
-        or runtime.get("fallback")
         or env("DOPE_REPORT_EMBEDDER_FALLBACK")
+        or legacy_fallback_model
         or DEFAULT_EMBEDDER_MODEL
     ).strip()
+    requested_top_k = bounded_int(runtime.get("top_k") or env("DOPE_REPORT_EMBEDDING_TOP_K"), DEFAULT_EMBEDDING_TOP_K, 2, 40)
+    requested_chunk_chars = bounded_int(runtime.get("chunk_chars") or env("DOPE_REPORT_EMBEDDING_CHUNK_CHARS"), DEFAULT_EMBEDDING_CHUNK_CHARS, 500, 6000)
+    requested_max_chunks = bounded_int(runtime.get("max_chunks") or env("DOPE_REPORT_EMBEDDING_MAX_CHUNKS"), DEFAULT_EMBEDDING_MAX_CHUNKS, 10, 240)
+    local_top_k_cap = bounded_int(env("DOPE_REPORT_EMBEDDING_LOCAL_TOP_K_CAP"), 6, 2, 20)
+    local_chunk_chars_cap = bounded_int(env("DOPE_REPORT_EMBEDDING_LOCAL_CHUNK_CHARS_CAP"), 1200, 500, 3000)
+    local_max_chunks_cap = bounded_int(env("DOPE_REPORT_EMBEDDING_LOCAL_MAX_CHUNKS_CAP"), 24, 10, 80)
     return {
         **runtime,
         "model": requested_model or DEFAULT_EMBEDDER_MODEL,
         "fallback_model": fallback_model or DEFAULT_EMBEDDER_MODEL,
-        "top_k": bounded_int(runtime.get("top_k") or env("DOPE_REPORT_EMBEDDING_TOP_K"), DEFAULT_EMBEDDING_TOP_K, 2, 40),
-        "chunk_chars": bounded_int(runtime.get("chunk_chars") or env("DOPE_REPORT_EMBEDDING_CHUNK_CHARS"), DEFAULT_EMBEDDING_CHUNK_CHARS, 500, 6000),
-        "max_chunks": bounded_int(runtime.get("max_chunks") or env("DOPE_REPORT_EMBEDDING_MAX_CHUNKS"), DEFAULT_EMBEDDING_MAX_CHUNKS, 10, 240),
+        "top_k": min(requested_top_k, local_top_k_cap),
+        "chunk_chars": min(requested_chunk_chars, local_chunk_chars_cap),
+        "max_chunks": min(requested_max_chunks, local_max_chunks_cap),
     }
 
 
@@ -956,6 +1011,10 @@ def stringify_source(value) -> str:
     if isinstance(value, str):
         return value.strip()
     return json.dumps(compact_for_prompt(value, limit=1800), indent=2, ensure_ascii=True)
+
+
+def semantic_embedding_enabled() -> bool:
+    return truthy(env("DOPE_REPORT_SEMANTIC_EMBEDDINGS_ENABLED", "1"))
 
 
 def split_source_text(label: str, text: str, chunk_chars: int) -> list[dict]:
@@ -1274,19 +1333,20 @@ def ensure_embedding_context(job: dict) -> tuple[str, dict]:
     fallback_used = None
     error_messages = []
 
-    for candidate in [requested_model, fallback_model]:
-        if not candidate:
-            continue
-        if ranked_chunks:
-            break
-        try:
-            ranked_chunks = rank_source_chunks(candidate, query, chunks, runtime["top_k"])
-            selected_model = candidate
-            if candidate != requested_model:
-                fallback_used = candidate
-        except Exception as error:
-            error_messages.append(f"{candidate}: {type(error).__name__}: {str(error)[:180]}")
-            log("embedding_candidate_failed", id=job.get("id"), provider="ollama/local", model=candidate, status=str(error)[:160])
+    if semantic_embedding_enabled():
+        for candidate in [requested_model, fallback_model]:
+            if not candidate:
+                continue
+            if ranked_chunks:
+                break
+            try:
+                ranked_chunks = rank_source_chunks(candidate, query, chunks, runtime["top_k"])
+                selected_model = candidate
+                if candidate != requested_model:
+                    fallback_used = candidate
+            except Exception as error:
+                error_messages.append(f"{candidate}: {type(error).__name__}: {str(error)[:180]}")
+                log("embedding_candidate_failed", id=job.get("id"), provider="ollama/local", model=candidate, status=str(error)[:160])
 
     if not ranked_chunks:
         ranked_chunks = lexical_rank_source_chunks(query, chunks, runtime["top_k"])
@@ -1346,19 +1406,20 @@ def ensure_repair_embedding_context(job: dict, retry_note: str | None = None) ->
     fallback_used = None
     error_messages = []
     ranked_chunks: list[dict] = []
-    for candidate in [runtime["model"], runtime["fallback_model"]]:
-        if not candidate:
-            continue
-        if ranked_chunks:
-            break
-        try:
-            ranked_chunks = rank_source_chunks(candidate, query, chunks, runtime["top_k"])
-            selected_model = candidate
-            if candidate != runtime["model"]:
-                fallback_used = candidate
-        except Exception as error:
-            error_messages.append(f"{candidate}: {type(error).__name__}: {str(error)[:180]}")
-            log("repair_embedding_candidate_failed", id=job.get("id"), provider="ollama/local", model=candidate, status=str(error)[:160])
+    if semantic_embedding_enabled():
+        for candidate in [runtime["model"], runtime["fallback_model"]]:
+            if not candidate:
+                continue
+            if ranked_chunks:
+                break
+            try:
+                ranked_chunks = rank_source_chunks(candidate, query, chunks, runtime["top_k"])
+                selected_model = candidate
+                if candidate != runtime["model"]:
+                    fallback_used = candidate
+            except Exception as error:
+                error_messages.append(f"{candidate}: {type(error).__name__}: {str(error)[:180]}")
+                log("repair_embedding_candidate_failed", id=job.get("id"), provider="ollama/local", model=candidate, status=str(error)[:160])
 
     if not ranked_chunks:
         ranked_chunks = lexical_rank_source_chunks(query, chunks, runtime["top_k"])
@@ -1453,6 +1514,13 @@ def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
     uploaded_media = job.get("assets", {}).get("uploaded_media", []) or []
     retrieval_context, embedding_meta = ensure_embedding_context(job)
     repair_context, repair_embedding_meta = ensure_repair_embedding_context(job, retry_note) if retry_note else ("", {})
+    account_graph = job.get("account_graph", {}) or {}
+    prompt_contract = dict(contract)
+    # These large prose fields are already represented by the primary prompt,
+    # required sections, and retrieval context below.
+    for duplicate_key in ("llm_prompt", "requested_output", "generation_prompt"):
+        prompt_contract.pop(duplicate_key, None)
+
     prompt_package = {
         "client_fact_sheet": source_fact_sheet(job),
         "primary_generation_prompt": primary_prompt,
@@ -1466,14 +1534,18 @@ def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
         "timing_context": report_timing_context(job),
         "previous_draft_for_repair": job.get("_alice_previous_draft") if retry_note else None,
         "quality_errors_to_fix": job.get("_alice_quality_errors") if retry_note else None,
-        "report_contract": contract,
+        "report_contract": prompt_contract,
         "required_sections": contract.get("required_sections", []),
         "writing_rules": contract.get("writing_rules", []),
         "deal": job.get("deal", {}),
         "company": job.get("company", {}),
         "commerce": job.get("commerce", {}),
         "campaign_context": job.get("campaign_context", {}),
-        "account_graph": job.get("account_graph", {}),
+        "account_graph": {
+            "companies": list(account_graph.get("companies", []) or [])[:4],
+            "contacts": list(account_graph.get("contacts", []) or [])[:6],
+            "deals": list(account_graph.get("deals", []) or [])[:6],
+        },
         "contact_intelligence": job.get("contact_intelligence", {}) or job.get("ai_runtime", {}).get("contact_intelligence", {}),
         "associated_data_summary": {
             "associated_company_count": len((job.get("account_graph", {}) or {}).get("companies", []) or []),
@@ -1482,7 +1554,6 @@ def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
         },
         "hubspot_context": {
             "labeled_properties": job.get("hubspot_context", {}).get("labeled_properties", {}),
-            "raw_properties": job.get("hubspot_context", {}).get("raw_properties", {}),
             "missing_core_fields": job.get("hubspot_context", {}).get("missing_core_fields", []),
             "property_count": job.get("hubspot_context", {}).get("property_count"),
         },
@@ -1504,7 +1575,54 @@ def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
             "docx_signature": "PK",
         },
     }
-    return json.dumps(compact_for_prompt(prompt_package), indent=2, ensure_ascii=True)
+    field_limit = bounded_int(env("DOPE_REPORT_PROMPT_FIELD_CHARS"), 1200, 400, 4000)
+    retrieval_limit = bounded_int(env("DOPE_REPORT_PROMPT_RETRIEVAL_CHARS"), 9000, 2000, 18000)
+    total_limit = bounded_int(env("DOPE_REPORT_PROMPT_TOTAL_CHARS"), 36000, 10000, 80000)
+    compact_package = compact_for_prompt(prompt_package, limit=field_limit)
+    compact_package["primary_generation_prompt"] = str(primary_prompt or "")[:6000]
+    compact_package["local_retrieval_context"] = str(retrieval_context or "")[:retrieval_limit]
+    if retry_note:
+        compact_package["repair_retrieval_context"] = str(repair_context or "")[:retrieval_limit]
+        compact_package["previous_draft_for_repair"] = str(job.get("_alice_previous_draft") or "")[:8000]
+
+    encoded = json.dumps(compact_package, indent=2, ensure_ascii=True)
+    for optional_key in ("contact_intelligence", "account_graph", "commerce"):
+        if len(encoded) <= total_limit:
+            break
+        compact_package.pop(optional_key, None)
+        encoded = json.dumps(compact_package, indent=2, ensure_ascii=True)
+    if len(encoded) > total_limit:
+        compact_package["local_retrieval_context"] = str(retrieval_context or "")[: max(2000, retrieval_limit // 2)]
+        encoded = json.dumps(compact_package, indent=2, ensure_ascii=True)
+    if len(encoded) > total_limit:
+        def excerpt(value, limit: int) -> str:
+            if isinstance(value, str):
+                return value[:limit]
+            return json.dumps(compact_for_prompt(value, limit=500), ensure_ascii=True)[:limit]
+
+        compact_package = {
+            "client_fact_sheet": excerpt(source_fact_sheet(job), 1200),
+            "primary_generation_prompt": str(primary_prompt or "")[:1800],
+            "local_retrieval_context": str(retrieval_context or "")[:1400],
+            "timing_context": excerpt(report_timing_context(job), 700),
+            "report_contract": excerpt(prompt_contract, 1500),
+            "required_sections": excerpt(contract.get("required_sections", []), 700),
+            "writing_rules": excerpt(contract.get("writing_rules", []), 600),
+            "embedded_media_observations": excerpt(job.get("_alice_media_observations", []), 300),
+            "quality_gate": excerpt(prompt_package.get("quality_gate", {}), 250),
+        }
+        if retry_note:
+            compact_package["retry_note"] = str(retry_note)[:600]
+            compact_package["previous_draft_for_repair"] = str(job.get("_alice_previous_draft") or "")[:2400]
+        encoded = json.dumps(compact_package, indent=2, ensure_ascii=True)
+    if len(encoded) > total_limit:
+        overflow = len(encoded) - total_limit
+        retrieval = compact_package.get("local_retrieval_context", "")
+        compact_package["local_retrieval_context"] = retrieval[: max(1000, len(retrieval) - overflow - 256)]
+        if "previous_draft_for_repair" in compact_package:
+            compact_package["previous_draft_for_repair"] = compact_package["previous_draft_for_repair"][:1200]
+        encoded = json.dumps(compact_package, indent=2, ensure_ascii=True)
+    return encoded
 
 
 def truthy(value) -> bool:
@@ -1653,7 +1771,7 @@ def design_press_openai_prompt(job: dict, document_text: str, report_title: str)
     return f"""Create a polished 8.5x11 vertical client-facing marketing report cover/poster.
 
 Keep these exact visible words only:
-DOPE MARKETING
+WIZWIKI MARKETING
 Market Strategy Report
 {plain_text(str(company_name))[:80]}
 {plain_text(str(service_area))[:80]}
@@ -1884,8 +2002,17 @@ def report_job_requires_exclusive_slot(job: dict) -> bool:
 
 def report_generation_instructions(job: dict | None = None) -> str:
     outline = required_report_outline(job or {})
-    return f"""You are the DOPEIPEDIA market analyzer for DOPE Marketing.
-Write a professional, client-facing DOPE Bold Market Report.
+    if truthy(env("DOPE_REPORT_COMPACT_PROMPT", "0")):
+        return f"""Write the final client-facing WIZWIKI Marketing report in polished Markdown.
+The supplied generation prompt and report contract are authoritative for section order, required tables, audience, length, and wording.
+{outline[:3000]}
+Ground every recommendation in the client fact sheet, retrieved context, timing context, approved media observations, and supplied CRM facts. Never invent facts, prices, dates, statistics, discounts, service areas, proof, or image details.
+Use concise headings, short paragraphs, useful bullets, concrete campaign names, and required Markdown tables. Keep the tone confident and professional.
+Never expose worker/model/vendor names, tokens, IDs, raw payloads, private metadata, source inventories, internal notes, or hidden reasoning.
+For client reports, omit AM actions, designer/production notes, appendices, assumptions tables, and technical handoff sections unless the contract explicitly requires them.
+Return only complete visible report copy. No JSON, code fences, placeholders, planning notes, prompt echoes, or <think> tags."""
+    return f"""You are the WIZWIKI market analyzer for WIZWIKI Marketing.
+Write a professional, client-facing WIZWIKI Market Report.
 Use payload["generation_prompt"] or payload["report_contract"]["llm_prompt"] as the controlling brief.
 SUN's report contract controls the visible section order, required tables, length, and wording. Do not append legacy sections.
 {outline}
@@ -1906,7 +2033,7 @@ Use directional proof points unless exact numbers are present in source context.
 The visible client report must stop after the Final Recommendation section when that section exists in the contract.
 Allowed internal AM sections are only the sections named in the AM report contract.
 Do not include AM-Facing Actions in client reports, Designer Notes, Print Production Notes, Canva Data Postcard Handoff, Source Data Appendix, HubSpot Properties, Asset List, Human Approval Gates, assumptions tables, prompt notes, payload notes, or technical metadata.
-Keep recommendations tied to DOPE services: direct mail, postcards, yard signs, door hangers, print, CRM/source-data follow-up, campaign tracking, and customer approval.
+Keep recommendations tied to WIZWIKI services: direct mail, postcards, yard signs, door hangers, print, CRM/source-data follow-up, campaign tracking, and customer approval.
 The output will be rendered into a real DOCX by the report worker, so write complete report content only."""
 
 
@@ -1916,7 +2043,7 @@ def local_report_prompt(job: dict, retry_note: str | None = None) -> str:
         f"{report_generation_instructions(job)}\n\n"
         "OUTPUT CONTRACT:\n"
         "- Return only the final client-visible Markdown copy.\n"
-        "- Start exactly with DOPE MARKETING.\n"
+        "- Start exactly with WIZWIKI MARKETING.\n"
         "- Do not explain what you are creating.\n"
         "- Do not echo the payload, report_contract, section list, missing inputs, or instructions.\n"
         "- Include required Markdown tables using pipe table syntax where the contract asks for tables.\n"
@@ -1978,7 +2105,7 @@ def local_retry_note(job: dict, report_text: str, quality_errors: list[str], min
     return (
         f"The previous draft failed preflight: words={words}, minimum={minimum}, errors={errors}. "
         f"Revise the previous draft with {target}-{target + 250} words while staying concise and {visible_label}. "
-        f"Start exactly with DOPE MARKETING. Return only {visible_label}. "
+        f"Start exactly with WIZWIKI MARKETING. Return only {visible_label}. "
         f"{section_rule}{table_rule}Do not include planning notes, "
         "payload summaries, missing-input labels, hidden thinking, or explanation of the task. "
         "Do not use unsupported exact percentages or statistics. Do not use internal ticket/status words like abandoned, SAM, HubSpot ID, or workflow stage names in client copy. "
@@ -2246,8 +2373,8 @@ def comm_kit_payload_prompt(job: dict, local_prep: str, report_text: str = "") -
         "- Exactly 3 SMS options and exactly 2 email options.\n"
         "- SMS bodies must be under 320 characters, paste-ready, and varied by tone.\n"
         "- Emails must be content-rich, friendly, and grounded in source-backed CRM context.\n"
-        "- For DOPE OUT, sell direct-mail marketing setup, postcards, neighborhood campaigns, and July 4 Happy 250th America specials.\n"
-        "- For CLIENT OUT, write as the client business to its customers and do not sell DOPE services.\n"
+        "- For WIZWIKI OUT, sell direct-mail marketing setup, postcards, neighborhood campaigns, and July 4 Happy 250th America specials.\n"
+        "- For CLIENT OUT, write as the client business to its customers and do not sell WIZWIKI services.\n"
         "- If prior success, recent engagement, playbook/fathom notes, or campaign history are present, reference them naturally.\n"
         "- Never invent percentages, discounts, guarantees, or unsupported campaign results.\n\n"
         f"Direction: {copy_maker_comm_kit_direction_label(job)}\n"
@@ -2495,13 +2622,13 @@ def render_structured_comm_kit_document(job: dict, comm_kit: dict, local_prep: s
         email_lines.append(f"Body: {option.get('body')}")
 
     return "\n\n".join([
-        "DOPE MARKETING",
+        "WIZWIKI MARKETING",
         f"Copy Maker COMM KIT: {business_name}",
         f"{copy_maker_comm_kit_direction_label(job)} // {current_date}",
         "Source-Aware Copy Direction",
         source_direction,
         "Recipient & Address Review",
-        recipient_review or "DVE ranked associated CRM contacts, phone numbers, emails, and addresses for human review before outreach.",
+        recipient_review or "AUTOS ranked associated CRM contacts, phone numbers, emails, and addresses for human review before outreach.",
         "\n".join(contact_lines),
         "COMM KIT // Text Messages",
         "\n".join(sms_lines),
@@ -2618,7 +2745,7 @@ def copy_maker_local_prep_prompt(job: dict) -> str:
     retry_note = str(job.get("_alice_retry_note") or "").strip()
     package = report_prompt_input(job, retry_note=retry_note or None)
     return (
-        "You are Alice local prep for DOPE Copy Maker.\n"
+        "You are Alice local prep for WIZWIKI Copy Maker.\n"
         "Use the selected local embedder context and CRM/account payload to prepare a compact source-aware brief for a cloud copywriter.\n"
         "This is NOT the final customer document. Do not write hidden thinking, raw JSON, or generic filler.\n\n"
         "Return these sections only:\n"
@@ -2649,12 +2776,12 @@ def copy_maker_final_prompt(job: dict, local_prep: str) -> str:
             "- Do not add model notes, process notes, unsupported stats, or fake urgency.\n"
         )
     return (
-        "You are DOPE Copy Maker creating the final visible copy document.\n"
+        "You are WIZWIKI Copy Maker creating the final visible copy document.\n"
         "Use the local source-aware brief and the custom prompt to write polished marketing copy.\n"
         "Do not expose hidden reasoning, API names, model names, prompt analysis, raw payload data, HubSpot IDs, or private metadata.\n"
         "Never use internal stage/status words like abandoned, SAM, workflow stage, ticket status, or HubSpot ID in the visible output.\n"
         "Return only visible Markdown for a DOCX document.\n"
-        "Start exactly with DOPE MARKETING.\n"
+        "Start exactly with WIZWIKI MARKETING.\n"
         "Include these section headings in this order when possible: "
         f"{', '.join(required_sections) if required_sections else 'Header, Source-Aware Copy Direction, Generated Copy, Usage Notes'}.\n"
         "If the custom prompt asks for postcard copy, email copy, ad copy, landing page copy, SMS, or a call script, put that actual copy under Generated Copy.\n"
@@ -2739,7 +2866,7 @@ def copy_maker_openai_response(api_key: str, model: str, prompt: str) -> tuple[d
         model=model,
         effort=effort,
         instructions=(
-            "You are DOPE Copy Maker. Return only polished visible client-ready Markdown. "
+            "You are WIZWIKI Copy Maker. Return only polished visible client-ready Markdown. "
             "Do not reveal hidden reasoning, prompt analysis, raw CRM payloads, API names, or private metadata."
         ),
         input_text=prompt,
@@ -2837,12 +2964,14 @@ def call_copy_maker(job: dict) -> tuple[str, dict]:
     }
 
 
-def ollama_report_response(model: str, prompt: str) -> dict:
+def ollama_report_response(model: str, prompt: str, on_progress=None) -> dict:
     base_url = str(env("OLLAMA_URL", "http://127.0.0.1:11434") or "http://127.0.0.1:11434").rstrip("/")
+    max_tokens = int(env("DOPE_REPORT_LOCAL_MAX_TOKENS", "3600"))
+    streaming = callable(on_progress)
     body = {
         "model": model,
         "prompt": prompt,
-        "stream": False,
+        "stream": streaming,
         "think": False,
         "options": {
             "temperature": float(env("DOPE_REPORT_LOCAL_TEMPERATURE", "0.28")),
@@ -2851,7 +2980,7 @@ def ollama_report_response(model: str, prompt: str) -> dict:
             "repeat_penalty": float(env("DOPE_REPORT_LOCAL_REPEAT_PENALTY", "1.16")),
             "repeat_last_n": int(env("DOPE_REPORT_LOCAL_REPEAT_LAST_N", "256")),
             "num_ctx": int(env("DOPE_REPORT_LOCAL_CONTEXT", "16384")),
-            "num_predict": int(env("DOPE_REPORT_LOCAL_MAX_TOKENS", "3600")),
+            "num_predict": max_tokens,
         },
     }
     req = urllib.request.Request(
@@ -2862,7 +2991,40 @@ def ollama_report_response(model: str, prompt: str) -> dict:
     )
     timeout = int(env("DOPE_REPORT_LOCAL_TIMEOUT", "900"))
     with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+        if not streaming:
+            return json.loads(response.read().decode("utf-8"))
+
+        response_parts = []
+        thinking_parts = []
+        final_payload = {}
+        decoded_chunks = 0
+        last_progress_at = 0.0
+        progress_interval = max(float(env("DOPE_REPORT_STREAM_PROGRESS_SECONDS", "15") or "15"), 5.0)
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            parsed = json.loads(line)
+            text_chunk = str(parsed.get("response") or "")
+            thinking_chunk = str(parsed.get("thinking") or "")
+            if text_chunk:
+                response_parts.append(text_chunk)
+            if thinking_chunk:
+                thinking_parts.append(thinking_chunk)
+            if text_chunk or thinking_chunk:
+                decoded_chunks += 1
+            if parsed.get("done"):
+                final_payload = parsed
+
+            now = time.monotonic()
+            if decoded_chunks and (now - last_progress_at >= progress_interval or parsed.get("done")):
+                on_progress(decoded_chunks, max_tokens)
+                last_progress_at = now
+
+        final_payload["response"] = "".join(response_parts)
+        if thinking_parts:
+            final_payload["thinking"] = "".join(thinking_parts)
+        return final_payload
 
 
 def post_generation_review_prompt(job: dict, report_text: str) -> str:
@@ -2895,7 +3057,7 @@ def post_generation_review_prompt(job: dict, report_text: str) -> str:
         f"{report_generation_instructions(job)}\n\n"
         "POST REVIEW CONTRACT:\n"
         "- Return only the revised visible Markdown report.\n"
-        "- Start exactly with DOPE MARKETING.\n"
+        "- Start exactly with WIZWIKI MARKETING.\n"
         "- Preserve all required section headings and required Markdown tables.\n"
         "- Improve clarity, rhythm, specificity, and sales-readiness without making the report longer than needed.\n"
         "- Do not add unsupported exact percentages or statistics.\n"
@@ -2994,19 +3156,24 @@ def contains_meta_leak(text: str) -> bool:
 
 def sanitize_visible_report_text(text: str) -> str:
     cleaned = strip_model_thinking(text)
-    starts = [match.start() for match in re.finditer(r"\bDOPE MARKETING\b", cleaned, flags=re.I)]
+    cleaned = re.sub(r"\bDOPEIPEDIA\b", "WIZWIKI", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bDOPE\s+MARKETING\b", "WIZWIKI MARKETING", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bDOPE\s+BOLD\b", "WIZWIKI", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bDOPE\s+services\b", "WIZWIKI services", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bDVE\b", "AUTOS", cleaned, flags=re.I)
+    starts = [match.start() for match in re.finditer(r"\bWIZWIKI MARKETING\b", cleaned, flags=re.I)]
     if len(starts) > 1 and contains_meta_leak(cleaned[: starts[1]]):
         cleaned = cleaned[starts[1]:]
     elif starts and starts[0] > 0 and contains_meta_leak(cleaned[: starts[0]]):
         cleaned = cleaned[starts[0]:]
-    seen_dope_header = False
+    seen_brand_header = False
     deduped_lines = []
     for line in cleaned.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        if re.match(r"^\s*(?:#{1,6}\s*)?(?:\*\*)?DOPE MARKETING(?:\*\*)?\s*$", line, flags=re.I):
-            if seen_dope_header:
+        if re.match(r"^\s*(?:#{1,6}\s*)?(?:\*\*)?WIZWIKI MARKETING(?:\*\*)?\s*$", line, flags=re.I):
+            if seen_brand_header:
                 continue
-            seen_dope_header = True
-            deduped_lines.append("DOPE MARKETING")
+            seen_brand_header = True
+            deduped_lines.append("WIZWIKI MARKETING")
             continue
         deduped_lines.append(line)
     cleaned = "\n".join(deduped_lines)
@@ -3037,7 +3204,7 @@ def normalized_heading_title(line: str) -> str | None:
         return None
     if re.search(r"[.!?]\s+", cleaned):
         return None
-    if re.match(r"^(DOPE MARKETING|Header / Cover|Executive Summary|Market Snapshot|Seasonality Timeline|Recommended Campaign|Campaign Recommendation|Channel Strategy|Neighborhood Targeting|Offer Strategy|Timeline / Launch Plan|Final Recommendation|Best Opportunity Callout|Big Stat Cards|Customer Mindset|Buying Triggers|Why Print/Direct Mail Fits|Offer Card \d+)$", cleaned, flags=re.I):
+    if re.match(r"^(WIZWIKI MARKETING|Header / Cover|Executive Summary|Market Snapshot|Seasonality Timeline|Recommended Campaign|Campaign Recommendation|Channel Strategy|Neighborhood Targeting|Offer Strategy|Timeline / Launch Plan|Final Recommendation|Best Opportunity Callout|Big Stat Cards|Customer Mindset|Buying Triggers|Why Print/Direct Mail Fits|Offer Card \d+)$", cleaned, flags=re.I):
         return cleaned.lower()
     return None
 
@@ -3131,9 +3298,9 @@ def visible_placeholder_markers(text: str, job: dict) -> list[str]:
         markers.append("measurable placeholder wording")
     if inferred and inferred != "local service business" and re.search(r"\bindustry\s*:\s*local service business\b", cleaned, flags=re.I):
         markers.append("generic industry header despite inferred industry")
-    dope_mentions = len(re.findall(r"^\s*(?:#\s*)?DOPE MARKETING\s*$", cleaned, flags=re.I | re.M))
-    if dope_mentions > 1:
-        markers.append("duplicate DOPE MARKETING header")
+    brand_mentions = len(re.findall(r"^\s*(?:#\s*)?WIZWIKI MARKETING\s*$", cleaned, flags=re.I | re.M))
+    if brand_mentions > 1:
+        markers.append("duplicate WIZWIKI MARKETING header")
     if re.search(r"^\s*Client Strategy Proposal\s*$", cleaned, flags=re.I | re.M):
         markers.append("legacy Client Strategy Proposal heading")
     return markers
@@ -3256,8 +3423,8 @@ def visible_text_quality_errors(text: str, job: dict) -> list[str]:
         if empty_headings:
             errors.append(f"visible copy has empty section headings: {', '.join(empty_headings[:5])}")
         return errors
-    if not re.match(r"^\s*(#\s*)?(\*\*)?DOPE MARKETING\b", cleaned, flags=re.I):
-        errors.append("visible copy does not start with DOPE MARKETING")
+    if not re.match(r"^\s*(#\s*)?(\*\*)?WIZWIKI MARKETING\b", cleaned, flags=re.I):
+        errors.append("visible copy does not start with WIZWIKI MARKETING")
     required_tables = job.get("report_contract", {}).get("required_tables", []) or []
     expected_table_count = min(len(required_tables), bounded_int(env("DOPE_REPORT_MAX_REQUIRED_TABLES"), 2, 1, 4))
     if audience != "am" and expected_table_count >= 2 and markdown_table_count(cleaned) < expected_table_count:
@@ -3298,7 +3465,7 @@ def structural_quality_errors(errors: list[str]) -> bool:
         for marker in [
             "missing required markdown tables",
             "missing required sections",
-            "does not start with dope marketing",
+            "does not start with wizwiki marketing",
             "prompt echo",
             "model planning",
             "unsupported exact percentages",
@@ -3318,7 +3485,7 @@ def local_model_attempt_limit(job: dict, errors: list[str], default_attempts: in
     return bounded_int(env("DOPE_REPORT_STRUCTURAL_ATTEMPTS_PER_MODEL"), 3, 1, default_attempts)
 
 
-def call_local_ollama(job: dict) -> tuple[str, dict]:
+def call_local_ollama(job: dict, progress_callback=None) -> tuple[str, dict]:
     target_minimum = minimum_words(job)
     hard_minimum = hard_minimum_words(job)
     job_id = job.get("id")
@@ -3346,6 +3513,7 @@ def call_local_ollama(job: dict) -> tuple[str, dict]:
                 parsed = ollama_report_response(
                     model,
                     local_report_prompt(job, retry_note=retry_note),
+                    on_progress=progress_callback,
                 )
                 report_text = sanitize_visible_report_text(str(parsed.get("response") or ""))
                 report_text = sanitize_unsupported_exact_stats(report_text, job)
@@ -3452,7 +3620,7 @@ def call_local_ollama(job: dict) -> tuple[str, dict]:
     raise RuntimeError(f"all local Ollama candidates failed: {last_error}")
 
 
-def generate_report_text(job: dict) -> tuple[str, dict]:
+def generate_report_text(job: dict, progress_callback=None) -> tuple[str, dict]:
     log(
         "audience_detected",
         id=job.get("id"),
@@ -3462,7 +3630,7 @@ def generate_report_text(job: dict) -> tuple[str, dict]:
         return call_copy_maker(job)
     if not local_report_required(job):
         log("forcing_local_report", id=job.get("id"), provider="ollama/local", status="DOPE reports are local-only")
-    return call_local_ollama(job)
+    return call_local_ollama(job, progress_callback=progress_callback)
 
 def call_openai(job: dict) -> tuple[str, dict]:
     api_key = env("OPENAI_API_KEY")
@@ -3657,7 +3825,7 @@ def template_report(job: dict) -> dict:
     description = compact(campaign.get("deal_description"), "No deal description was provided.")
     return {
         "title": f"{company_name} 90-Day Postcard Campaign Report",
-        "subtitle": "Prepared by DOPE Marketing with DOPEIPEDIA market analysis",
+        "subtitle": "Prepared by WIZWIKI Marketing with WIZWIKI market analysis",
         "executive_summary": (
             f"{company_name} is a fit for a disciplined 90-day postcard campaign that connects CRM data, "
             f"print production, and account-manager follow-up. The current brief says: {description} "
@@ -3712,7 +3880,7 @@ def template_report(job: dict) -> dict:
         "data_setup": [
             f"Confirm list exports from {crm}, including contact status, owner, geography, and suppression fields.",
             "Approve creative, offer, compliance language, and mail quantity before production.",
-            "Keep human review in the workflow; DOPEIPEDIA organizes the draft and the team approves.",
+            "Keep human review in the workflow; WIZWIKI organizes the draft and the team approves.",
         ],
         "next_steps": [
             "Confirm the campaign objective and primary audience.",
@@ -3722,7 +3890,7 @@ def template_report(job: dict) -> dict:
         ],
         "assumptions": [
             "No live postage or print quote was supplied unless shown in the deal package.",
-            "Recommendations should be reviewed by the DOPE account manager before being sent to the customer.",
+            "Recommendations should be reviewed by the WIZWIKI account manager before being sent to the customer.",
         ],
     }
 
@@ -3925,7 +4093,7 @@ def build_document_xml(job: dict, report: dict, logo: tuple[bytes, str] | None) 
     campaign_context = job.get("campaign_context", {})
     body = []
 
-    body.append(paragraph("DOPE MARKETING", bold=True, color="D71920", size=24))
+    body.append(paragraph("WIZWIKI MARKETING", bold=True, color="D71920", size=24))
     if logo:
         width, height = image_size(logo[0])
         body.append(image_run(width, height))
@@ -4054,14 +4222,14 @@ def header_xml(job: dict) -> str:
     company = compact(job.get("company", {}).get("name") or job.get("deal", {}).get("company_name"), "DOPE client")
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-<w:p><w:pPr><w:pStyle w:val="Normal"/><w:jc w:val="right"/><w:spacing w:after="60"/></w:pPr><w:r><w:rPr><w:b/><w:color w:val="{BRAND_RED}"/><w:sz w:val="16"/></w:rPr><w:t>DOPE Marketing</w:t></w:r><w:r><w:rPr><w:color w:val="{MUTED}"/><w:sz w:val="16"/></w:rPr><w:t xml:space="preserve"> | {safe_text(company)}</w:t></w:r></w:p>
+<w:p><w:pPr><w:pStyle w:val="Normal"/><w:jc w:val="right"/><w:spacing w:after="60"/></w:pPr><w:r><w:rPr><w:b/><w:color w:val="{BRAND_RED}"/><w:sz w:val="16"/></w:rPr><w:t>WIZWIKI Marketing</w:t></w:r><w:r><w:rPr><w:color w:val="{MUTED}"/><w:sz w:val="16"/></w:rPr><w:t xml:space="preserve"> | {safe_text(company)}</w:t></w:r></w:p>
 </w:hdr>"""
 
 
 def footer_xml() -> str:
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-<w:p><w:pPr><w:pStyle w:val="Normal"/><w:jc w:val="center"/><w:spacing w:before="60"/></w:pPr><w:r><w:rPr><w:color w:val="{MUTED}"/><w:sz w:val="16"/></w:rPr><w:t>Human-reviewed campaign strategy draft | Created using the DOPEIPEDIA market analyzer</w:t></w:r></w:p>
+<w:p><w:pPr><w:pStyle w:val="Normal"/><w:jc w:val="center"/><w:spacing w:before="60"/></w:pPr><w:r><w:rPr><w:color w:val="{MUTED}"/><w:sz w:val="16"/></w:rPr><w:t>Human-reviewed campaign strategy draft | Created using the WIZWIKI market analyzer</w:t></w:r></w:p>
 </w:ftr>"""
 
 
@@ -4298,7 +4466,7 @@ def canva_design_handoff_text(job: dict, report_text: str) -> str:
     lines = [
         "## Canva Data Postcard Handoff",
         "",
-        "Purpose: turn this strategy into a stylized 8.5x11 data postcard/report page that informs and engages the client. DOPEIPEDIA creates the copy/data packet; a human designer finishes the Canva design and approves exports.",
+        "Purpose: turn this strategy into a stylized 8.5x11 data postcard/report page that informs and engages the client. WIZWIKI creates the copy/data packet; a human designer finishes the Canva design and approves exports.",
         "",
         "### Canva Workflow",
         f"- Canva Desktop status: {'available at ' + app_path if app_path else 'not detected on this machine'}",
@@ -4360,7 +4528,7 @@ def write_canva_packet(job: dict, report_text: str, docx_path: Path) -> dict:
         "csv_path": str(csv_path),
         "format": "8.5x11 data postcard",
         "page_count": len(rows),
-        "automation_boundary": "DOPEIPEDIA writes copy/data. Canva design/export stays human-reviewed unless an explicit Canva API integration is approved.",
+        "automation_boundary": "WIZWIKI writes copy/data. Canva design/export stays human-reviewed unless an explicit Canva API integration is approved.",
         "approval_gates": ["account_manager", "customer", "designer_preflight", "production"],
     }
 
@@ -4636,12 +4804,12 @@ def page_visual_qa_prompt(job: dict, document_text: str, render_meta: dict) -> s
     company = compact(job.get("company", {}).get("name") or job.get("deal", {}).get("company_name"), "client")
     audience = str(job.get("metadata", {}).get("report_audience") or job.get("report_contract", {}).get("audience") or "client")
     return (
-        "You are the final visual QA inspector for a DOPE Marketing report rendered from DOCX pages.\n"
+        "You are the final visual QA inspector for a WIZWIKI Marketing report rendered from DOCX pages.\n"
         "Inspect the attached rendered page images only. Judge the visible finished report, not hidden metadata.\n"
         "Return strict JSON only with this shape: "
         '{"pass":true,"score":90,"notes":["..."],"errors":[],"repair_instructions":"..."}.\n\n'
         "Fail if any page is blank, visually broken, too crowded to read, has overlapping/cropped content, has unreadable tables, "
-        "shows filenames/endpoints/local paths, repeats the DOPE MARKETING header awkwardly, exposes AI/process notes, or does not feel client-facing.\n"
+        "shows filenames/endpoints/local paths, repeats the WIZWIKI MARKETING header awkwardly, exposes AI/process notes, or does not feel client-facing.\n"
         "Prefer practical design criticism: hierarchy, spacing, image placement, table readability, and whether it feels like a polished proposal.\n"
         "Do not invent business facts. Do not ask for revisions unless the page visuals actually need them.\n\n"
         f"CLIENT: {company}\n"
@@ -4914,9 +5082,9 @@ def retryable_report_error(message: str) -> bool:
 def retry_note_from_error(message: str) -> str:
     cleaned = re.sub(r"\s+", " ", str(message or "")).strip()
     return (
-        "The previous draft failed DOPE/SUN validation. Rewrite from scratch and fix this exact issue: "
+        "The previous draft failed WIZWIKI validation. Rewrite from scratch and fix this exact issue: "
         f"{cleaned[:600]}. "
-        "Return only the visible document. Start with DOPE MARKETING. Include every required section title "
+        "Return only the visible document. Start with WIZWIKI MARKETING. Include every required section title "
         "from the contract in order. Include required Markdown tables only when the contract asks for tables. "
         "If the failure mentions page visual QA, make the report cleaner, shorter, less crowded, with clearer headings, fewer dense paragraphs, and easier tables."
     )
@@ -4932,12 +5100,12 @@ def process_one(client: DopeClient, dry_run: bool = False, gate: ReportResourceG
     company_name = compact(job.get("company", {}).get("name") or job.get("deal", {}).get("company_name"), "unknown")
     log("claimed", id=job_id, status=company_name)
     try:
-        with ReportHeartbeat(client, job):
+        with ReportHeartbeat(client, job) as heartbeat:
             slot_heavy = False
             if gate:
                 slot_heavy = gate.acquire(job)
             try:
-                return process_claimed_report(client, job, company_name, dry_run=dry_run)
+                return process_claimed_report(client, job, company_name, dry_run=dry_run, heartbeat=heartbeat)
             finally:
                 if gate:
                     gate.release(slot_heavy)
@@ -4951,11 +5119,21 @@ def process_one(client: DopeClient, dry_run: bool = False, gate: ReportResourceG
         return False
 
 
-def process_claimed_report(client: DopeClient, job: dict, company_name: str, dry_run: bool = False) -> bool:
+def process_claimed_report(
+    client: DopeClient,
+    job: dict,
+    company_name: str,
+    dry_run: bool = False,
+    heartbeat: ReportHeartbeat | None = None,
+) -> bool:
     job_id = job.get("id")
     try:
+            if heartbeat:
+                heartbeat.update("assets", 16, "Collecting the report sources and approved media.")
             logo = client.fetch_logo(job)
             report_images, media_fetch_errors = client.fetch_report_images(job, logo=logo)
+            if heartbeat:
+                heartbeat.update("preflight", 22, "Checking source material before the writing pass.")
             vision_notes = vision_scan_images(job, report_images)
             ocr_notes = ocr_scan_images(job, report_images)
             media_observations = embedded_media_observations(report_images, vision_notes + ocr_notes)
@@ -4966,7 +5144,24 @@ def process_claimed_report(client: DopeClient, job: dict, company_name: str, dry
             for job_attempt in range(1, max_attempts + 1):
                 if job_attempt > 1:
                     log("rebuild_retry", id=job_id, status=f"attempt={job_attempt} of {max_attempts}")
-                report_text, ai_meta = generate_report_text(job)
+                if heartbeat:
+                    heartbeat.update("embedding", 30, "Retrieving the most relevant training and CRM context.")
+                ensure_embedding_context(job)
+                if heartbeat:
+                    heartbeat.update("drafting", 38, "Qwen 8B is writing the report from grounded context.")
+
+                def update_generation_progress(decoded_tokens: int, max_tokens: int) -> None:
+                    if not heartbeat:
+                        return
+                    expected_tokens = min(max_tokens, max(300, int(minimum_words(job) * 1.6)))
+                    progress = 38 + min(30, int((decoded_tokens / max(expected_tokens, 1)) * 30))
+                    heartbeat.update(
+                        "drafting",
+                        progress,
+                        f"Qwen 8B is writing locally — {decoded_tokens} output tokens received.",
+                    )
+
+                report_text, ai_meta = generate_report_text(job, progress_callback=update_generation_progress)
                 _retrieval_context, embedding_meta = ensure_embedding_context(job)
                 document_text = full_document_text(job, report_text)
                 timestamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -4974,6 +5169,8 @@ def process_claimed_report(client: DopeClient, job: dict, company_name: str, dry
                 filename = f"{timestamp}-{slug(company_name)}-{document_kind}.docx"
                 REPORT_DIR.mkdir(parents=True, exist_ok=True)
                 docx_path = REPORT_DIR / filename
+                if heartbeat:
+                    heartbeat.update("document", 72, "Building the downloadable document and report kit.")
                 create_report_docx(job, document_text, logo, docx_path, report_images=report_images)
                 canva_packet = write_canva_packet(job, document_text, docx_path)
                 log("canva_packet", id=job_id, status=f"{canva_packet['format']} csv={canva_packet['csv_path']}")
@@ -4989,6 +5186,8 @@ def process_claimed_report(client: DopeClient, job: dict, company_name: str, dry
                 sections = report_section_titles(job, document_text)
                 report_title = report_display_title(job, document_text, sections, company_name)
                 words = word_count(document_text)
+                if heartbeat:
+                    heartbeat.update("quality", 84, "Validating structure, sources, and document quality.")
                 quality_errors = validate_report_file(job, docx_path, document_text)
                 quality_errors.extend(page_visual_qa.get("errors", []))
                 logo_reason = logo_missing_reason(job, logo)
@@ -5101,6 +5300,8 @@ def process_claimed_report(client: DopeClient, job: dict, company_name: str, dry
                     log("dry_run_ready", id=job_id, provider=ai_meta["provider"], model=ai_meta["model"], status=str(docx_path))
                     return True
                 try:
+                    if heartbeat:
+                        heartbeat.update("uploading", 94, "Returning the validated report to PB and WIZWIKI.")
                     result = client.complete(job, docx_path, manifest)
                 except Exception as complete_error:
                     last_error = complete_error

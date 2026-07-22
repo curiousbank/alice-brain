@@ -1,0 +1,43 @@
+[Unit]
+Description=Alice local Qwen 8B report worker for POPE/WIZWIKI
+After=network-online.target sun-dope-tunnel.service ollama.service
+Wants=network-online.target ollama.service
+Requires=sun-dope-tunnel.service
+
+[Service]
+Type=simple
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+WorkingDirectory=%h/Desktop/alice-brain
+Environment=DOPE_REPORT_WORKER_BASE_URL=http://127.0.0.1:18182
+Environment=DOPE_REPORT_WORKER_ID=pbu-qwen8-reports-01
+Environment=DOPE_REPORT_LOCAL_MODEL=qwen3:8b
+Environment=DOPE_REPORT_LOCAL_MODEL_CANDIDATES=qwen3:8b
+Environment=DOPE_REPORT_LOCAL_FALLBACKS_ENABLED=0
+Environment=DOPE_REPORT_LOCAL_CONTEXT=8192
+Environment=DOPE_REPORT_LOCAL_MAX_TOKENS=1300
+Environment=DOPE_REPORT_LOCAL_ATTEMPTS=2
+Environment=DOPE_REPORT_COMPACT_PROMPT=1
+Environment=DOPE_REPORT_PROMPT_FIELD_CHARS=500
+Environment=DOPE_REPORT_PROMPT_RETRIEVAL_CHARS=2000
+Environment=DOPE_REPORT_EMBEDDER_FALLBACK=qwen3-embedding:0.6b
+Environment=DOPE_REPORT_WORKER_POLL_SECONDS=8
+Environment=DOPE_REPORT_WORKER_CONCURRENCY=1
+Environment=DOPE_REPORT_HEARTBEAT_SECONDS=30
+Environment=DOPE_REPORT_LOCAL_TIMEOUT=3600
+Environment=DOPE_REPORT_EMBEDDING_TIMEOUT=600
+Environment=DOPE_REPORT_PROMPT_TOTAL_CHARS=10000
+Environment=OLLAMA_URL=http://127.0.0.1:11434
+EnvironmentFile=%h/.config/pinball/dope-worker.env
+ExecStart=/usr/bin/python3 %h/Desktop/alice-brain/bin/dope_market_report_worker --poll-seconds 8 --concurrency 1
+Restart=always
+RestartSec=5
+Nice=5
+CPUWeight=350
+IOWeight=300
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
