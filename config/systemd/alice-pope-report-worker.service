@@ -28,7 +28,7 @@ Environment=DOPE_REPORT_WORKER_CONCURRENCY=1
 Environment=DOPE_REPORT_HEARTBEAT_SECONDS=30
 Environment=DOPE_REPORT_LOCAL_TIMEOUT=3600
 Environment=DOPE_REPORT_EMBEDDING_TIMEOUT=600
-Environment=DOPE_REPORT_PROMPT_TOTAL_CHARS=10000
+Environment=DOPE_REPORT_PROMPT_TOTAL_CHARS=6000
 Environment=OLLAMA_URL=http://127.0.0.1:11434
 EnvironmentFile=%h/.config/pinball/dope-worker.env
 ExecStartPre=/bin/sh -c 'while /usr/bin/pgrep -f "/bin/[d]ope_market_report_worker --once" >/dev/null; do /usr/bin/sleep 5; done'

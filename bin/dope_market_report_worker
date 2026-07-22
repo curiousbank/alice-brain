@@ -1625,7 +1625,7 @@ def report_prompt_input(job: dict, retry_note: str | None = None) -> str:
     }
     field_limit = bounded_int(env("DOPE_REPORT_PROMPT_FIELD_CHARS"), 1200, 400, 4000)
     retrieval_limit = bounded_int(env("DOPE_REPORT_PROMPT_RETRIEVAL_CHARS"), 9000, 2000, 18000)
-    total_limit = bounded_int(env("DOPE_REPORT_PROMPT_TOTAL_CHARS"), 36000, 10000, 80000)
+    total_limit = bounded_int(env("DOPE_REPORT_PROMPT_TOTAL_CHARS"), 36000, 6000, 80000)
     compact_package = compact_for_prompt(prompt_package, limit=field_limit)
     compact_package["primary_generation_prompt"] = str(primary_prompt or "")[:6000]
     compact_package["local_retrieval_context"] = str(retrieval_context or "")[:retrieval_limit]
